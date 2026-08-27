@@ -1,0 +1,44 @@
+name: Real Kimi-VL V2 probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v2.yml"
+
+jobs:
+  real-layer-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build C runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+
+      - name: Download only real layer-1 MLP shard
+        run: python tools/fetch_real_v2.py "$RUNNER_TEMP/kimi-vl" --layer 1
+
+      - name: Pack real routed experts
+        run: python tools/pack_experts.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed" --layer 1
+
+      - name: Generate real-weight Torch oracle
+        run: python tools/dump_real_moe_reference.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed/layer1.fixture" --layer 1
+
+      - name: Compare streamed C MoE with real-weight oracle
+        run: |
+          ./build/kvl_moe_probe \
+            "$RUNNER_TEMP/packed/experts.bin" \
+            "$RUNNER_TEMP/packed/experts.idx" \
+            "$RUNNER_TEMP/packed/layer1.fixture" \
+            1200000000
