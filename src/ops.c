@@ -34,6 +34,124 @@ void kvl_silu_mul(float *y, const float *gate, const float *up, int n) {
     }
 }
 
+void kvl_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
+                      int n, float eps) {
+    double ms = 0.0;
+    for (int i = 0; i < n; ++i) ms += (double)x[i] * (double)x[i];
+    const float inv = 1.0f / sqrtf((float)(ms / (double)n) + eps);
+    for (int i = 0; i < n; ++i)
+        y[i] = x[i] * inv * kvl_bf16_to_f32(weight[i]);
+}
+
+/* Kimi-VL's apply_rotary_pos_emb first reshapes [D] -> [D/2,2], transposes
+ * the final two dimensions, then flattens. For a raw projection laid out
+ * [e0,o0,e1,o1,...], that produces [all evens, all odds]. rotate_half then
+ * forms the usual complex pairs. Compute that exact result directly. */
+static void rope_interleaved(float *dst, const float *raw, int dim,
+                             int position, float theta) {
+    const int half = dim / 2;
+    for (int i = 0; i < half; ++i) {
+        const double exponent = (double)(2 * i) / (double)dim;
+        const double inv_freq = pow((double)theta, -exponent);
+        const double angle = (double)position * inv_freq;
+        const float c = (float)cos(angle);
+        const float si = (float)sin(angle);
+        const float a = raw[2 * i];
+        const float b = raw[2 * i + 1];
+        dst[i] = a * c - b * si;
+        dst[half + i] = b * c + a * si;
+    }
+}
+
+int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
+                         const KvlMlaConfig *cfg, const KvlMlaBF16 *w) {
+    if (!out || !x || !cfg || !w || !w->q_proj || !w->kv_a_proj ||
+        !w->kv_a_norm || !w->kv_b_proj || !w->o_proj || seq_len <= 0 ||
+        cfg->hidden_size <= 0 || cfg->num_heads <= 0 || cfg->qk_nope_dim <= 0 ||
+        cfg->qk_rope_dim <= 0 || (cfg->qk_rope_dim & 1) || cfg->v_head_dim <= 0 ||
+        cfg->kv_lora_rank <= 0 || cfg->rope_theta <= 0.0f)
+        return -1;
+
+    const int S = seq_len, H = cfg->hidden_size, NH = cfg->num_heads;
+    const int DN = cfg->qk_nope_dim, DR = cfg->qk_rope_dim, DV = cfg->v_head_dim;
+    const int QD = DN + DR, R = cfg->kv_lora_rank;
+    const int QO = NH * QD, KVO = R + DR, KVB = NH * (DN + DV);
+
+    float *q_states = (float *)malloc((size_t)S * NH * QD * sizeof(float));
+    float *k_states = (float *)malloc((size_t)S * NH * QD * sizeof(float));
+    float *v_states = (float *)malloc((size_t)S * NH * DV * sizeof(float));
+    float *qtmp = (float *)malloc((size_t)QO * sizeof(float));
+    float *katmp = (float *)malloc((size_t)KVO * sizeof(float));
+    float *latent = (float *)malloc((size_t)R * sizeof(float));
+    float *kvtmp = (float *)malloc((size_t)KVB * sizeof(float));
+    float *rope = (float *)malloc((size_t)DR * sizeof(float));
+    float *head_out = (float *)malloc((size_t)NH * DV * sizeof(float));
+    float *scores = (float *)malloc((size_t)S * sizeof(float));
+    if (!q_states || !k_states || !v_states || !qtmp || !katmp || !latent ||
+        !kvtmp || !rope || !head_out || !scores) {
+        free(q_states); free(k_states); free(v_states); free(qtmp); free(katmp);
+        free(latent); free(kvtmp); free(rope); free(head_out); free(scores);
+        return -1;
+    }
+
+    for (int t = 0; t < S; ++t) {
+        const float *xt = x + (size_t)t * H;
+        kvl_matvec_bf16(qtmp, xt, w->q_proj, H, QO);
+        kvl_matvec_bf16(katmp, xt, w->kv_a_proj, H, KVO);
+        kvl_rmsnorm_bf16(latent, katmp, w->kv_a_norm, R, cfg->rms_eps);
+        kvl_matvec_bf16(kvtmp, latent, w->kv_b_proj, R, KVB);
+        rope_interleaved(rope, katmp + R, DR, t, cfg->rope_theta);
+
+        for (int h = 0; h < NH; ++h) {
+            const float *qh = qtmp + (size_t)h * QD;
+            float *qd = q_states + ((size_t)t * NH + h) * QD;
+            memcpy(qd, qh, (size_t)DN * sizeof(float));
+            rope_interleaved(qd + DN, qh + DN, DR, t, cfg->rope_theta);
+
+            const float *kvh = kvtmp + (size_t)h * (DN + DV);
+            float *kd = k_states + ((size_t)t * NH + h) * QD;
+            memcpy(kd, kvh, (size_t)DN * sizeof(float));
+            memcpy(kd + DN, rope, (size_t)DR * sizeof(float));
+            memcpy(v_states + ((size_t)t * NH + h) * DV,
+                   kvh + DN, (size_t)DV * sizeof(float));
+        }
+    }
+
+    const float scale = 1.0f / sqrtf((float)QD);
+    for (int t = 0; t < S; ++t) {
+        for (int h = 0; h < NH; ++h) {
+            const float *q = q_states + ((size_t)t * NH + h) * QD;
+            float max_score = -INFINITY;
+            for (int j = 0; j <= t; ++j) {
+                const float *k = k_states + ((size_t)j * NH + h) * QD;
+                double dot = 0.0;
+                for (int d = 0; d < QD; ++d) dot += (double)q[d] * (double)k[d];
+                scores[j] = (float)dot * scale;
+                if (scores[j] > max_score) max_score = scores[j];
+            }
+            double denom = 0.0;
+            for (int j = 0; j <= t; ++j) {
+                scores[j] = expf(scores[j] - max_score);
+                denom += scores[j];
+            }
+            float *ho = head_out + (size_t)h * DV;
+            for (int d = 0; d < DV; ++d) {
+                double acc = 0.0;
+                for (int j = 0; j <= t; ++j) {
+                    const float *v = v_states + ((size_t)j * NH + h) * DV;
+                    acc += ((double)scores[j] / denom) * (double)v[d];
+                }
+                ho[d] = (float)acc;
+            }
+        }
+        kvl_matvec_bf16(out + (size_t)t * H, head_out, w->o_proj, NH * DV, H);
+    }
+
+    free(q_states); free(k_states); free(v_states); free(qtmp); free(katmp);
+    free(latent); free(kvtmp); free(rope); free(head_out); free(scores);
+    return 0;
+}
+
 int kvl_mlp_bf16(float *y, const float *x, const KvlMlpBF16 *mlp,
                  int hidden_size, float *scratch) {
     if (!y || !x || !mlp || !mlp->gate || !mlp->up || !mlp->down ||
