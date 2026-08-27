@@ -15,6 +15,25 @@ typedef struct {
 } KvlRouterConfig;
 
 typedef struct {
+    int hidden_size;
+    int num_heads;
+    int qk_nope_dim;
+    int qk_rope_dim;
+    int v_head_dim;
+    int kv_lora_rank;
+    float rms_eps;
+    float rope_theta;
+} KvlMlaConfig;
+
+typedef struct {
+    const uint16_t *q_proj;
+    const uint16_t *kv_a_proj;
+    const uint16_t *kv_a_norm;
+    const uint16_t *kv_b_proj;
+    const uint16_t *o_proj;
+} KvlMlaBF16;
+
+typedef struct {
     const uint16_t *gate;
     const uint16_t *up;
     const uint16_t *down;
@@ -25,6 +44,11 @@ float kvl_bf16_to_f32(uint16_t x);
 void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
                      int in, int out);
 void kvl_silu_mul(float *y, const float *gate, const float *up, int n);
+void kvl_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
+                      int n, float eps);
+int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
+                         const KvlMlaConfig *cfg, const KvlMlaBF16 *w);
+
 int kvl_mlp_bf16(float *y, const float *x, const KvlMlpBF16 *mlp,
                  int hidden_size, float *scratch);
 
