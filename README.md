@@ -17,6 +17,8 @@ oracle.
 - Synthetic oracle uses **64 experts / top-6**, matching released Kimi-VL routing
   cardinality, while reducing matrix dimensions so CI/tests are tiny.
 - One-layer real-checkpoint fixture generator avoids instantiating the full 32.8 GB model.
+- `tools/fetch_real_v2.py` downloads only the checkpoint shards that contain one requested
+  decoder layer's MLP tensors instead of snapshotting the whole model.
 
 ## Build
 
@@ -46,14 +48,46 @@ cmake --build build-asan
 python tests/test_moe_oracle.py --build-dir build-asan
 ```
 
-## Validate one real model layer later
+## Pull only the real weights needed for V2
 
-This does **not** load Transformers or all model weights into RAM:
+Install the small Python-side dependencies first:
 
 ```sh
-python tools/pack_experts.py D:/models/Kimi-VL-A3B-Instruct D:/models/Kimi-VL-layer1 --layer 1
+pip install huggingface_hub safetensors torch
+```
+
+Resolve the exact shards for decoder layer 1 without downloading large files:
+
+```sh
+python tools/fetch_real_v2.py D:/models/Kimi-VL-real-v2 --layer 1 --metadata-only
+```
+
+Then download only those resolved shards:
+
+```sh
+python tools/fetch_real_v2.py D:/models/Kimi-VL-real-v2 --layer 1
+```
+
+The script first fetches `config.json` and `model.safetensors.index.json`, matches
+`language_model.model.layers.1.mlp.*`, writes `real_v2_download_plan.json`, then downloads
+only the safetensors shards containing those tensors. The official checkpoint is split
+into seven shards of roughly 5 GB each (the last is smaller), so this avoids automatically
+pulling the full ~32.8 GB repository.
+
+## Validate one real model layer
+
+This does **not** instantiate Transformers or load the whole model into RAM:
+
+```sh
+python tools/pack_experts.py \
+  D:/models/Kimi-VL-real-v2 \
+  D:/models/Kimi-VL-layer1 \
+  --layer 1
+
 python tools/dump_real_moe_reference.py \
-  D:/models/Kimi-VL-A3B-Instruct D:/models/Kimi-VL-layer1/layer1.fixture --layer 1
+  D:/models/Kimi-VL-real-v2 \
+  D:/models/Kimi-VL-layer1/layer1.fixture \
+  --layer 1
 
 build/kvl_moe_probe \
   D:/models/Kimi-VL-layer1/experts.bin \
