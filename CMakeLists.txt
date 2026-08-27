@@ -36,3 +36,6 @@ target_link_libraries(kvl_layer_probe PRIVATE kvl_storage)
 
 add_executable(kvl_stack_probe src/stack_probe.c)
 target_link_libraries(kvl_stack_probe PRIVATE kvl_storage)
+
+add_executable(kvl_logits_probe src/logits_probe.c)
+target_link_libraries(kvl_logits_probe PRIVATE kvl_storage)
