@@ -9,6 +9,7 @@ find_package(OpenMP)
 add_library(kvl_storage
   src/expert_store.c
   src/expert_cache.c
+  src/trunk_store.c
   src/ops.c
 )
 target_include_directories(kvl_storage PUBLIC include)
@@ -32,3 +33,6 @@ target_link_libraries(kvl_moe_probe PRIVATE kvl_storage)
 
 add_executable(kvl_layer_probe src/layer_probe.c)
 target_link_libraries(kvl_layer_probe PRIVATE kvl_storage)
+
+add_executable(kvl_stack_probe src/stack_probe.c)
+target_link_libraries(kvl_stack_probe PRIVATE kvl_storage)
