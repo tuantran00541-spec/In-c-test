@@ -1,0 +1,71 @@
+name: Real Kimi-VL V4 stack
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v4.yml"
+
+jobs:
+  real-stack-0-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build C runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+
+      - name: Synthetic V4 regression
+        run: python tests/test_stack_oracle.py --build-dir build
+
+      - name: Download real layer 0 only
+        run: python tools/fetch_real_v4.py "$RUNNER_TEMP/kimi-vl" --layers 0
+
+      - name: Pack layer 0 resident trunk
+        run: python tools/pack_trunk.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed" --layers 0
+
+      - name: Drop raw layer 0 shard before next download
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          root=pathlib.Path("${{ runner.temp }}/kimi-vl")
+          plan=json.loads((root/'real_v4_download_plan.json').read_text())
+          for name in plan['shards']:
+              p=root/name
+              if p.exists():
+                  print('deleting', p)
+                  p.unlink()
+          PY
+
+      - name: Download real layer 1 only
+        run: python tools/fetch_real_v4.py "$RUNNER_TEMP/kimi-vl" --layers 1
+
+      - name: Append layer 1 resident trunk
+        run: python tools/pack_trunk.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed" --layers 1 --append
+
+      - name: Pack layer 1 routed experts
+        run: python tools/pack_experts.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed" --layer 1
+
+      - name: Generate real two-layer Torch oracle from packed trunk
+        run: python tools/dump_real_stack_reference.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed" "$RUNNER_TEMP/packed/v4.fixture" --seq-len 4
+
+      - name: Compare C stack with real oracle under 256 MiB expert cache
+        run: |
+          ./build/kvl_stack_probe \
+            "$RUNNER_TEMP/packed/trunk.bin" \
+            "$RUNNER_TEMP/packed/trunk.idx" \
+            "$RUNNER_TEMP/packed/experts.bin" \
+            "$RUNNER_TEMP/packed/experts.idx" \
+            "$RUNNER_TEMP/packed/v4.fixture" \
+            268435456
