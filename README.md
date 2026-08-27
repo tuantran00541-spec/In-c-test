@@ -4,8 +4,12 @@ CPU-first low-RAM inference prototype for `moonshotai/Kimi-VL-A3B-Instruct`, bor
 storage discipline of `kimi-k3-in-c` while keeping model-specific math separate.
 
 V2 is the first numerical milestone: a complete **one-token Kimi/DeepSeek-style MoE
-forward** now runs through the streamed expert cache and is checked against a PyTorch
-oracle.
+forward** runs through the streamed expert cache and is checked against a PyTorch oracle.
+
+**Real-weight status: PASS.** On 2026-08-27 the layer-1 MoE path was tested against the
+official Kimi-VL checkpoint. The C runtime selected the same top-6 experts as the Torch
+oracle and reached `2.2351742e-08` max absolute output error with direct I/O enabled.
+See `spec/REAL_V2_RESULT.md`.
 
 ## What works
 
@@ -16,6 +20,7 @@ oracle.
   weights, BF16 direct GEMV, SiLU-GLU, routed weighted sum, resident shared MLP.
 - Synthetic oracle uses **64 experts / top-6**, matching released Kimi-VL routing
   cardinality, while reducing matrix dimensions so CI/tests are tiny.
+- Real Kimi-VL layer-1 MLP test passes end-to-end using one official ~5 GB checkpoint shard.
 - One-layer real-checkpoint fixture generator avoids instantiating the full 32.8 GB model.
 - `tools/fetch_real_v2.py` downloads only the checkpoint shards that contain one requested
   decoder layer's MLP tensors instead of snapshotting the whole model.
@@ -35,8 +40,9 @@ python tests/test_cache_roundtrip.py --build-dir build
 python tests/test_moe_oracle.py --build-dir build
 ```
 
-The V2 oracle currently reaches about `1.5e-8` max absolute error on its deterministic
-fixture after the BF16 bytes have gone through safetensors -> packer -> direct-I/O cache.
+The synthetic V2 oracle reaches about `1.5e-8` max absolute error after the BF16 bytes
+have gone through safetensors -> packer -> direct-I/O cache. The real-weight layer-1 probe
+reaches `2.2351742e-08` max absolute MoE output error.
 
 Sanitizer build used during development:
 
@@ -50,10 +56,10 @@ python tests/test_moe_oracle.py --build-dir build-asan
 
 ## Pull only the real weights needed for V2
 
-Install the small Python-side dependencies first:
+Install the Python-side dependencies:
 
 ```sh
-pip install huggingface_hub safetensors torch
+pip install huggingface_hub safetensors torch numpy
 ```
 
 Resolve the exact shards for decoder layer 1 without downloading large files:
@@ -68,11 +74,9 @@ Then download only those resolved shards:
 python tools/fetch_real_v2.py D:/models/Kimi-VL-real-v2 --layer 1
 ```
 
-The script first fetches `config.json` and `model.safetensors.index.json`, matches
-`language_model.model.layers.1.mlp.*`, writes `real_v2_download_plan.json`, then downloads
-only the safetensors shards containing those tensors. The official checkpoint is split
-into seven shards of roughly 5 GB each (the last is smaller), so this avoids automatically
-pulling the full ~32.8 GB repository.
+For the current official checkpoint, all 197 layer-1 MLP tensors resolve to one shard:
+`model-00003-of-00007.safetensors`. The script discovers this from the checkpoint index;
+it is not hardcoded.
 
 ## Validate one real model layer
 
@@ -96,7 +100,8 @@ build/kvl_moe_probe \
   1200000000
 ```
 
-See `spec/V2_NUMERICS.md` for the numerical contract and its deliberate precision limits.
+See `spec/V2_NUMERICS.md` for the numerical contract and
+`spec/REAL_V2_RESULT.md` for the first official-weight result.
 
 ## Next: V3
 
