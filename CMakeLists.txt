@@ -29,3 +29,6 @@ target_link_libraries(kvl_cache_probe PRIVATE kvl_storage)
 
 add_executable(kvl_moe_probe src/moe_probe.c)
 target_link_libraries(kvl_moe_probe PRIVATE kvl_storage)
+
+add_executable(kvl_layer_probe src/layer_probe.c)
+target_link_libraries(kvl_layer_probe PRIVATE kvl_storage)
