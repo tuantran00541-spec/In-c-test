@@ -1,37 +1,31 @@
-# kimi-vl-lowram v3
+# kimi-vl-lowram v4
 
 CPU-first low-RAM inference prototype for `moonshotai/Kimi-VL-A3B-Instruct`, borrowing the
 storage discipline of `kimi-k3-in-c` while keeping model-specific math separate.
 
-**Real-weight V3 status: PASS.** On 2026-08-27 a complete four-token causal prefill through
-Kimi-VL decoder layer 1 ran in C using official weights:
+**Real-weight V4 status: PASS.** On 2026-08-27 a four-token prefill was chained through
+official decoder layers 0 -> 1 in C. Layer 0 is the model's dense first layer; layer 1 is
+sparse MoE. Resident tensors were read from a new aligned `trunk.bin/trunk.idx`, routed
+experts from `experts.bin/experts.idx`, and both paths used direct I/O.
 
-```text
-RMSNorm -> MLA/RoPE/causal attention -> residual
-        -> RMSNorm -> streamed top-6 MoE -> residual
-```
-
-The final layer output matched the manual PyTorch oracle with `1.1920929e-07` max absolute
-error. The routed expert pack was 1.031 GiB while the test cache was hard-capped at 256 MiB,
-forcing real direct-I/O reads and evictions. See `spec/REAL_V3_RESULT.md`.
+The final two-layer output matched the PyTorch oracle with `1.1920929e-07` max absolute
+error under a 256 MiB expert-cache cap. See `spec/REAL_V4_RESULT.md`.
 
 ## What works
 
 - **V0:** safetensors routed-expert packer -> aligned `experts.bin` + `experts.idx`.
-- **V1:** hard-budget LRU, `EMPTY/INFLIGHT/VALID`, offset-sorted concurrent `getmany()`
-  reads, portable direct I/O, cache metrics.
-- **V2:** Kimi/DeepSeek-style router, BF16 streamed expert GEMV, SiLU-GLU, routed weighted
-  sum and resident shared expert. Official layer-1 MoE weights pass the Torch oracle.
-- **V3:** RMSNorm + Kimi-VL MLA + exact RoPE permutation + causal attention + residuals +
-  V2 streamed MoE. A real four-token decoder-layer probe passes end-to-end.
-- Synthetic V0/V1/V2/V3 regressions are available under `tests/`; V3 was also exercised
-  under AddressSanitizer and UndefinedBehaviorSanitizer during development.
-- `tools/fetch_real_v2.py` and `tools/fetch_real_v3.py` resolve only the checkpoint shard(s)
-  required for a requested layer instead of snapshotting the full ~32.8 GB model.
-
-For the current official checkpoint, the complete decoder layer 1 (205 tensors) resolves to
-one shard: `model-00003-of-00007.safetensors`. This is discovered from the checkpoint index,
-not hardcoded.
+- **V1:** hard-budget LRU with `EMPTY/INFLIGHT/VALID`, offset-sorted concurrent `getmany()`
+  reads, portable direct I/O, and cache metrics.
+- **V2:** real Kimi/DeepSeek-style router + BF16 streamed MoE; official layer-1 weights pass.
+- **V3:** RMSNorm + Kimi-VL MLA/RoPE/causal attention + residuals + streamed MoE; one full
+  official decoder layer passes on a four-token sequence.
+- **V4:** a separate aligned trunk backing store plus a real multi-layer stack. Official
+  layer 0 (dense) -> layer 1 (MoE) passes end-to-end with both trunk and expert direct I/O.
+- **Bounded-shard conversion:** V4 downloaded layer 0's source shard, packed it, deleted the
+  raw shard, then downloaded/packed layer 1. The converter therefore does not need the full
+  checkpoint resident on disk at once.
+- Synthetic regressions exist for every milestone; V3/V4 paths were also exercised with
+  AddressSanitizer and UndefinedBehaviorSanitizer during development.
 
 ## Build
 
@@ -47,66 +41,59 @@ python tests/test_pack_roundtrip.py
 python tests/test_cache_roundtrip.py --build-dir build
 python tests/test_moe_oracle.py --build-dir build
 python tests/test_layer_oracle.py --build-dir build
+python tests/test_stack_oracle.py --build-dir build
 ```
 
-## Pull only the real weights needed for V3
+## Runtime backing-store layout
 
-Install Python-side dependencies:
+```text
+trunk.bin / trunk.idx
+  attention projections
+  RMSNorms
+  dense layer-0 MLP
+  MoE routers
+  shared experts
+  (global embeddings/final norm/LM head are reserved for V5)
 
-```sh
-pip install huggingface_hub safetensors torch numpy
+experts.bin / experts.idx
+  routed expert gate/up/down matrices
 ```
 
-Resolve the exact shard without downloading it:
+Records are 4096-byte aligned. The current V4 probe loads one layer's trunk records,
+computes the layer, frees them, and advances. A later optimization can replace these
+independent reads with layer-contiguous ring slots without changing the numerical path.
 
-```sh
-python tools/fetch_real_v3.py D:/models/Kimi-VL-real-v3 --layer 1 --metadata-only
+## Real V4 result
+
+The passing official-weight run used:
+
+```text
+trunk data      0.213 GiB   (layers 0 and 1 only)
+expert data     1.031 GiB   (64 BF16 routed experts for layer 1)
+expert cache    256 MiB
+unique experts  17 across four tokens
+expert reads    280.50 MiB
+expert evictions 2
+
+C vs Torch:
+dense_layer_max  5.9604645e-08
+router_ids        OK
+max_weight_abs    8.9406967e-08
+final_max         1.1920929e-07
+final_rms         1.765652e-08
+trunk_direct_io   yes
+expert_direct_io  yes
 ```
 
-Then download only the resolved shard(s):
+The real workflow is `.github/workflows/real-v4.yml` and the recorded baseline is
+`spec/REAL_V4_RESULT.md`.
 
-```sh
-python tools/fetch_real_v3.py D:/models/Kimi-VL-real-v3 --layer 1
-```
+## Next: V5 logits
 
-Pack routed experts and create a four-token full-layer oracle:
+V5 generalizes the stack into an arbitrary 27-layer decoder loop, extends the bounded-shard
+packer across the whole text model, and adds global token embeddings, final RMSNorm and LM
+head. The target milestone is **real full-prefill text logits from the C runtime**.
 
-```sh
-python tools/pack_experts.py \
-  D:/models/Kimi-VL-real-v3 \
-  D:/models/Kimi-VL-layer1 \
-  --layer 1
-
-python tools/dump_real_layer_reference.py \
-  D:/models/Kimi-VL-real-v3 \
-  D:/models/Kimi-VL-layer1/layer1-v3.fixture \
-  --layer 1 --seq-len 4
-```
-
-Run the C layer probe with a 256 MiB expert-cache cap:
-
-```sh
-build/kvl_layer_probe \
-  D:/models/Kimi-VL-layer1/experts.bin \
-  D:/models/Kimi-VL-layer1/experts.idx \
-  D:/models/Kimi-VL-layer1/layer1-v3.fixture \
-  268435456
-```
-
-See:
-
-- `spec/V2_NUMERICS.md`
-- `spec/REAL_V2_RESULT.md`
-- `spec/V3_DECODER_LAYER.md`
-- `spec/REAL_V3_RESULT.md`
-
-## Next: V4
-
-V4 moves from a single layer to a **real text-decoder path**. The immediate targets are:
-
-1. pack/load the always-active trunk cleanly instead of embedding resident tensors in a
-   test fixture;
-2. chain multiple real decoder layers, then all 27;
-3. add persistent compressed MLA KV state for incremental decoding;
-4. add token embeddings, final RMSNorm and LM head so the C runtime can produce real logits;
-5. only after the text path is stable, add quantized expert kernels and MoonViT vision.
+After full-prefill logits match the oracle, incremental MLA/KV state, tokenizer/sampling,
+quantized expert kernels and MoonViT vision can be added one at a time without mixing their
+failure modes.
