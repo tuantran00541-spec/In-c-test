@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Pack Kimi-VL non-routed tensors into aligned trunk.bin/trunk.idx.
 
-The format is intentionally simple: every tensor is an independently aligned direct-I/O
-record. V4 streams one decoder layer's resident tensors, computes the layer, then frees
-them. Later versions can coalesce records into layer-contiguous ring slots without
-changing model math.
+Every tensor is an independently aligned direct-I/O record. V5 adds selective model-global
+records so embedding/final-norm/LM-head can be consumed from different source shards while
+using the bounded-shard converter.
 """
 import argparse, json, pathlib, struct
 from safetensors import safe_open
@@ -51,10 +50,8 @@ def load_existing(idx_path):
     if len(raw)<HDR.size: raise SystemExit('bad existing trunk.idx')
     magic,version,align,nrec,reserved,roff,data_bytes=HDR.unpack_from(raw,0)
     if magic!=MAGIC or version!=VERSION or align!=ALIGN or roff!=HDR.size: raise SystemExit('incompatible existing trunk.idx')
-    recs=[]
-    off=roff
-    for _ in range(nrec):
-        recs.append(REC.unpack_from(raw,off)); off+=REC.size
+    recs=[]; off=roff
+    for _ in range(nrec): recs.append(REC.unpack_from(raw,off)); off+=REC.size
     return recs
 
 def main():
@@ -62,7 +59,8 @@ def main():
     ap.add_argument('model_dir',type=pathlib.Path)
     ap.add_argument('out_dir',type=pathlib.Path)
     ap.add_argument('--layers',default='0,1',help='comma-separated decoder layer ids')
-    ap.add_argument('--include-globals',action='store_true')
+    ap.add_argument('--include-globals',action='store_true',help='pack all model-global text tensors')
+    ap.add_argument('--global',dest='globals',action='append',choices=['embed','final_norm','lm_head'],help='pack one global tensor (repeatable)')
     ap.add_argument('--append',action='store_true')
     args=ap.parse_args()
     layers=[int(x) for x in args.layers.split(',') if x.strip()]
@@ -82,10 +80,9 @@ def main():
         if not path.exists(): raise FileNotFoundError(f'{path} required for {name}')
         with safe_open(path,framework='pt',device='cpu') as f: return f.get_tensor(name)
     specs=[]
-    if args.include_globals:
-        specs += [(GLOBAL,'embed','language_model.model.embed_tokens.weight'),
-                  (GLOBAL,'final_norm','language_model.model.norm.weight'),
-                  (GLOBAL,'lm_head','language_model.lm_head.weight')]
+    global_names={'embed':'language_model.model.embed_tokens.weight','final_norm':'language_model.model.norm.weight','lm_head':'language_model.lm_head.weight'}
+    selected_globals=list(global_names) if args.include_globals else (args.globals or [])
+    for g in selected_globals: specs.append((GLOBAL,g,global_names[g]))
     for L in layers:
         is_moe=(int(cfg['n_routed_experts'])>0 and L>=first_dense and L%freq==0)
         for key,name in tensor_spec(L,not is_moe): specs.append((L,key,name))
