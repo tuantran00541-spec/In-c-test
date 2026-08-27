@@ -1,0 +1,50 @@
+#ifndef KVL_V3_FIXTURE_H
+#define KVL_V3_FIXTURE_H
+#include <stdint.h>
+#define KVL_V3_FIXTURE_MAGIC "KVLV3OR1"
+#pragma pack(push,1)
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t seq_len;
+    uint32_t hidden;
+    uint32_t num_heads;
+    uint32_t qk_nope_dim;
+    uint32_t qk_rope_dim;
+    uint32_t v_head_dim;
+    uint32_t kv_lora_rank;
+    uint32_t expert_intermediate;
+    uint32_t shared_intermediate;
+    uint32_t n_experts;
+    uint32_t top_k;
+    uint32_t n_group;
+    uint32_t topk_group;
+    uint32_t layer;
+    uint32_t norm_topk_prob;
+    float rms_eps;
+    float rope_theta;
+    float routed_scaling_factor;
+    uint64_t off_x;
+    uint64_t off_input_norm;
+    uint64_t off_q_proj;
+    uint64_t off_kv_a;
+    uint64_t off_kv_a_norm;
+    uint64_t off_kv_b;
+    uint64_t off_o_proj;
+    uint64_t off_post_norm;
+    uint64_t off_router;
+    uint64_t off_bias;
+    uint64_t off_shared_gate;
+    uint64_t off_shared_up;
+    uint64_t off_shared_down;
+    uint64_t off_expected_norm1;
+    uint64_t off_expected_attn;
+    uint64_t off_expected_resid1;
+    uint64_t off_expected_norm2;
+    uint64_t off_expected_ids;
+    uint64_t off_expected_weights;
+    uint64_t off_expected_out;
+    uint64_t file_bytes;
+} KvlV3FixtureHeader;
+#pragma pack(pop)
+#endif
