@@ -1,0 +1,38 @@
+name: Kimi-VL V5 text metadata probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/hf-v5-metadata.yml"
+
+jobs:
+  resolve-text-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install metadata dependency
+        run: python -m pip install --disable-pip-version-check huggingface_hub
+      - name: Resolve all decoder-layer shards
+        run: |
+          python tools/fetch_real_v4.py "$RUNNER_TEMP/kimi-vl-v5-meta" \
+            --layers 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26 \
+            --metadata-only
+      - name: Resolve global text tensors
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          root=pathlib.Path("${{ runner.temp }}/kimi-vl-v5-meta")
+          wm=json.loads((root/'model.safetensors.index.json').read_text())['weight_map']
+          names=[
+            'language_model.model.embed_tokens.weight',
+            'language_model.model.norm.weight',
+            'language_model.lm_head.weight',
+          ]
+          for n in names:
+              print(n, '->', wm.get(n))
+          print('global text shards:', sorted({wm[n] for n in names if n in wm}))
+          PY
