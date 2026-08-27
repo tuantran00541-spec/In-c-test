@@ -1,0 +1,21 @@
+name: Kimi-VL V3 metadata probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/hf-v3-metadata.yml"
+      - "tools/fetch_real_v3.py"
+
+jobs:
+  resolve-layer-1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install metadata dependency
+        run: python -m pip install --disable-pip-version-check huggingface_hub
+      - name: Resolve complete decoder layer 1
+        run: python tools/fetch_real_v3.py "$RUNNER_TEMP/kimi-vl-v3-meta" --layer 1 --metadata-only
