@@ -1,0 +1,22 @@
+name: Hugging Face metadata probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/hf-metadata.yml"
+      - "tools/fetch_real_v2.py"
+
+jobs:
+  resolve-layer-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install metadata dependency
+        run: python -m pip install --disable-pip-version-check huggingface_hub
+      - name: Resolve Kimi-VL layer 1 shards
+        run: python tools/fetch_real_v2.py "$RUNNER_TEMP/kimi-vl-meta" --layer 1 --metadata-only
