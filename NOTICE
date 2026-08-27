@@ -1,0 +1,6 @@
+This project is an independent experimental implementation inspired by the storage-aware
+inference architecture of FareedKhan-dev/kimi-k3-in-c (Apache-2.0), especially its
+hard-budget expert cache, batched top-k prefetch, direct positioned I/O, and publish-after-
+read cache discipline.
+
+No model weights are included.

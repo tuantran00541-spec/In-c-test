@@ -1,0 +1,16 @@
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.pdb
+__pycache__/
+*.py[cod]
+.DS_Store
+.vscode/
+.idea/
+*.bin
+*.idx
+*.fixture
