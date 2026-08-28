@@ -14,30 +14,51 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <io.h>
+
+/* Windows positioned reads use an overlapped handle even though the public API is
+ * synchronous. Each read owns an event and waits for completion, which makes concurrent
+ * cache prefetches safe without sharing or mutating a file pointer. FILE_FLAG_NO_BUFFERING
+ * is added independently when direct I/O is requested. */
 static int kvl_open_data(const char *path, int direct) {
-    DWORD flags = FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING : 0);
+    DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                  (direct ? FILE_FLAG_NO_BUFFERING : 0);
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, flags, NULL);
     if (h == INVALID_HANDLE_VALUE) return -1;
     int fd = _open_osfhandle((intptr_t)h, _O_RDONLY | _O_BINARY);
     if (fd < 0) CloseHandle(h);
     return fd;
 }
+
 static int64_t kvl_pread(int fd, void *buf, size_t n, uint64_t off) {
     HANDLE h = (HANDLE)_get_osfhandle(fd);
     if (h == INVALID_HANDLE_VALUE) return -1;
     size_t done = 0;
     while (done < n) {
         DWORD chunk = (DWORD)((n - done) > 0x40000000u ? 0x40000000u : (n - done));
-        OVERLAPPED ov; memset(&ov, 0, sizeof ov);
+        OVERLAPPED ov;
+        memset(&ov, 0, sizeof ov);
         uint64_t at = off + done;
-        ov.Offset = (DWORD)at; ov.OffsetHigh = (DWORD)(at >> 32);
+        ov.Offset = (DWORD)at;
+        ov.OffsetHigh = (DWORD)(at >> 32);
+        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) return -1;
+
         DWORD got = 0;
-        if (!ReadFile(h, (unsigned char*)buf + done, chunk, &got, &ov)) return -1;
+        BOOL ok = ReadFile(h, (unsigned char *)buf + done, chunk, &got, &ov);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING || !GetOverlappedResult(h, &ov, &got, TRUE)) {
+                CloseHandle(ov.hEvent);
+                return -1;
+            }
+        }
+        CloseHandle(ov.hEvent);
         if (!got) break;
         done += got;
     }
     return (int64_t)done;
 }
+
 static int kvl_aligned_alloc(void **out, size_t align, size_t n) {
     *out = _aligned_malloc(n, align);
     return *out ? 0 : -1;
