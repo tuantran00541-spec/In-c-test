@@ -12,6 +12,10 @@ on:
       - "src/ops.c"
       - "src/mla_state.c"
       - "src/mla_compressed_state.c"
+      - "src/vision.c"
+      - "src/vision_probe.c"
+      - "src/generate.c"
+      - "src/generate_vl.c"
       - "tests/test_cache_roundtrip.py"
       - "tests/test_stack_oracle.py"
       - "tools/pack_experts.py"
@@ -36,6 +40,8 @@ jobs:
         run: |
           cmake -S . -B build -A x64
           cmake --build build --config Release --parallel 2
+          if (-not (Test-Path build/Release/kvl_vision.exe)) { throw "kvl_vision.exe missing" }
+          if (-not (Test-Path build/Release/kvl_generate_vl.exe)) { throw "kvl_generate_vl.exe missing" }
       - name: Exercise Windows expert direct I/O
         shell: pwsh
         run: |
