@@ -1,0 +1,35 @@
+name: Real Kimi-VL V6 compressed MLA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v6-mla.yml"
+
+jobs:
+  real-layer-1-mla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install packer dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+      - name: Pull only official decoder layer 1 shard
+        run: python tools/fetch_real_v4.py "$RUNNER_TEMP/kimi-vl-v6" --layers 1
+      - name: Pack only layer 1 resident attention/trunk tensors
+        run: python tools/pack_trunk.py "$RUNNER_TEMP/kimi-vl-v6" "$RUNNER_TEMP/v6-trunk" --layers 1
+      - name: Compare official-weight causal prefill, expanded state, and compressed state
+        run: |
+          ./build/kvl_mla_real_probe \
+            "$RUNNER_TEMP/v6-trunk/trunk.bin" \
+            "$RUNNER_TEMP/v6-trunk/trunk.idx" \
+            1
