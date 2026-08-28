@@ -1,0 +1,72 @@
+name: V9 exact VI official generation-config sampling diagnostic
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-user-vi-official-sampling.yml"
+  workflow_dispatch:
+
+jobs:
+  vi-official-sampling:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+      - name: Restore exact VI image and fetch runtime assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+      - name: Fetch vision shard and pack vision
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct',filename=name,local_dir=root)
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+      - name: Pack full official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+      - name: Run exact VI prompt with official default temperature 0.2 and fixed seed
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-vi.jpg" \
+            "Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu." \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 24 --temperature 0.2 --seed 1 --show-tokens \
+            2> >(tee "$RUNNER_TEMP/vi-stderr.txt" >&2) | tee "$RUNNER_TEMP/vi-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-stderr.txt"
+      - name: Semantic diagnostic
+        run: |
+          python - <<'PY'
+          import os
+          p=os.path.join(os.environ['RUNNER_TEMP'],'vi-output.txt')
+          text=open(p,encoding='utf-8').read().strip()
+          print('VI_OFFICIAL_SAMPLING_OUTPUT=',text)
+          bad=('chưa được cung','không được cung','không có ảnh','chưa có ảnh')
+          print('KNOWN_ABSENT_IMAGE_PHRASE=',any(x in text.lower() for x in bad))
+          PY
