@@ -1,0 +1,43 @@
+name: V9 exact multimodal processor oracle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-multimodal-processor-oracle.yml"
+      - "tests/test_multimodal_processor_oracle.py"
+      - "tools/kimi_tokenizer.py"
+      - "tools/kimi_image.py"
+      - ".github/testdata/kimi-user-vi.jpg.b64"
+      - ".github/testdata/kimi-user-en.jpg.b64"
+
+jobs:
+  processor-oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install official frontend dependencies
+        run: |
+          python -m pip install --no-cache-dir numpy pillow tiktoken transformers huggingface_hub
+          python -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Restore exact user images
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+
+      - name: Fetch released tokenizer and preprocessing assets
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/runtime"
+
+      - name: Compare real AutoProcessor with runtime frontend
+        run: |
+          python tests/test_multimodal_processor_oracle.py \
+            "$RUNNER_TEMP/runtime" \
+            "$RUNNER_TEMP/user-vi.jpg" \
+            "$RUNNER_TEMP/user-en.jpg"
