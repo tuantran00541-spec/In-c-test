@@ -1,0 +1,102 @@
+name: V9 user two-image bilingual smoke
+
+on:
+  push:
+    branches:
+      - v9-user-image-smoke
+    paths:
+      - ".github/workflows/v9-user-two-images.yml"
+
+jobs:
+  bilingual-image-chat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build V9 AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_vision
+          test -x ./build/kvl_generate_vl
+
+      - name: Fetch runtime assets
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+
+      - name: Fetch vision shard and pack MoonViT
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-user')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root))
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9"
+
+      - name: Convert complete official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9"
+          du -h "$RUNNER_TEMP/packed-v9"/*.bin
+
+      - name: Vietnamese image prompt
+        shell: bash
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" tests/assets/user-smoke/image_vi.jpg \
+            "Hãy nhìn ảnh và mô tả nội dung chính bằng đúng một câu tiếng Việt ngắn." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 20 --temperature 0 --seed 1 \
+            --show-tokens \
+            2> >(tee "$RUNNER_TEMP/vi-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/vi-output.txt"
+          test -s "$RUNNER_TEMP/vi-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-stderr.txt"
+
+      - name: English image prompt
+        shell: bash
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" tests/assets/user-smoke/image_en.jpg \
+            "Look at the image and describe the main content in exactly one short English sentence." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 20 --temperature 0 --seed 1 \
+            --show-tokens \
+            2> >(tee "$RUNNER_TEMP/en-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/en-output.txt"
+          test -s "$RUNNER_TEMP/en-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/en-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/en-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/en-stderr.txt"
+
+      - name: Print bilingual outputs
+        shell: bash
+        run: |
+          echo '=== VI OUTPUT ==='
+          cat "$RUNNER_TEMP/vi-output.txt"
+          echo
+          echo '=== EN OUTPUT ==='
+          cat "$RUNNER_TEMP/en-output.txt"
+          echo
