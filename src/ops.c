@@ -5,12 +5,50 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef KVL_USE_AVX2
+#include <immintrin.h>
+#endif
+
 float kvl_bf16_to_f32(uint16_t x) {
     uint32_t bits = (uint32_t)x << 16;
     float f;
     memcpy(&f, &bits, sizeof f);
     return f;
 }
+
+static float dot_bf16_ref(const uint16_t *row, const float *x, int n) {
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i)
+        acc += (double)kvl_bf16_to_f32(row[i]) * (double)x[i];
+    return (float)acc;
+}
+
+#ifdef KVL_USE_AVX2
+/* Convert eight BF16 words to FP32 by zero-extending to uint32 and shifting into
+ * the high half of each IEEE float. Accumulate in FP32: this backend is intentionally
+ * treated as a performance implementation and is regression-tested against the scalar
+ * double-accumulation reference before release. */
+static float dot_bf16_avx2(const uint16_t *row, const float *x, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i w16 = _mm_loadu_si128((const __m128i *)(row + i));
+        __m256i w32 = _mm256_cvtepu16_epi32(w16);
+        w32 = _mm256_slli_epi32(w32, 16);
+        const __m256 wf = _mm256_castsi256_ps(w32);
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(wf, xv));
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float out = _mm_cvtss_f32(sum);
+    for (; i < n; ++i) out += kvl_bf16_to_f32(row[i]) * x[i];
+    return out;
+}
+#endif
 
 void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
                      int in, int out) {
@@ -19,10 +57,11 @@ void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
 #endif
     for (int o = 0; o < out; ++o) {
         const uint16_t *row = w + (size_t)o * (size_t)in;
-        double acc = 0.0;
-        for (int i = 0; i < in; ++i)
-            acc += (double)kvl_bf16_to_f32(row[i]) * (double)x[i];
-        y[o] = (float)acc;
+#ifdef KVL_USE_AVX2
+        y[o] = dot_bf16_avx2(row, x, in);
+#else
+        y[o] = dot_bf16_ref(row, x, in);
+#endif
     }
 }
 
