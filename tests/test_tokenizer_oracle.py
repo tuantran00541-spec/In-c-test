@@ -42,7 +42,9 @@ def main() -> None:
     assert got_text == ref_text, (got_text, ref_text)
     got_ids = encode_chat(enc, prompt)
     ref_ids = ref.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
-    assert got_ids == ref_ids, (got_ids, ref_ids)
+    if hasattr(ref_ids, "keys"):
+        ref_ids = ref_ids["input_ids"]
+    assert got_ids == list(ref_ids), (got_ids, ref_ids)
 
     print(f"PASS: tokenizer + text chat template match official oracle; chat_tokens={len(got_ids)}")
 
