@@ -1,0 +1,42 @@
+name: V9 official image preprocessing oracle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-image-processor-oracle.yml"
+      - "tests/test_image_processor_oracle.py"
+      - "tools/kimi_image.py"
+
+jobs:
+  processor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir numpy pillow transformers huggingface_hub
+          python -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - name: Fetch released preprocessing config
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os, shutil
+          out=os.path.join(os.environ['RUNNER_TEMP'],'runtime')
+          os.makedirs(out,exist_ok=True)
+          p=hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct','preprocessor_config.json')
+          shutil.copy2(p,os.path.join(out,'preprocessor_config.json'))
+          PY
+      - name: Create exact red integration fixture
+        run: |
+          python - <<'PY'
+          from PIL import Image
+          import os
+          Image.new('RGB',(28,28),(255,0,0)).save(os.path.join(os.environ['RUNNER_TEMP'],'red.png'))
+          PY
+      - name: Compare lightweight frontend with official processor
+        run: |
+          python tests/test_image_processor_oracle.py "$RUNNER_TEMP/runtime" "$RUNNER_TEMP/red.png"
