@@ -1,0 +1,211 @@
+name: V9 pinned media sensitivity and canonical image diagnostic
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-pinned-media-sensitivity.yml"
+  workflow_dispatch:
+
+jobs:
+  media-sensitivity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Syntax-check generalized official oracles
+        run: |
+          python -m py_compile tools/dump_official_bf16_vision_reference.py
+          python -m py_compile tools/dump_official_streamed_text_prefill.py
+
+      - name: Build V9 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate_vl
+
+      - name: Restore user image and canonical model-card image
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python - <<'PY'
+          import os, urllib.request
+          from PIL import Image
+          out=os.path.join(os.environ['RUNNER_TEMP'],'candy-source.jpg')
+          url='https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG'
+          urllib.request.urlretrieve(url,out)
+          im=Image.open(out).convert('RGB')
+          print('candy source:',im.size)
+          # Keep this diagnostic bounded to the exact same 14x14 patch / 49-media-token shape
+          # as the user regression while retaining the canonical image semantics.
+          im.resize((196,196),Image.Resampling.BICUBIC).save(os.path.join(os.environ['RUNNER_TEMP'],'candy-196.jpg'),quality=95)
+          print('user:',Image.open(os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg')).size)
+          print('candy diagnostic:',Image.open(os.path.join(os.environ['RUNNER_TEMP'],'candy-196.jpg')).size)
+          PY
+
+      - name: Fetch pinned metadata, frontend assets and vision weights
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json, os, shutil
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          work=os.path.join(os.environ['RUNNER_TEMP'],'kimi-pinned')
+          packed=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          os.makedirs(work,exist_ok=True); os.makedirs(packed,exist_ok=True)
+          frontend=('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json')
+          for name in frontend:
+              p=hf_hub_download(repo,revision=rev,filename=name,local_dir=work)
+              shutil.copy2(p,os.path.join(packed,name))
+          for name in ('config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=name,local_dir=work)
+          idx=json.load(open(os.path.join(work,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for name in shards:
+              print(hf_hub_download(repo,revision=rev,filename=name,local_dir=work))
+          print('revision',rev,'vision shards',shards)
+          PY
+
+      - name: Produce pinned official BF16 media for both images
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-pinned')
+          for key,img in [('user','user-vi.jpg'),('candy','candy-196.jpg')]:
+              gh,gw=write_patches(root,os.path.join(os.environ['RUNNER_TEMP'],img),os.path.join(os.environ['RUNNER_TEMP'],f'{key}-patches.f32'))
+              Path(os.path.join(os.environ['RUNNER_TEMP'],f'{key}-grid.txt')).write_text(f'{gh} {gw}\n')
+              print(key,'grid',gh,gw,'media',(gh//2)*(gw//2))
+              assert (gh,gw)==(14,14),(key,gh,gw)
+          PY
+          for key in user candy; do
+            read gh gw < "$RUNNER_TEMP/${key}-grid.txt"
+            python tools/dump_official_bf16_vision_reference.py \
+              "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/${key}-patches.f32" "$gh" "$gw" \
+              "$RUNNER_TEMP/${key}-media.f32" "$RUNNER_TEMP/${key}-media.u16" \
+              --revision "$REV"
+          done
+          python - <<'PY'
+          import numpy as np, os
+          for key in ('user','candy'):
+              root=os.environ['RUNNER_TEMP']
+              u=np.fromfile(os.path.join(root,f'{key}-media.u16'),dtype=np.uint16)
+              f=np.fromfile(os.path.join(root,f'{key}-media.f32'),dtype=np.float32)
+              np.zeros_like(u).tofile(os.path.join(root,f'{key}-zero.u16'))
+              np.zeros_like(f).tofile(os.path.join(root,f'{key}-zero.f32'))
+              print(key,'media elems bf16',u.size,'f32',f.size)
+          PY
+
+      - name: Pack pinned complete text model once
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" --revision "$REV"
+          du -h "$RUNNER_TEMP/packed-v9"/*.bin
+
+      - name: Build exact prompts
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding, encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'
+          enc,_,special=build_encoding(root); pad=special['<|media_pad|>']
+          prompts={
+            'user':'Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.',
+            'candy':'What animal is on the candy?'
+          }
+          for key,prompt in prompts.items():
+              ids=encode_image_chat(enc,prompt,49)
+              assert sum(x==pad for x in ids)==49
+              (Path(os.environ['RUNNER_TEMP'])/f'{key}-prompt.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+              print(key,'prompt tokens',len(ids),'media positions',[i for i,x in enumerate(ids) if x==pad][:2],'-',[i for i,x in enumerate(ids) if x==pad][-2:])
+          PY
+
+      - name: Official BF16 first-token sensitivity - user actual vs zero
+        run: |
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/user-prompt.ids" "$RUNNER_TEMP/user-media.u16" "$RUNNER_TEMP/user-actual.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/user-actual.log"
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/user-prompt.ids" "$RUNNER_TEMP/user-zero.u16" "$RUNNER_TEMP/user-zero.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/user-zero.log"
+
+      - name: Official BF16 first-token sensitivity - candy actual vs zero
+        run: |
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/candy-prompt.ids" "$RUNNER_TEMP/candy-media.u16" "$RUNNER_TEMP/candy-actual.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/candy-actual.log"
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/candy-prompt.ids" "$RUNNER_TEMP/candy-zero.u16" "$RUNNER_TEMP/candy-zero.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/candy-zero.log"
+
+      - name: Quantify official image influence
+        run: |
+          python - <<'PY'
+          import numpy as np, os
+          root=os.environ['RUNNER_TEMP']
+          for key in ('user','candy'):
+              a=np.load(os.path.join(root,f'{key}-actual.npz')); z=np.load(os.path.join(root,f'{key}-zero.npz'))
+              fa=a['final_last'].astype(np.float64); fz=z['final_last'].astype(np.float64)
+              d=fa-fz
+              cos=float(np.dot(fa,fz)/(np.linalg.norm(fa)*np.linalg.norm(fz)))
+              per=np.max(np.abs(a['layer_last'].astype(np.float64)-z['layer_last'].astype(np.float64)),axis=1)
+              print(f'{key.upper()}_ACTUAL_TOKEN={int(a["first_token"][0])} ZERO_TOKEN={int(z["first_token"][0])}')
+              print(f'{key.upper()}_FINAL_MAXABS={np.max(np.abs(d)):.9g} RMSDIFF={np.sqrt(np.mean(d*d)):.9g} COS={cos:.9g}')
+              print(f'{key.upper()}_LAYER_MAXABS='+' '.join(f'{x:.6g}' for x in per))
+          PY
+
+      - name: Generate short C continuations with pinned official media
+        run: |
+          for key in user candy; do
+            ./build/kvl_generate_vl \
+              "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+              "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+              "$RUNNER_TEMP/${key}-prompt.ids" "$RUNNER_TEMP/${key}-media.f32" \
+              536870912 8 0 1 \
+              2> >(tee "$RUNNER_TEMP/${key}-c.stderr" >&2) \
+              | tee "$RUNNER_TEMP/${key}-c.tokens"
+          done
+
+      - name: Decode semantic outputs
+        run: |
+          python - <<'PY'
+          import os,sys,re
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding, decode_generated
+          root=Path(os.environ['RUNNER_TEMP']); enc,_,_=build_encoding(root/'packed-v9')
+          for key in ('user','candy'):
+              ids=[]
+              for line in (root/f'{key}-c.tokens').read_text().splitlines():
+                  if line.startswith('TOKEN '): ids.append(int(line.split()[1]))
+              print(f'===== {key.upper()} C + PINNED OFFICIAL MEDIA =====')
+              print('ids:', ' '.join(map(str,ids)))
+              print(decode_generated(enc,ids,{163585,163586}))
+          PY
