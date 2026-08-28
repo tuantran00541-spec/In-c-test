@@ -1,0 +1,74 @@
+name: V9 official top-k50 two-image screen
+
+on:
+  workflow_dispatch:
+
+jobs:
+  topk50-two-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Patch official top-k50 sampler and build
+        run: |
+          python tools/patch_official_topk50_sampler.py
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+      - name: Restore exact user images and tokenizer assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+      - name: Fetch checkpoint and pack vision
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root, revision='398eede0903cd983a2bfa0cc634e9ac1d843f375')
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+      - name: Pack full official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+      - name: Screen exact VI prompt with temp 0.2 top-k50
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-vi.jpg" \
+            "Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu." \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 10 --temperature 0.2 --seed 1 --show-tokens \
+            2> >(tee "$RUNNER_TEMP/vi-stderr.txt" >&2) | tee "$RUNNER_TEMP/vi-output.txt"
+      - name: Screen exact EN prompt with temp 0.2 top-k50
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-en.jpg" \
+            "Look at this image and answer only in English. Describe the character and facial expression in one short sentence." \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 10 --temperature 0.2 --seed 1 --show-tokens \
+            2> >(tee "$RUNNER_TEMP/en-stderr.txt" >&2) | tee "$RUNNER_TEMP/en-output.txt"
+      - name: Print semantic screen
+        run: |
+          echo '===== VI TOPK50 ====='; cat "$RUNNER_TEMP/vi-output.txt"; echo
+          echo '===== EN TOPK50 ====='; cat "$RUNNER_TEMP/en-output.txt"; echo
+          python - <<'PY'
+          import os
+          root=os.environ['RUNNER_TEMP']
+          for lang in ('vi','en'):
+              text=open(os.path.join(root,f'{lang}-output.txt'),encoding='utf-8').read().strip()
+              print(lang.upper()+'_TEXT=',repr(text))
+          PY
