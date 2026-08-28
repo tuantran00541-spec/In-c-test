@@ -1,0 +1,82 @@
+name: V9 exact user-VI scalar vision oracle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-user-vi-vision-scalar-oracle.yml"
+
+jobs:
+  scalar-vision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build scalar C vision runtime
+        run: |
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar -j 2
+          test -x ./build-scalar/kvl_vision
+
+      - name: Restore exact Vietnamese regression image
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+
+      - name: Fetch and pack official vision tensors
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors','preprocessor_config.json'):
+              print(hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root))
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed"
+
+      - name: Preprocess exact image
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'), os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'), os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          print(f'grid={gh}x{gw}')
+          assert (gh,gw)==(14,14)
+          PY
+
+      - name: Run official-weight reference and scalar C path
+        run: |
+          python tools/dump_vision_reference_from_patches.py \
+            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/ref.f32"
+          ./build-scalar/kvl_vision \
+            "$RUNNER_TEMP/packed/vision.bin" "$RUNNER_TEMP/packed/vision.idx" \
+            "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/got.f32"
+
+      - name: Strict compare projected media embeddings
+        run: |
+          python - <<'PY'
+          import os, numpy as np
+          ref=np.fromfile(os.path.join(os.environ['RUNNER_TEMP'],'ref.f32'),dtype=np.float32)
+          got=np.fromfile(os.path.join(os.environ['RUNNER_TEMP'],'got.f32'),dtype=np.float32)
+          assert ref.shape==got.shape==(49*2048,), (ref.shape,got.shape)
+          d=got.astype(np.float64)-ref.astype(np.float64)
+          ma=float(np.max(np.abs(d)))
+          rms=float(np.sqrt(np.mean(d*d)))
+          idx=int(np.argmax(np.abs(d)))
+          print(f'scalar actual user-vi vision compare: max_abs={ma:.9g} rms={rms:.9g} worst={idx}')
+          assert ma < 3e-6, ma
+          assert rms < 7e-7, rms
+          print('PASS: exact user-VI MoonViT+projector matches official reference on scalar backend')
+          PY
