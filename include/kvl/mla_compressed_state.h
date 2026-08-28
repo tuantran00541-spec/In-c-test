@@ -23,6 +23,16 @@ void kvl_mla_compressed_state_reset(KvlMlaCompressedState *state);
 void kvl_mla_compressed_state_free(KvlMlaCompressedState *state);
 size_t kvl_mla_compressed_state_bytes(const KvlMlaCompressedState *state);
 
+/* Fill persistent compressed history for a causal prompt batch without running the
+ * attention output path. `x` is the already-normalized attention input [seq_len,H].
+ * This is used by V8 layer-major batch prefill after kvl_mla_prefill_bf16() computes
+ * the causal attention outputs for the same prompt. State must be empty. */
+int kvl_mla_compressed_state_prefill_bf16(const float *x,
+                                          int seq_len,
+                                          const KvlMlaConfig *cfg,
+                                          const KvlMlaBF16 *w,
+                                          KvlMlaCompressedState *state);
+
 /* One-token absorbed MLA decode.
  *
  * For the no-PE key path:
