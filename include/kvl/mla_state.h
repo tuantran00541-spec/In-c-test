@@ -1,6 +1,7 @@
 #ifndef KVL_MLA_STATE_H
 #define KVL_MLA_STATE_H
 
+#include <stddef.h>
 #include "kvl/ops.h"
 
 /* V6a correctness/reference state.
