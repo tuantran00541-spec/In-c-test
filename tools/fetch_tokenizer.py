@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the small official tokenizer assets into an already-packed runtime directory."""
+"""Fetch small official tokenizer/frontend assets into an already-packed runtime directory."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,13 @@ from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 REPO = "moonshotai/Kimi-VL-A3B-Instruct"
-FILES = ("tiktoken.model", "tokenizer_config.json", "generation_config.json", "chat_template.jinja")
+FILES = (
+    "tiktoken.model",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+)
 
 
 def main() -> None:
@@ -23,7 +29,7 @@ def main() -> None:
         src = Path(hf_hub_download(args.repo, name))
         dst = out / name
         shutil.copy2(src, dst)
-        print(f"tokenizer asset: {dst} ({dst.stat().st_size} bytes)")
+        print(f"runtime asset: {dst} ({dst.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":
