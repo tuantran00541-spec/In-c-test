@@ -5,6 +5,11 @@ on:
   push:
     paths:
       - ".github/workflows/real-v6-full-decode.yml"
+      - "src/decode_probe.c"
+      - "src/mla_compressed_state.c"
+      - "include/kvl/mla_compressed_state.h"
+      - "src/ops.c"
+      - "include/kvl/ops.h"
 
 jobs:
   two-token-full-model:
