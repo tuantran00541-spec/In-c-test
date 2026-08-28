@@ -1,0 +1,77 @@
+name: Real Kimi-VL V9 vision oracle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v9-vision.yml"
+      - "src/vision.c"
+      - "src/vision_probe.c"
+      - "include/kvl/vision.h"
+      - "include/kvl/trunk_format.h"
+      - "tools/pack_vision.py"
+      - "tools/dump_real_vision_reference.py"
+
+jobs:
+  real-vision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build C vision runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j 2
+      - name: Fetch only the official vision shard
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-vision')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              p=hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct',filename=name,local_dir=root)
+              print(name,p)
+          PY
+      - name: Pack independent aligned vision store
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-vision" "$RUNNER_TEMP/packed-v9"
+          du -h "$RUNNER_TEMP/packed-v9"/*
+      - name: Create independent PyTorch oracle
+        run: |
+          python tools/dump_real_vision_reference.py "$RUNNER_TEMP/kimi-vl-v9-vision" "$RUNNER_TEMP/v9-oracle"
+      - name: Run C MoonViT plus projector
+        run: |
+          ./build/kvl_vision \
+            "$RUNNER_TEMP/packed-v9/vision.bin" "$RUNNER_TEMP/packed-v9/vision.idx" \
+            "$RUNNER_TEMP/v9-oracle/patches.f32" 2 2 "$RUNNER_TEMP/v9-oracle/c-output.f32"
+      - name: Compare C image token to PyTorch oracle
+        run: |
+          python - <<'PY'
+          import numpy as np, os
+          p=os.path.join(os.environ['RUNNER_TEMP'],'v9-oracle')
+          a=np.fromfile(os.path.join(p,'reference.f32'),dtype=np.float32)
+          b=np.fromfile(os.path.join(p,'c-output.f32'),dtype=np.float32)
+          assert a.shape==b.shape==(2048,), (a.shape,b.shape)
+          d=np.abs(a-b)
+          rms=np.sqrt(np.mean((a-b)**2))
+          print('vision_max_abs',float(d.max()))
+          print('vision_rms',float(rms))
+          print('argmax_ref/c',int(a.argmax()),int(b.argmax()))
+          assert np.isfinite(b).all()
+          assert float(d.max()) < 5e-3
+          PY
