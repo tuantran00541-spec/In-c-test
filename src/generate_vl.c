@@ -1,9 +1,9 @@
 /* V9 multimodal generator.
  *
- * Reuse the already-proven V8 decoder implementation in this translation unit while exposing
- * a prompt-prefill path that can inject one distinct 2048-float projected image embedding at
- * every <|media_pad|> token position. Keeping this as a separate executable prevents the V9
- * correctness bridge from regressing the faster layer-major text-only prefill path.
+ * Reuse the proven V8 decoder implementation, but initialize the prompt hidden-state matrix
+ * from a mixture of BF16 token embeddings and one projected image embedding per media-pad.
+ * The complete multimodal prompt then follows the same layer-major batch prefill as text-only
+ * V8, so each trunk tensor is loaded once per layer rather than once per token.
  */
 #define main kvl_generate_text_entry_unused
 #include "generate.c"
@@ -26,40 +26,176 @@ static int read_media_f32(const char *path, float **out, int count) {
     return 0;
 }
 
-/* Official Kimi-VL casts token embeddings to image_features.dtype before replacing media-pad
- * positions. Released weights are BF16, so preserve our FP32 compute kernels but round the
- * projector output through an IEEE BF16 value at this exact multimodal boundary. */
+/* Released Kimi-VL uses BF16 image features and casts text embeddings to that dtype before
+ * replacing media-pad positions. Keep FP32 runtime activations, but round projector output to
+ * an IEEE BF16 value at exactly that multimodal boundary. */
 static float v9_round_bf16(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof u);
     const uint32_t exp = u & UINT32_C(0x7f800000);
-    if (exp != UINT32_C(0x7f800000)) {
-        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u); /* nearest, ties to even */
-    }
+    if (exp != UINT32_C(0x7f800000))
+        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u);
     u &= UINT32_C(0xffff0000);
     memcpy(&x, &u, sizeof x);
     return x;
 }
 
-static int forward_input_v9(KvlTrunkStore *ts, KvlExpertCache *cache,
-                            KvlMlaCompressedState *states,
-                            const KvlTrunkTensor *final_norm,
-                            const KvlTrunkTensor *lm_head,
-                            const float *input, int position, int need_logits,
-                            float *logits, float *x, float *r1, float *n2, float *y,
-                            float *router, float *bias, int *ids, float *weights,
-                            float *scratch, float *z) {
-    memcpy(x, input, (size_t)H * sizeof(float));
+static int prefill_multimodal_v9(KvlTrunkStore *ts, KvlExpertCache *cache,
+                                 KvlMlaCompressedState *states,
+                                 const KvlTrunkTensor *emb,
+                                 const KvlTrunkTensor *final_norm,
+                                 const KvlTrunkTensor *lm_head,
+                                 const int *prompt, int seq_len,
+                                 const float *media, int media_n,
+                                 float *logits, float *router, float *bias,
+                                 int *ids, float *weights, float *scratch, float *z) {
+    if (!ts || !cache || !states || !emb || !final_norm || !lm_head ||
+        !prompt || seq_len <= 0 || !media || media_n <= 0 || !logits ||
+        !router || !bias || !ids || !weights || !scratch || !z)
+        return -1;
+
+    const size_t elems = (size_t)seq_len * H;
+    float *x = (float *)malloc(elems * sizeof(float));
+    float *n1 = (float *)malloc(elems * sizeof(float));
+    float *attn = (float *)malloc(elems * sizeof(float));
+    float *r1 = (float *)malloc(elems * sizeof(float));
+    float *n2 = (float *)malloc(elems * sizeof(float));
+    float *y = (float *)malloc(elems * sizeof(float));
+    int rc = -1;
+    if (!x || !n1 || !attn || !r1 || !n2 || !y) goto done;
+
+    int mi = 0;
+    for (int t = 0; t < seq_len; ++t) {
+        float *dst = x + (size_t)t * H;
+        if (prompt[t] == MEDIA_PAD_ID_V9) {
+            if (mi >= media_n) goto done;
+            const float *src = media + (size_t)mi * H;
+            for (int i = 0; i < H; ++i) dst[i] = v9_round_bf16(src[i]);
+            ++mi;
+        } else {
+            if (prompt[t] < 0 || prompt[t] >= V) goto done;
+            expand(dst, (const uint16_t *)emb->data + (size_t)prompt[t] * H, H);
+        }
+    }
+    if (mi != media_n) goto done;
+
+    KvlMlaConfig cfg = {H, NH, DN, DR, DV, R, RMS_EPS, ROPE_THETA};
+    KvlRouterConfig router_cfg = {H, E, TOPK, 1, 1, 1, 2.446f};
+
     for (int layer = 0; layer < LN; ++layer) {
-        if (attention_token(ts, layer, x, position, &states[layer], r1, n2) != 0) return -1;
-        if (mlp_token(ts, cache, layer, n2, y, router, bias, ids, weights, scratch) != 0) return -1;
-        for (int i = 0; i < H; ++i) x[i] = r1[i] + y[i];
+        KvlTrunkTensor in = {0}, q = {0}, kva = {0}, kvan = {0};
+        KvlTrunkTensor kvb = {0}, o = {0}, pn = {0};
+        if (load_kind(ts, (uint32_t)layer, KVL_TENSOR_INPUT_NORM, &in) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_Q_PROJ, &q) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_KV_A_PROJ, &kva) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_KV_A_NORM, &kvan) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_KV_B_PROJ, &kvb) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_O_PROJ, &o) ||
+            load_kind(ts, (uint32_t)layer, KVL_TENSOR_POST_ATTN_NORM, &pn)) {
+            kvl_trunk_tensor_free(&in); kvl_trunk_tensor_free(&q);
+            kvl_trunk_tensor_free(&kva); kvl_trunk_tensor_free(&kvan);
+            kvl_trunk_tensor_free(&kvb); kvl_trunk_tensor_free(&o);
+            kvl_trunk_tensor_free(&pn);
+            goto done;
+        }
+
+        for (int t = 0; t < seq_len; ++t)
+            kvl_rmsnorm_bf16(n1 + (size_t)t * H, x + (size_t)t * H,
+                             (const uint16_t *)in.data, H, RMS_EPS);
+
+        KvlMlaBF16 aw = {
+            (const uint16_t *)q.data,
+            (const uint16_t *)kva.data,
+            (const uint16_t *)kvan.data,
+            (const uint16_t *)kvb.data,
+            (const uint16_t *)o.data
+        };
+        if (kvl_mla_prefill_bf16(attn, n1, seq_len, &cfg, &aw) != 0 ||
+            kvl_mla_compressed_state_prefill_bf16(n1, seq_len, &cfg, &aw,
+                                                   &states[layer]) != 0) {
+            kvl_trunk_tensor_free(&in); kvl_trunk_tensor_free(&q);
+            kvl_trunk_tensor_free(&kva); kvl_trunk_tensor_free(&kvan);
+            kvl_trunk_tensor_free(&kvb); kvl_trunk_tensor_free(&o);
+            kvl_trunk_tensor_free(&pn);
+            goto done;
+        }
+
+        for (int t = 0; t < seq_len; ++t) {
+            const size_t base = (size_t)t * H;
+            for (int i = 0; i < H; ++i) r1[base + i] = x[base + i] + attn[base + i];
+            kvl_rmsnorm_bf16(n2 + base, r1 + base,
+                             (const uint16_t *)pn.data, H, RMS_EPS);
+        }
+        kvl_trunk_tensor_free(&in); kvl_trunk_tensor_free(&q);
+        kvl_trunk_tensor_free(&kva); kvl_trunk_tensor_free(&kvan);
+        kvl_trunk_tensor_free(&kvb); kvl_trunk_tensor_free(&o);
+        kvl_trunk_tensor_free(&pn);
+
+        if (layer == 0) {
+            KvlTrunkTensor g = {0}, u = {0}, d = {0};
+            if (load_kind(ts, 0, KVL_TENSOR_DENSE_GATE, &g) ||
+                load_kind(ts, 0, KVL_TENSOR_DENSE_UP, &u) ||
+                load_kind(ts, 0, KVL_TENSOR_DENSE_DOWN, &d)) {
+                kvl_trunk_tensor_free(&g); kvl_trunk_tensor_free(&u);
+                kvl_trunk_tensor_free(&d);
+                goto done;
+            }
+            KvlMlpBF16 dense = {
+                (const uint16_t *)g.data, (const uint16_t *)u.data,
+                (const uint16_t *)d.data, DENSE_I
+            };
+            for (int t = 0; t < seq_len; ++t) {
+                const size_t base = (size_t)t * H;
+                if (kvl_mlp_bf16(y + base, n2 + base, &dense, H, scratch) != 0) {
+                    kvl_trunk_tensor_free(&g); kvl_trunk_tensor_free(&u);
+                    kvl_trunk_tensor_free(&d); goto done;
+                }
+            }
+            kvl_trunk_tensor_free(&g); kvl_trunk_tensor_free(&u);
+            kvl_trunk_tensor_free(&d);
+        } else {
+            KvlTrunkTensor rt = {0}, rb = {0}, sg = {0}, su = {0}, sd = {0};
+            if (load_kind(ts, (uint32_t)layer, KVL_TENSOR_ROUTER_WEIGHT, &rt) ||
+                load_kind(ts, (uint32_t)layer, KVL_TENSOR_ROUTER_BIAS, &rb) ||
+                load_kind(ts, (uint32_t)layer, KVL_TENSOR_SHARED_GATE, &sg) ||
+                load_kind(ts, (uint32_t)layer, KVL_TENSOR_SHARED_UP, &su) ||
+                load_kind(ts, (uint32_t)layer, KVL_TENSOR_SHARED_DOWN, &sd)) {
+                kvl_trunk_tensor_free(&rt); kvl_trunk_tensor_free(&rb);
+                kvl_trunk_tensor_free(&sg); kvl_trunk_tensor_free(&su);
+                kvl_trunk_tensor_free(&sd); goto done;
+            }
+            expand(router, (const uint16_t *)rt.data, (size_t)E * H);
+            expand(bias, (const uint16_t *)rb.data, E);
+            KvlMlpBF16 shared = {
+                (const uint16_t *)sg.data, (const uint16_t *)su.data,
+                (const uint16_t *)sd.data, SHARED_I
+            };
+            for (int t = 0; t < seq_len; ++t) {
+                const size_t base = (size_t)t * H;
+                if (kvl_moe_token_bf16(cache, layer, &router_cfg, n2 + base,
+                                       router, bias, EXP_I, &shared, y + base,
+                                       ids, weights, scratch) != 0) {
+                    kvl_trunk_tensor_free(&rt); kvl_trunk_tensor_free(&rb);
+                    kvl_trunk_tensor_free(&sg); kvl_trunk_tensor_free(&su);
+                    kvl_trunk_tensor_free(&sd); goto done;
+                }
+            }
+            kvl_trunk_tensor_free(&rt); kvl_trunk_tensor_free(&rb);
+            kvl_trunk_tensor_free(&sg); kvl_trunk_tensor_free(&su);
+            kvl_trunk_tensor_free(&sd);
+        }
+
+        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];
     }
-    if (need_logits) {
-        kvl_rmsnorm_bf16(z, x, (const uint16_t *)final_norm->data, H, RMS_EPS);
-        kvl_matvec_bf16(logits, z, (const uint16_t *)lm_head->data, H, V);
-    }
-    return 0;
+
+    kvl_rmsnorm_bf16(z, x + (size_t)(seq_len - 1) * H,
+                     (const uint16_t *)final_norm->data, H, RMS_EPS);
+    kvl_matvec_bf16(logits, z, (const uint16_t *)lm_head->data, H, V);
+    rc = 0;
+
+done:
+    free(x); free(n1); free(attn); free(r1); free(n2); free(y);
+    return rc;
 }
 
 int main(int argc, char **argv) {
@@ -78,23 +214,12 @@ int main(int argc, char **argv) {
     if (rng == 0) rng = UINT64_C(0x9e3779b97f4a7c15);
 
     int *prompt = NULL, prompt_n = 0;
-    if (read_prompt_ids(argv[5], &prompt, &prompt_n) != 0) {
-        fprintf(stderr, "failed to read prompt token ids\n");
-        return 2;
-    }
+    if (read_prompt_ids(argv[5], &prompt, &prompt_n) != 0) return 2;
     int media_n = 0;
     for (int i = 0; i < prompt_n; ++i) if (prompt[i] == MEDIA_PAD_ID_V9) ++media_n;
-    if (media_n <= 0) {
-        fprintf(stderr, "multimodal prompt contains no media_pad token id %d\n", MEDIA_PAD_ID_V9);
-        free(prompt);
-        return 2;
-    }
+    if (media_n <= 0) { free(prompt); return 2; }
     float *media = NULL;
-    if (read_media_f32(argv[6], &media, media_n) != 0) {
-        fprintf(stderr, "failed to read %d projected media embeddings\n", media_n);
-        free(prompt);
-        return 2;
-    }
+    if (read_media_f32(argv[6], &media, media_n) != 0) { free(prompt); return 2; }
 
     const int capacity = prompt_n + max_new;
     KvlTrunkStore ts;
@@ -121,7 +246,6 @@ int main(int argc, char **argv) {
     }
 
     float *logits = (float *)malloc((size_t)V * sizeof(float));
-    float *input = (float *)malloc((size_t)H * sizeof(float));
     float *x = (float *)malloc((size_t)H * sizeof(float));
     float *r1 = (float *)malloc((size_t)H * sizeof(float));
     float *n2 = (float *)malloc((size_t)H * sizeof(float));
@@ -132,32 +256,21 @@ int main(int argc, char **argv) {
     int *top_ids = (int *)malloc((size_t)TOPK * sizeof(int));
     float *top_weights = (float *)malloc((size_t)TOPK * sizeof(float));
     float *scratch = (float *)malloc((size_t)(3 * DENSE_I + H) * sizeof(float));
-    if (!logits || !input || !x || !r1 || !n2 || !y || !z || !router || !bias ||
+    if (!logits || !x || !r1 || !n2 || !y || !z || !router || !bias ||
         !top_ids || !top_weights || !scratch) return 2;
 
+    const double batch_mib = (double)((size_t)6 * (size_t)prompt_n * H * sizeof(float)) / 1048576.0;
     fprintf(stderr,
             "kvl_generate_vl: prompt=%d media=%d max_new=%d temperature=%.4g "
-            "state=%.2f MiB cache=%.2f MiB prefill=token-major-media media_boundary=bf16\n",
+            "state=%.2f MiB cache=%.2f MiB prefill=batch-layer-major-media "
+            "batch_ws=%.2f MiB media_boundary=bf16\n",
             prompt_n, media_n, max_new, temperature, state_bytes / 1048576.0,
-            cache_bytes / 1048576.0);
+            cache_bytes / 1048576.0, batch_mib);
 
-    int mi = 0;
-    for (int position = 0; position < prompt_n; ++position) {
-        if (prompt[position] == MEDIA_PAD_ID_V9) {
-            const float *src = media + (size_t)mi * H;
-            for (int i = 0; i < H; ++i) input[i] = v9_round_bf16(src[i]);
-            ++mi;
-        } else {
-            const int token = prompt[position];
-            if (token < 0 || token >= V) return 2;
-            expand(input, (const uint16_t *)emb.data + (size_t)token * H, H);
-        }
-        if (forward_input_v9(&ts, &cache, states, &fn, &lm, input, position,
-                             position == prompt_n - 1, logits, x, r1, n2, y,
-                             router, bias, top_ids, top_weights, scratch, z) != 0)
-            return 1;
-    }
-    if (mi != media_n) return 1;
+    if (prefill_multimodal_v9(&ts, &cache, states, &emb, &fn, &lm,
+                              prompt, prompt_n, media, media_n, logits,
+                              router, bias, top_ids, top_weights, scratch, z) != 0)
+        return 1;
 
     int generated = 0;
     int position = prompt_n;
@@ -180,8 +293,8 @@ int main(int argc, char **argv) {
 
     for (int layer = 0; layer < LN; ++layer) kvl_mla_compressed_state_free(&states[layer]);
     kvl_trunk_tensor_free(&emb); kvl_trunk_tensor_free(&fn); kvl_trunk_tensor_free(&lm);
-    free(prompt); free(media); free(logits); free(input); free(x); free(r1); free(n2);
-    free(y); free(z); free(router); free(bias); free(top_ids); free(top_weights); free(scratch);
+    free(prompt); free(media); free(logits); free(x); free(r1); free(n2); free(y); free(z);
+    free(router); free(bias); free(top_ids); free(top_weights); free(scratch);
     kvl_expert_cache_close(&cache); kvl_expert_store_close(&es); kvl_trunk_store_close(&ts);
     return 0;
 }
