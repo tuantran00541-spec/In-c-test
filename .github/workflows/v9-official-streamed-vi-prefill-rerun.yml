@@ -1,0 +1,113 @@
+name: V9 official streamed VI prefill oracle rerun
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-official-streamed-vi-prefill-rerun.yml"
+  workflow_dispatch:
+
+jobs:
+  official-streamed-vi-rerun:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install checkpoint-compatible CPU dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Restore exact VI image and frontend assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+
+      - name: Fetch official metadata and vision tensors
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json, os
+          repo='moonshotai/Kimi-VL-A3B-Instruct'; root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):
+              hf_hub_download(repo,filename=name,local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for name in shards: hf_hub_download(repo,filename=name,local_dir=root)
+          print('vision shards',shards)
+          PY
+
+      - name: Produce exact official BF16 media embeddings
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'),os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14),(gh,gw)
+          PY
+          python tools/dump_official_bf16_vision_reference.py \
+            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 \
+            "$RUNNER_TEMP/official-media.f32" "$RUNNER_TEMP/official-media.u16"
+
+      - name: Pack complete official text model into runtime stores
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+          du -h "$RUNNER_TEMP/packed-v9"/*.bin
+
+      - name: Build exact VI processor-matching prompt IDs
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'; enc,_,special=build_encoding(root)
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          ids=encode_image_chat(enc,prompt,49); pad=special['<|media_pad|>']
+          assert len(ids)==136,len(ids)
+          assert [i for i,x in enumerate(ids) if x==pad]==list(range(15,64))
+          (Path(os.environ['RUNNER_TEMP'])/'prompt.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+          print('prompt_tokens=136 media_positions=15..63')
+          PY
+
+      - name: Run released decoder code one layer at a time
+        run: |
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/official-media.u16" \
+            "$RUNNER_TEMP/official-prefill.npz" \
+            | tee "$RUNNER_TEMP/oracle.txt"
+          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/oracle.txt"
+
+      - name: Decode official first token
+        run: |
+          python - <<'PY'
+          import os,re,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding
+          root=Path(os.environ['RUNNER_TEMP']); enc,_,_=build_encoding(root/'packed-v9')
+          text=(root/'oracle.txt').read_text()
+          m=re.search(r'^OFFICIAL_FIRST_TOKEN=(\d+)',text,re.M); assert m
+          tid=int(m.group(1))
+          print('OFFICIAL_FIRST_TOKEN_ID=',tid)
+          print('OFFICIAL_FIRST_TOKEN_TEXT=',repr(enc.decode([tid])))
+          print('KNOWN_BAD_C_FIRST_TOKEN=39')
+          print('MATCHES_KNOWN_BAD_C=',tid==39)
+          PY
