@@ -47,3 +47,6 @@ target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
 
 add_executable(kvl_mla_real_probe src/mla_real_probe.c)
 target_link_libraries(kvl_mla_real_probe PRIVATE kvl_storage)
+
+add_executable(kvl_decode_probe src/decode_probe.c)
+target_link_libraries(kvl_decode_probe PRIVATE kvl_storage)
