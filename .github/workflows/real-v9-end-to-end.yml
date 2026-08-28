@@ -52,18 +52,18 @@ jobs:
         run: |
           python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-full" "$RUNNER_TEMP/packed-v9"
           du -h "$RUNNER_TEMP/packed-v9"/*.bin
-      - name: Create deterministic tiny red image
+      - name: Create deterministic 224px red image
         run: |
           python - <<'PY'
           from PIL import Image
           import os
-          p=os.path.join(os.environ['RUNNER_TEMP'],'red-28.png')
-          Image.new('RGB',(28,28),(255,0,0)).save(p)
+          p=os.path.join(os.environ['RUNNER_TEMP'],'red-224.png')
+          Image.new('RGB',(224,224),(255,0,0)).save(p)
           print(p)
           PY
       - name: Run real image to real generated text through C runtime
         run: |
-          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/red-28.png" \
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/red-224.png" \
             "What is the dominant color in this image? Reply with one short word." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
@@ -72,9 +72,11 @@ jobs:
             2> >(tee "$RUNNER_TEMP/v9-stderr.txt" >&2) \
             | tee "$RUNNER_TEMP/v9-output.txt"
           test -s "$RUNNER_TEMP/v9-output.txt"
-          grep -q 'grid=2x2 media_tokens=1' "$RUNNER_TEMP/v9-stderr.txt"
-          grep -q 'kvl_vision: grid=2x2 media_tokens=1 direct_io=yes' "$RUNNER_TEMP/v9-stderr.txt"
+          grep -q 'grid=16x16 media_tokens=64' "$RUNNER_TEMP/v9-stderr.txt"
+          grep -q 'kvl_vision: grid=16x16 media_tokens=64 direct_io=yes' "$RUNNER_TEMP/v9-stderr.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'media_boundary=bf16' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'kvl_generate_vl: generated=' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'timing vision=' "$RUNNER_TEMP/v9-stderr.txt"
+          grep -Eiq '(^|[^A-Za-z])red([^A-Za-z]|$)' "$RUNNER_TEMP/v9-output.txt"
