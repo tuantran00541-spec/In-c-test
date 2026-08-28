@@ -1,0 +1,85 @@
+name: V9 official BF16 vision determinism
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-official-bf16-vision-determinism.yml"
+  workflow_dispatch:
+
+jobs:
+  vision-determinism:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Restore exact user image and fetch pinned vision weights
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python - <<'PY'
+          import json,os
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']; root=os.path.join(os.environ['RUNNER_TEMP'],'kimi')
+          for n in ('config.json','preprocessor_config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for n in shards: hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          PY
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi')
+          gh,gw=write_patches(root,os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14)
+          PY
+      - name: Run twice at two threads
+        env:
+          OMP_NUM_THREADS: "2"
+        run: |
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/t2-a.f32" "$RUNNER_TEMP/t2-a.u16" --revision "$REV"
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/t2-b.f32" "$RUNNER_TEMP/t2-b.u16" --revision "$REV"
+      - name: Run twice at one thread
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/t1-a.f32" "$RUNNER_TEMP/t1-a.u16" --revision "$REV"
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/t1-b.f32" "$RUNNER_TEMP/t1-b.u16" --revision "$REV"
+      - name: Compare exact BF16 media bytes
+        run: |
+          python - <<'PY'
+          import hashlib,os,numpy as np
+          root=os.environ['RUNNER_TEMP']
+          names=['t2-a','t2-b','t1-a','t1-b']
+          arr={}
+          for n in names:
+              p=os.path.join(root,n+'.u16'); b=open(p,'rb').read(); arr[n]=np.frombuffer(b,dtype=np.uint16)
+              print(n,'sha256',hashlib.sha256(b).hexdigest(),'elems',arr[n].size)
+          def cmp(a,b):
+              x=arr[a]; y=arr[b]; neq=int(np.count_nonzero(x!=y))
+              xf=x.view(np.uint16).copy(); yf=y.view(np.uint16).copy()
+              # Compare decoded BF16 via torch for meaningful max/RMS.
+              import torch
+              xx=torch.from_numpy(xf).view(torch.bfloat16).float().numpy().astype(np.float64)
+              yy=torch.from_numpy(yf).view(torch.bfloat16).float().numpy().astype(np.float64)
+              d=xx-yy
+              print(f'{a}_VS_{b}: mismatches={neq}/{x.size} max={np.max(np.abs(d)):.9g} rms={np.sqrt(np.mean(d*d)):.9g}')
+              return neq
+          n22=cmp('t2-a','t2-b'); n11=cmp('t1-a','t1-b'); n21=cmp('t2-a','t1-a')
+          print('TWO_THREAD_DETERMINISTIC',n22==0)
+          print('ONE_THREAD_DETERMINISTIC',n11==0)
+          print('THREAD_COUNT_IDENTICAL',n21==0)
+          PY
