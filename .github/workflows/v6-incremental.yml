@@ -1,0 +1,31 @@
+name: V6 incremental MLA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v6-incremental.yml"
+      - "src/mla_state.c"
+      - "src/mla_incremental_probe.c"
+      - "include/kvl/mla_state.h"
+      - "CMakeLists.txt"
+
+jobs:
+  incremental-vs-prefill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release build and numerical probe
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+          ./build/kvl_mla_incremental_probe
+
+      - name: ASan + UBSan build
+        run: |
+          cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build-san --config Debug -j 2
+          ASAN_OPTIONS=detect_leaks=1 ./build-san/kvl_mla_incremental_probe
