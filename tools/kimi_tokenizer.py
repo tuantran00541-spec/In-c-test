@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Small tokenizer helper matching moonshotai/Kimi-VL-A3B-Instruct.
 
-Inference stays in C. This module only reproduces the official tiktoken regex/ranks,
-special-token table, and text-only chat template so V7 can turn strings into token IDs
-and generated token IDs back into UTF-8 text.
+Inference stays in C. This module reproduces the official tiktoken regex/ranks, special-token
+table and the released text/image chat template. Image processing expands one media placeholder
+into one `<|media_pad|>` token per projected MoonViT image token.
 """
 from __future__ import annotations
 
@@ -39,7 +39,6 @@ def build_encoding(model_dir: str | Path) -> tuple[tiktoken.Encoding, int, dict[
         for k, v in cfg.get("added_tokens_decoder", {}).items()
     }
     n_base = len(ranks)
-    # Mirrors tokenization_moonshot.py: 256 reserved specials plus two trailing slots.
     special = {
         added.get(i, f"<|reserved_token_{i}|>"): i
         for i in range(n_base, n_base + 258)
@@ -54,7 +53,6 @@ def build_encoding(model_dir: str | Path) -> tuple[tiktoken.Encoding, int, dict[
 
 
 def format_text_chat(prompt: str, system: str = DEFAULT_SYSTEM) -> str:
-    # Exact text-only specialization of the official Jinja chat template.
     return (
         f"<|im_system|>system<|im_middle|>{system}<|im_end|>"
         f"<|im_user|>user<|im_middle|>{prompt}<|im_end|>"
@@ -62,8 +60,28 @@ def format_text_chat(prompt: str, system: str = DEFAULT_SYSTEM) -> str:
     )
 
 
+def format_image_chat(prompt: str, media_tokens: int, system: str = DEFAULT_SYSTEM) -> str:
+    if media_tokens <= 0:
+        raise ValueError("media_tokens must be positive")
+    media = (
+        "<|media_start|>image<|media_content|>"
+        + "<|media_pad|>" * media_tokens
+        + "<|media_end|>"
+    )
+    return (
+        f"<|im_system|>system<|im_middle|>{system}<|im_end|>"
+        f"<|im_user|>user<|im_middle|>{media}{prompt}<|im_end|>"
+        f"<|im_assistant|>assistant<|im_middle|>"
+    )
+
+
 def encode_chat(enc: tiktoken.Encoding, prompt: str, system: str = DEFAULT_SYSTEM) -> list[int]:
     return enc.encode(format_text_chat(prompt, system), allowed_special="all")
+
+
+def encode_image_chat(enc: tiktoken.Encoding, prompt: str, media_tokens: int,
+                      system: str = DEFAULT_SYSTEM) -> list[int]:
+    return enc.encode(format_image_chat(prompt, media_tokens, system), allowed_special="all")
 
 
 def decode_generated(enc: tiktoken.Encoding, ids: Iterable[int], stop_ids: set[int] | None = None) -> str:
