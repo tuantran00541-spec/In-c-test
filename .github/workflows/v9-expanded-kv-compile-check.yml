@@ -1,0 +1,21 @@
+name: V9 expanded KV compile check
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-expanded-kv-compile-check.yml"
+
+jobs:
+  compile-expanded-kv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply expanded KV diagnostic patch
+        run: python tools/patch_expanded_kv_decode.py
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate_vl
