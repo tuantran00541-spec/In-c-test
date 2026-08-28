@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Check where released Kimi-VL greedy logits diverge from the C bad continuation.
+"""Check a generated prefix against released Kimi-VL greedy logits in one causal prefill.
 
-Runs the released decoder code once over the exact 136-token VI multimodal prompt plus the
-first seven known-bad C tokens. The logits at sequence positions 135..142 then predict all
-eight bad tokens in one causal prefill, avoiding any Python KV-cache/decode implementation.
+The prompt, projected BF16 media, and candidate generated-token prefix are supplied explicitly.
+The released decoder implementation runs layer-by-layer with a bounded working set, and logits
+at the relevant causal positions report the first token where official greedy differs.
 """
 from __future__ import annotations
 
@@ -23,38 +23,43 @@ from dump_official_streamed_text_prefill import (
     Trunk, Experts, layer_state_dict, repair_meta_rotary, official_rms,
 )
 
-BAD = [39, 150340, 13271, 118, 96, 42955, 437, 16032]
-PROMPT_LEN = 136
-
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("packed_dir", type=pathlib.Path)
     ap.add_argument("prompt_ids", type=pathlib.Path)
     ap.add_argument("media_u16", type=pathlib.Path)
+    ap.add_argument("prefix_ids", type=pathlib.Path,
+                    help="candidate generated token IDs to check, whitespace separated")
+    ap.add_argument("--revision", default="main")
     ap.add_argument("--logit-chunk", type=int, default=8192)
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, int(__import__('os').environ.get('OMP_NUM_THREADS', '2'))))
 
-    cfg = AutoConfig.from_pretrained(REPO, trust_remote_code=True)
+    cfg = AutoConfig.from_pretrained(REPO, trust_remote_code=True, revision=args.revision)
     tc = cfg.text_config
     tc._attn_implementation = "eager"
-    decoder_cls = get_class_from_dynamic_module("modeling_kimi_vl.DeepseekV3DecoderLayer", REPO)
+    decoder_cls = get_class_from_dynamic_module(
+        "modeling_kimi_vl.DeepseekV3DecoderLayer", REPO, revision=args.revision
+    )
 
     prompt = [int(x) for x in args.prompt_ids.read_text().split()]
-    if len(prompt) != PROMPT_LEN:
-        raise SystemExit(f"expected {PROMPT_LEN} prompt tokens, got {len(prompt)}")
+    prefix = [int(x) for x in args.prefix_ids.read_text().split()]
+    if not prompt:
+        raise SystemExit("empty prompt")
+    if not prefix:
+        raise SystemExit("empty generated prefix")
     media_pos = [i for i,t in enumerate(prompt) if t == MEDIA_PAD]
-    if media_pos != list(range(15,64)):
-        raise SystemExit(f"unexpected media positions: {media_pos}")
+    if not media_pos:
+        raise SystemExit("prompt has no media pads")
 
-    # Seven teacher-forced generated tokens are sufficient to predict BAD[0..7].
-    seq_ids = prompt + BAD[:-1]
+    prompt_len = len(prompt)
+    # Prefix[:-1] is teacher-forced input. Hidden at prompt_len-1 predicts prefix[0], etc.
+    seq_ids = prompt + prefix[:-1]
     S = len(seq_ids)
     H = int(tc.hidden_size)
-    assert S == 143
 
     tr = Trunk(args.packed_dir)
     ex = Experts(args.packed_dir)
@@ -63,9 +68,12 @@ def main() -> None:
     del embed
 
     bits = np.fromfile(args.media_u16, dtype=np.uint16)
-    if bits.size != 49 * H:
-        raise SystemExit(f"media u16 size={bits.size}, expected {49*H}")
-    media = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(49,H)
+    if bits.size != len(media_pos) * H:
+        raise SystemExit(
+            f"media u16 size={bits.size}, expected {len(media_pos)*H} "
+            f"for {len(media_pos)} media positions"
+        )
+    media = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(len(media_pos),H)
     x[0, torch.tensor(media_pos)] = media
     assert x.dtype == torch.bfloat16
 
@@ -73,7 +81,10 @@ def main() -> None:
     attention_mask = _prepare_4d_causal_attention_mask(mask2, (1,S), x, 0)
     position_ids = torch.arange(S, dtype=torch.long).unsqueeze(0)
 
-    print(f"teacher-forced official: seq={S} predicts={len(BAD)} bad_prefix={BAD}", flush=True)
+    print(
+        f"teacher-forced official: prompt={prompt_len} seq={S} "
+        f"predicts={len(prefix)} media={len(media_pos)} prefix={prefix}", flush=True
+    )
     for L in range(int(tc.num_hidden_layers)):
         with torch.device("meta"):
             layer_mod = decoder_cls(tc, L)
@@ -93,12 +104,11 @@ def main() -> None:
         gc.collect()
 
     z = official_rms(x, tr.get(GLOBAL, FINAL_NORM), float(tc.rms_norm_eps))
-    # Hidden 135 predicts BAD[0], hidden 136 predicts BAD[1], ... hidden 142 predicts BAD[7].
-    targets = z[0, torch.arange(PROMPT_LEN-1, PROMPT_LEN-1+len(BAD))]
+    targets = z[0, torch.arange(prompt_len-1, prompt_len-1+len(prefix))]
     lm = tr.get(GLOBAL, LM_HEAD)
-    best_val = torch.full((len(BAD),), -float("inf"), dtype=torch.float32)
-    best_id = torch.full((len(BAD),), -1, dtype=torch.long)
-    bad_logits = torch.full((len(BAD),), float("nan"), dtype=torch.float32)
+    best_val = torch.full((len(prefix),), -float("inf"), dtype=torch.float32)
+    best_id = torch.full((len(prefix),), -1, dtype=torch.long)
+    prefix_logits = torch.full((len(prefix),), float("nan"), dtype=torch.float32)
 
     for a in range(0, int(tc.vocab_size), args.logit_chunk):
         b = min(int(tc.vocab_size), a + args.logit_chunk)
@@ -107,19 +117,25 @@ def main() -> None:
         take = vals > best_val
         best_val[take] = vals[take]
         best_id[take] = inds[take] + a
-        for j, tid in enumerate(BAD):
+        for j, tid in enumerate(prefix):
             if a <= tid < b:
-                bad_logits[j] = logits[j, tid-a]
+                prefix_logits[j] = logits[j, tid-a]
 
     official = best_id.tolist()
-    matches = [int(a == b) for a,b in zip(official, BAD)]
+    matches = [int(a == b) for a,b in zip(official, prefix)]
     first_div = next((i for i,m in enumerate(matches) if not m), -1)
-    print("C_BAD_IDS=" + " ".join(map(str,BAD)), flush=True)
+    print("CANDIDATE_IDS=" + " ".join(map(str,prefix)), flush=True)
     print("OFFICIAL_GREEDY_IDS=" + " ".join(map(str,official)), flush=True)
     print("MATCH_FLAGS=" + " ".join(map(str,matches)), flush=True)
-    print("BAD_TOKEN_LOGITS=" + " ".join(f"{v:.7g}" for v in bad_logits.tolist()), flush=True)
+    print("CANDIDATE_LOGITS=" + " ".join(f"{v:.7g}" for v in prefix_logits.tolist()), flush=True)
     print("OFFICIAL_MAX_LOGITS=" + " ".join(f"{v:.7g}" for v in best_val.tolist()), flush=True)
     print(f"FIRST_DIVERGENCE={first_div}", flush=True)
+    if first_div >= 0:
+        print(
+            f"DIVERGENCE_DETAIL index={first_div} candidate={prefix[first_div]} "
+            f"official={official[first_div]} candidate_logit={prefix_logits[first_div].item():.7g} "
+            f"official_logit={best_val[first_div].item():.7g}", flush=True
+        )
 
 
 if __name__ == "__main__":
