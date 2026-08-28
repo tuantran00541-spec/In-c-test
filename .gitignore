@@ -11,6 +11,14 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# Model/checkpoint/runtime weights stay outside Git. Keep only source, tools, specs and tiny
+# synthetic fixtures in this repository.
+*.safetensors
+*.gguf
 *.bin
 *.idx
 *.fixture
+models/
+checkpoints/
+packed/
