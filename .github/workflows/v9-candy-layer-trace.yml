@@ -1,0 +1,219 @@
+name: V9 candy layer trace and BF16 semantics screen
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-candy-layer-trace.yml"
+  workflow_dispatch:
+
+jobs:
+  candy-layer-trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Instrument layer-last trace without changing normal runtime behavior
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/generate_vl.c')
+          s=p.read_text()
+          old='        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];\n'
+          new='''        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];
+        {
+            const char *trace_path = getenv("KVL_TRACE_LAYER_LAST");
+            if (trace_path && *trace_path) {
+                FILE *tf = fopen(trace_path, layer == 0 ? "wb" : "ab");
+                if (!tf) goto done;
+                const float *last = x + (size_t)(seq_len - 1) * H;
+                const size_t wrote = fwrite(last, sizeof(float), H, tf);
+                fclose(tf);
+                if (wrote != H) goto done;
+            }
+        }
+'''
+          assert s.count(old)==1, s.count(old)
+          p.write_text(s.replace(old,new))
+          PY
+
+      - name: Build baseline traced runtime
+        run: |
+          cmake -S . -B build-base -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-base -j 2
+          test -x ./build-base/kvl_generate_vl
+
+      - name: Create strict BF16 candidate and build separately
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/ops.c'); s=p.read_text()
+          marker='''float kvl_bf16_to_f32(uint16_t x) {
+    uint32_t bits = (uint32_t)x << 16;
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+'''
+          helper=marker+'''\nstatic float kvl_strict_bf16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof u);
+    const uint32_t exp = u & UINT32_C(0x7f800000);
+    if (exp != UINT32_C(0x7f800000))
+        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u);
+    u &= UINT32_C(0xffff0000);
+    memcpy(&x, &u, sizeof x);
+    return x;
+}
+'''
+          assert s.count(marker)==1
+          s=s.replace(marker,helper)
+          s=s.replace('y[o] = dot_bf16_avx2(row, x, in);','y[o] = kvl_strict_bf16(dot_bf16_avx2(row, x, in));')
+          s=s.replace('y[o] = dot_bf16_ref(row, x, in);','y[o] = kvl_strict_bf16(dot_bf16_ref(row, x, in));')
+          s=s.replace('y[i] = silu * up[i];','y[i] = kvl_strict_bf16(silu * up[i]);')
+          s=s.replace('y[i] = x[i] * inv * kvl_bf16_to_f32(weight[i]);','y[i] = kvl_strict_bf16(x[i] * inv * kvl_bf16_to_f32(weight[i]));')
+          s=s.replace('dst[i] = a * c - b * si;','dst[i] = kvl_strict_bf16(a * c - b * si);')
+          s=s.replace('dst[half + i] = b * c + a * si;','dst[half + i] = kvl_strict_bf16(b * c + a * si);')
+          s=s.replace('scores[j] = (float)dot * scale;','scores[j] = kvl_strict_bf16((float)dot * scale);')
+          s=s.replace('acc += ((double)scores[j] / denom) * (double)v[d];','acc += (double)kvl_strict_bf16((float)((double)scores[j] / denom)) * (double)v[d];')
+          s=s.replace('ho[d] = (float)acc;','ho[d] = kvl_strict_bf16((float)acc);')
+          # Official decoder layer returns BF16, including routed/shared MoE aggregation.
+          s=s.replace('        for (int i = 0; i < H; ++i) out[i] += tmp[i];','        for (int i = 0; i < H; ++i) out[i] = kvl_strict_bf16(out[i] + tmp[i]);')
+          p.write_text(s)
+
+          p=Path('src/generate_vl.c'); s=p.read_text()
+          s=s.replace('r1[base + i] = x[base + i] + attn[base + i];','r1[base + i] = v9_round_bf16(x[base + i] + v9_round_bf16(attn[base + i]));')
+          s=s.replace('for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];','for (size_t i = 0; i < elems; ++i) x[i] = v9_round_bf16(r1[i] + v9_round_bf16(y[i]));')
+          p.write_text(s)
+          PY
+          cmake -S . -B build-strict -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-strict -j 2
+          test -x ./build-strict/kvl_generate_vl
+
+      - name: Restore canonical candy image
+        run: |
+          python - <<'PY'
+          import os, urllib.request
+          from PIL import Image
+          out=os.path.join(os.environ['RUNNER_TEMP'],'candy-source.jpg')
+          urllib.request.urlretrieve('https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG',out)
+          Image.open(out).convert('RGB').resize((196,196),Image.Resampling.BICUBIC).save(os.path.join(os.environ['RUNNER_TEMP'],'candy-196.jpg'),quality=95)
+          PY
+
+      - name: Fetch pinned assets and official vision shard
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json, os, shutil
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          work=os.path.join(os.environ['RUNNER_TEMP'],'kimi-pinned'); packed=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          os.makedirs(work,exist_ok=True); os.makedirs(packed,exist_ok=True)
+          for name in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=name,local_dir=work); shutil.copy2(p,os.path.join(packed,name))
+          for name in ('config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=name,local_dir=work)
+          idx=json.load(open(os.path.join(work,'model.safetensors.index.json')))
+          for name in sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')}):
+              hf_hub_download(repo,revision=rev,filename=name,local_dir=work)
+          PY
+
+      - name: Produce pinned official candy media
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-pinned')
+          gh,gw=write_patches(root,os.path.join(os.environ['RUNNER_TEMP'],'candy-196.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'candy-patches.f32'))
+          assert (gh,gw)==(14,14),(gh,gw)
+          PY
+          python tools/dump_official_bf16_vision_reference.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/candy-patches.f32" 14 14 \
+            "$RUNNER_TEMP/candy-media.f32" "$RUNNER_TEMP/candy-media.u16" --revision "$REV"
+
+      - name: Pack pinned complete text model once
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" --revision "$REV"
+
+      - name: Build candy prompt
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'; enc,_,special=build_encoding(root)
+          ids=encode_image_chat(enc,'What animal is on the candy?',49)
+          assert sum(x==special['<|media_pad|>'] for x in ids)==49
+          (Path(os.environ['RUNNER_TEMP'])/'candy-prompt.ids').write_text('\n'.join(map(str,ids))+'\n')
+          print('prompt_tokens',len(ids))
+          PY
+
+      - name: Run official BF16 layer oracle once
+        run: |
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi-pinned" "$RUNNER_TEMP/packed-v9" \
+            "$RUNNER_TEMP/candy-prompt.ids" "$RUNNER_TEMP/candy-media.u16" "$RUNNER_TEMP/candy-official.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/candy-official.log"
+
+      - name: Run baseline C traced prefill
+        run: |
+          KVL_TRACE_LAYER_LAST="$RUNNER_TEMP/candy-base-layer.f32" \
+          ./build-base/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/candy-prompt.ids" "$RUNNER_TEMP/candy-media.f32" \
+            536870912 1 0 1 | tee "$RUNNER_TEMP/candy-base.tokens"
+
+      - name: Run strict BF16 candidate traced prefill
+        run: |
+          KVL_TRACE_LAYER_LAST="$RUNNER_TEMP/candy-strict-layer.f32" \
+          ./build-strict/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/candy-prompt.ids" "$RUNNER_TEMP/candy-media.f32" \
+            536870912 1 0 1 | tee "$RUNNER_TEMP/candy-strict.tokens"
+
+      - name: Compare C layers against official
+        run: |
+          python - <<'PY'
+          import numpy as np, os
+          root=os.environ['RUNNER_TEMP']; ref=np.load(os.path.join(root,'candy-official.npz'))['layer_last'].astype(np.float64)
+          official_token=int(np.load(os.path.join(root,'candy-official.npz'))['first_token'][0])
+          print('OFFICIAL_TOKEN',official_token)
+          for key in ('base','strict'):
+              a=np.fromfile(os.path.join(root,f'candy-{key}-layer.f32'),dtype=np.float32)
+              assert a.size==27*2048,(key,a.size)
+              a=a.reshape(27,2048).astype(np.float64)
+              mx=np.max(np.abs(a-ref),axis=1); rms=np.sqrt(np.mean((a-ref)**2,axis=1))
+              ids=[]
+              for line in open(os.path.join(root,f'candy-{key}.tokens')):
+                  if line.startswith('TOKEN '): ids.append(int(line.split()[1]))
+              print(f'{key.upper()}_TOKEN',ids[0] if ids else -1)
+              for L,(m,r) in enumerate(zip(mx,rms)):
+                  print(f'{key.upper()}_L{L:02d}_MAX={m:.9g} RMS={r:.9g}')
+              print(f'{key.upper()}_FIRST_GT_1E3',next((i for i,x in enumerate(mx) if x>1e-3),-1))
+              print(f'{key.upper()}_FINAL_MAX={mx[-1]:.9g} FINAL_RMS={rms[-1]:.9g}')
+          PY
