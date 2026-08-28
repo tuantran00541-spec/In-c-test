@@ -1,22 +1,23 @@
-# kimi-vl-lowram v5
+# kimi-vl-lowram v6
 
 CPU-first low-RAM inference prototype for `moonshotai/Kimi-VL-A3B-Instruct`, borrowing the
 storage discipline of `kimi-k3-in-c` while keeping model-specific math separate.
 
-**Real-weight V5 status: PASS.** The complete official Kimi-VL text model now forwards in C
-from aligned SSD-backed runtime stores:
+**Real-weight V6 status: PASS.** The complete official Kimi-VL text decoder now supports
+persistent token-by-token execution in C from aligned SSD-backed runtime stores using
+compressed MLA history.
+
+The accepted full-model test compares:
 
 ```text
-token embedding
-  -> 27 decoder layers
-  -> final RMSNorm
-  -> 163,840-way LM head
-  -> logits
+A. causal prefill of token ids [1, 1008]
+B. token 1 -> persistent compressed MLA state -> token 1008 incremental decode
 ```
 
-For token id `1`, the C runtime matched the packed PyTorch oracle with `2.8252602e-05`
-maximum absolute logit error and selected the same argmax token, `1008`. Both trunk and
-expert backing stores used direct I/O. See `spec/REAL_V5_RESULT.md`.
+through all 27 decoder layers, final RMSNorm and the 163,840-way LM head. With the official
+`rms_norm_eps=1e-5`, incremental decoding matched causal prefill with
+`7.62939453e-06` maximum hidden-state error and `1.90734863e-06` maximum logit error; both
+paths selected argmax token `1609`. See `spec/REAL_V6_RESULT.md`.
 
 ## Milestones
 
@@ -28,10 +29,11 @@ expert backing stores used direct I/O. See `spec/REAL_V5_RESULT.md`.
   official decoder layer passes on a four-token sequence.
 - **V4:** separate aligned trunk backing store plus a real two-layer stack; official dense
   layer 0 -> sparse layer 1 passes with both stores using direct I/O.
-- **V5:** bounded conversion of the complete official text checkpoint, all 27 decoder layers,
-  global embedding/final norm/LM head, and a complete C logits forward.
+- **V5:** complete 27-layer official text model -> final RMSNorm -> 163,840 logits in C.
+- **V6:** persistent incremental decode using compressed MLA latent+RoPE history; full
+  two-token 27-layer execution matches causal prefill and produces the same next argmax.
 
-## Full V5 runtime pack
+## Complete runtime pack
 
 ```text
 trunk.bin       2.916 GiB
@@ -42,34 +44,68 @@ experts.idx   133,168 bytes
 routed expert records = 1664 = 26 x 64
 ```
 
-`tools/pack_full_text.py` downloads official source shards with a bounded working set. A few
-decoder layers cross a shard boundary, so the converter may keep two source shards at once;
-once no unfinished tensor depends on a shard it is deleted. In the passing V5 workflow all
-seven large safetensor source shards were removed by the end of conversion.
+`tools/pack_full_text.py` downloads official source shards with a bounded working set. Some
+layers cross shard boundaries, so the converter may retain two source shards at once; a
+source shard is deleted as soon as no unfinished tensor depends on it. In the passing V6
+workflow all seven large source shards were gone after conversion.
 
-## V5 real run
+## V6 compressed MLA state
 
-The C run used a hard 512 MiB routed-expert cache:
+V6 has two incremental implementations:
+
+1. an expanded K/V state used only as a correctness reference;
+2. the intended compressed MLA state, which stores normalized latent KV plus the RoPE
+   component and performs the K/V projection algebra during attention.
+
+For the released Kimi-VL dimensions:
 
 ```text
-cache slots       31
-MoE selections    156
-physical reads    156
-expert bytes read 2574.00 MiB
-expert evictions  125
-read failures     0
-
-worst layer       26
-layer max abs     1.0681152e-04
-logits max abs    2.8252602e-05
-logits RMS        4.0282628e-06
-argmax             1008
-reference argmax   1008
-trunk direct I/O   yes
-expert direct I/O  yes
+latent KV rank                  512
+RoPE component                   64
+compressed FP32 payload
+  per layer / historical token 2304 bytes
 ```
 
-The measured disk throughput in CI is runner-specific and is not a laptop benchmark.
+An official production-dimension layer-1 test reduced four-token state from 81,960 bytes
+expanded to 9,248 bytes compressed (~8.862x) while matching causal prefill within
+`4.42378223e-09` max absolute error.
+
+For the final full-model two-token test, all 27 compressed states together allocated
+125,280 bytes.
+
+## Full V6 real run
+
+Official semantics and execution:
+
+```text
+rms_norm_eps         1.0e-05
+tokens                    2
+worst layer              26
+worst token                1
+hidden max abs     7.62939453e-06
+logits max abs     1.90734863e-06
+logits RMS         4.55979847e-07
+prefill argmax          1609
+incremental argmax      1609
+trunk direct I/O         yes
+expert direct I/O        yes
+```
+
+The hard 512 MiB routed-expert cache was heavily exercised:
+
+```text
+cache slots          31
+physical reads       595
+expert bytes read 9817.50 MiB
+expert evictions     564
+read failures          0
+```
+
+The cache's compute-side hit count is measured after `getmany()` prefetch; the physical-read
+and eviction counters show that the complete routed working set was not resident.
+
+The measured GitHub Actions disk throughput is runner-specific and is not a laptop
+performance claim.
 
 ## Build
 
@@ -86,9 +122,16 @@ python tests/test_cache_roundtrip.py --build-dir build
 python tests/test_moe_oracle.py --build-dir build
 python tests/test_layer_oracle.py --build-dir build
 python tests/test_stack_oracle.py --build-dir build
+./build/kvl_mla_incremental_probe
 ```
 
-The real full-text workflow is `.github/workflows/real-v5.yml`.
+Real workflows:
+
+```text
+.github/workflows/real-v5.yml              full one-token logits
+.github/workflows/real-v6-mla.yml          official compressed-MLA layer probe
+.github/workflows/real-v6-full-decode.yml  full 27-layer incremental equivalence
+```
 
 ## Runtime backing stores
 
@@ -107,22 +150,25 @@ experts.bin / experts.idx
   routed expert gate/up/down matrices
 ```
 
-Records are 4096-byte aligned. The current implementation loads the needed trunk records,
-computes with them and releases them; routed experts use the hard-budget LRU/prefetch cache.
+Records are 4096-byte aligned. Trunk tensors are loaded/released as needed; routed experts
+use the hard-budget LRU/prefetch cache.
 
-## Next: V6 incremental decoding
+## Next: V7 actual text generation
 
-V5 proves a complete one-token text forward, but it is not generation yet. V6 adds persistent
-MLA state and compares token-by-token decoding against causal multi-token prefill.
+V6 closes the incremental-decoder correctness milestone. The shortest route to visible text
+is now tokenizer + generation plumbing rather than another model-math block:
 
-The correctness plan is deliberately staged:
+```text
+prompt
+  -> tokenizer
+  -> prefill / compressed MLA state
+  -> logits
+  -> greedy or sampled token
+  -> incremental decode
+  -> EOS / stop handling
+  -> decoded text
+```
 
-1. **V6a:** an expanded K/V cache used as a reference implementation. Incremental outputs
-   must match the already-validated causal prefill path.
-2. **V6b:** replace the expanded reference state with the intended compressed MLA state
-   (latent KV + RoPE component) and prove it produces the same outputs.
-3. Run a real multi-token 27-layer oracle and compare next-token logits.
-4. Add tokenizer/sampling only after incremental logits match.
-
-Quantized expert kernels and MoonViT vision remain separate later milestones so they do not
-hide decoder-correctness bugs.
+After this baseline CLI generates real text, performance work can proceed independently:
+BF16 MLA-state compression, routed-expert quantization/direct AVX2 kernels, smarter expert
+prefetch/cache policy and finally MoonViT vision integration.
