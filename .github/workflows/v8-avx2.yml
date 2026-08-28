@@ -1,0 +1,40 @@
+name: V8 AVX2 numerical regression
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v8-avx2.yml"
+      - "CMakeLists.txt"
+      - "src/ops.c"
+      - "src/mla_state.c"
+      - "src/mla_compressed_state.c"
+      - "tests/test_moe_oracle.py"
+      - "tests/test_layer_oracle.py"
+      - "tests/test_stack_oracle.py"
+
+jobs:
+  avx2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fixture dependencies
+        run: |
+          python -m pip install --no-cache-dir numpy safetensors torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build AVX2 backend
+        run: |
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 -j 2
+      - name: Run AVX2 numerical regressions
+        run: |
+          python tests/test_moe_oracle.py --build-dir build-avx2
+          python tests/test_layer_oracle.py --build-dir build-avx2
+          python tests/test_stack_oracle.py --build-dir build-avx2
+          ./build-avx2/kvl_mla_incremental_probe
