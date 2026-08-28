@@ -33,6 +33,7 @@ jobs:
       - name: Install V7 dependencies
         run: |
           python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
       - name: Build C runtime
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
