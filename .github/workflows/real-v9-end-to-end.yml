@@ -74,6 +74,7 @@ jobs:
           test -s "$RUNNER_TEMP/v9-output.txt"
           grep -q 'grid=2x2 media_tokens=1' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'kvl_vision: grid=2x2 media_tokens=1 direct_io=yes' "$RUNNER_TEMP/v9-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'kvl_generate_vl: generated=' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/v9-stderr.txt"
           grep -q 'timing vision=' "$RUNNER_TEMP/v9-stderr.txt"
