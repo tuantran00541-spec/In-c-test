@@ -1,0 +1,85 @@
+name: V9 official VI 16-token teacher-forced oracle
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-official-vi-16-token-teacher.yml"
+  workflow_dispatch:
+
+jobs:
+  vi-16-token-official:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Restore image and fetch pinned frontend/vision assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python - <<'PY'
+          import json,os,shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']; work=os.path.join(os.environ['RUNNER_TEMP'],'kimi'); packed=os.path.join(os.environ['RUNNER_TEMP'],'packed')
+          os.makedirs(work,exist_ok=True); os.makedirs(packed,exist_ok=True)
+          for n in ('config.json','preprocessor_config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=work)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=work); shutil.copy2(p,os.path.join(packed,n))
+          idx=json.load(open(os.path.join(work,'model.safetensors.index.json')))
+          for n in sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')}):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=work)
+          PY
+      - name: Produce exact pinned official BF16 user media
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi')
+          gh,gw=write_patches(root,os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14)
+          PY
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/media.f32" "$RUNNER_TEMP/media.u16" --revision "$REV"
+      - name: Pack pinned complete text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" --revision "$REV"
+      - name: Build exact VI prompt and captured 16-token continuation
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed'; enc,_,special=build_encoding(root)
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          ids=encode_image_chat(enc,prompt,49)
+          assert len(ids)==136 and sum(x==special['<|media_pad|>'] for x in ids)==49
+          (Path(os.environ['RUNNER_TEMP'])/'prompt.ids').write_text('\n'.join(map(str,ids))+'\n')
+          bad=[39,150340,13271,118,96,42955,437,16032,104,77,650,47766,64,124397,275,4313]
+          (Path(os.environ['RUNNER_TEMP'])/'bad16.ids').write_text('\n'.join(map(str,bad))+'\n')
+          print('BAD16_TEXT=',repr(enc.decode(bad)))
+          PY
+      - name: Verify all 16 tokens against official BF16 greedy logits
+        run: |
+          python tools/dump_official_teacher_forced_bad_prefix.py \
+            "$RUNNER_TEMP/packed" "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/media.u16" "$RUNNER_TEMP/bad16.ids" \
+            --revision "$REV" | tee "$RUNNER_TEMP/teacher16.log"
+          grep -q '^FIRST_DIVERGENCE=' "$RUNNER_TEMP/teacher16.log"
