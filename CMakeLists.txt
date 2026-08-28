@@ -11,6 +11,7 @@ add_library(kvl_storage
   src/expert_cache.c
   src/trunk_store.c
   src/ops.c
+  src/mla_state.c
 )
 target_include_directories(kvl_storage PUBLIC include)
 if (OpenMP_C_FOUND)
@@ -39,3 +40,6 @@ target_link_libraries(kvl_stack_probe PRIVATE kvl_storage)
 
 add_executable(kvl_logits_probe src/logits_probe.c)
 target_link_libraries(kvl_logits_probe PRIVATE kvl_storage)
+
+add_executable(kvl_mla_incremental_probe src/mla_incremental_probe.c)
+target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
