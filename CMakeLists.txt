@@ -2,7 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(kimi_vl_lowram C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-add_compile_options(-Wall -Wextra -Wpedantic)
+if(MSVC)
+  add_compile_options(/W4)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
 
 find_package(OpenMP)
 
@@ -50,3 +54,6 @@ target_link_libraries(kvl_mla_real_probe PRIVATE kvl_storage)
 
 add_executable(kvl_decode_probe src/decode_probe.c)
 target_link_libraries(kvl_decode_probe PRIVATE kvl_storage)
+
+add_executable(kvl_generate src/generate.c)
+target_link_libraries(kvl_generate PRIVATE kvl_storage)
