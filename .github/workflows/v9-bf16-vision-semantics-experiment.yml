@@ -1,0 +1,97 @@
+name: V9 BF16 vision semantics experiment
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-bf16-vision-semantics-experiment.yml"
+
+jobs:
+  bf16-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply CI-only BF16 tensor-boundary experiment
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('src/vision.c'); s=p.read_text()
+          old='''static int loadv(KvlTrunkStore *s, uint32_t layer, uint32_t kind, KvlTrunkTensor *t) {\n    return kvl_trunk_load(s, layer, kind, t);\n}\n'''
+          new=old+'''\nstatic float vision_bf16_round(float x) {\n    uint32_t u; memcpy(&u,&x,sizeof(u));\n    const uint32_t exp=u&0x7f800000u;\n    if(exp==0x7f800000u){ if(u&0x007fffffu)u|=0x00400000u; u&=0xffff0000u; }\n    else { u+=0x00007fffu+((u>>16)&1u); u&=0xffff0000u; }\n    memcpy(&x,&u,sizeof(x)); return x;\n}\nstatic void vision_bf16_round_vec(float *x,size_t n){for(size_t i=0;i<n;++i)x[i]=vision_bf16_round(x[i]);}\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''        y[i] = ((x[i] - (float)mean) * inv) * w + b;\n'''; new='''        y[i] = vision_bf16_round(((x[i] - (float)mean) * inv) * w + b);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''    kvl_matvec_bf16(y, x, weight, in, out);\n    if (bias) for (int i = 0; i < out; ++i) y[i] += kvl_bf16_to_f32(bias[i]);\n'''; new='''    kvl_matvec_bf16(y, x, weight, in, out);\n    if (bias) for (int i = 0; i < out; ++i) y[i] += kvl_bf16_to_f32(bias[i]);\n    vision_bf16_round_vec(y,(size_t)out);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''    return (float)acc;\n}\n\nstatic void rope2d_pair'''; new='''    return vision_bf16_round((float)acc);\n}\n\nstatic void rope2d_pair'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''        q[a] = qa * c - qb * s; q[b] = qb * c + qa * s;\n        k[a] = ka * c - kb * s; k[b] = kb * c + ka * s;\n'''; new='''        q[a]=vision_bf16_round(qa*c-qb*s); q[b]=vision_bf16_round(qb*c+qa*s);\n        k[a]=vision_bf16_round(ka*c-kb*s); k[b]=vision_bf16_round(kb*c+ka*s);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''                scores[j]=(float)dot*scale;\n                if(scores[j]>mx)mx=scores[j];\n'''; new='''                scores[j]=vision_bf16_round((float)dot);\n                scores[j]=vision_bf16_round(scores[j]*scale);\n                if(scores[j]>mx)mx=scores[j];\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''            double den=0.0;\n            for(int j=0;j<seq;++j){scores[j]=expf(scores[j]-mx);den+=scores[j];}\n            float *ho=attn+(size_t)t*VD+(size_t)h*VHD;\n            for(int d=0;d<VHD;++d){\n                double a=0.0;\n                for(int j=0;j<seq;++j){\n                    const float *v=qkv+(size_t)j*3*VD+2*VD+(size_t)h*VHD;\n                    a+=((double)scores[j]/den)*(double)v[d];\n                }\n                ho[d]=(float)a;\n            }\n'''; new='''            double den=0.0;\n            for(int j=0;j<seq;++j){scores[j]=expf(scores[j]-mx);den+=scores[j];}\n            for(int j=0;j<seq;++j)scores[j]=vision_bf16_round((float)((double)scores[j]/den));\n            float *ho=attn+(size_t)t*VD+(size_t)h*VHD;\n            for(int d=0;d<VHD;++d){\n                double a=0.0;\n                for(int j=0;j<seq;++j){const float *v=qkv+(size_t)j*3*VD+2*VD+(size_t)h*VHD;a+=(double)scores[j]*(double)v[d];}\n                ho[d]=vision_bf16_round((float)a);\n            }\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''        for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=tmpd[d];\n'''; new='''        for(int d=0;d<VD;++d)x[(size_t)t*VD+d]=vision_bf16_round(x[(size_t)t*VD+d]+tmpd[d]);\n'''
+          assert s.count(old)==1; s=s.replace(old,new,1)
+          old='''        for(int i=0;i<VI;++i)inter[i]=gelu_tanh(inter[i]);\n        linear_bias(tmpd,inter,(const uint16_t*)f1w.data,(const uint16_t*)f1b.data,VI,VD);\n        for(int d=0;d<VD;++d)xt[d]+=tmpd[d];\n'''; new='''        for(int i=0;i<VI;++i)inter[i]=vision_bf16_round(gelu_tanh(inter[i]));\n        linear_bias(tmpd,inter,(const uint16_t*)f1w.data,(const uint16_t*)f1b.data,VI,VD);\n        for(int d=0;d<VD;++d)xt[d]=vision_bf16_round(xt[d]+tmpd[d]);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''    for(int t=0;t<seq;++t){\n        linear_bias(x+(size_t)t*VD,patches+(size_t)t*PATCH_IN,\n                    (const uint16_t*)pw.data,(const uint16_t*)pb.data,PATCH_IN,VD);\n'''; new='''    for(int t=0;t<seq;++t){\n        for(int i=0;i<PATCH_IN;++i)concat[i]=vision_bf16_round(patches[(size_t)t*PATCH_IN+i]);\n        linear_bias(x+(size_t)t*VD,concat,\n                    (const uint16_t*)pw.data,(const uint16_t*)pb.data,PATCH_IN,VD);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''            for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=kvl_bf16_to_f32(pp[d]);\n'''; new='''            for(int d=0;d<VD;++d)x[(size_t)t*VD+d]=vision_bf16_round(x[(size_t)t*VD+d]+kvl_bf16_to_f32(pp[d]));\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''            for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=\n                interp_pos((const uint16_t*)pos.data,ph,pwid,gh,gw,oh,ow,d);\n'''; new='''            for(int d=0;d<VD;++d)x[(size_t)t*VD+d]=vision_bf16_round(x[(size_t)t*VD+d]+\n                interp_pos((const uint16_t*)pos.data,ph,pwid,gh,gw,oh,ow,d));\n'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''        for(int i=0;i<PROJECT;++i)projtmp[i]=gelu_exact(projtmp[i]);\n'''; new='''        for(int i=0;i<PROJECT;++i)projtmp[i]=vision_bf16_round(gelu_exact(projtmp[i]));\n'''
+          assert old in s; s=s.replace(old,new,1)
+          p.write_text(s); print('BF16 tensor-boundary experiment applied')
+          PY
+
+      - name: Install checkpoint-compatible CPU dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build experimental C vision
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+
+      - name: Restore image and fetch official vision assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json,os
+          repo='moonshotai/Kimi-VL-A3B-Instruct';root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):hf_hub_download(repo,filename=name,local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for name in shards:hf_hub_download(repo,filename=name,local_dir=root)
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed"
+
+      - name: Preprocess and compare exact BF16 media boundary
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools');from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'),os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14)
+          PY
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/official.f32" "$RUNNER_TEMP/official.u16"
+          ./build/kvl_vision "$RUNNER_TEMP/packed/vision.bin" "$RUNNER_TEMP/packed/vision.idx" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/c.f32"
+          python - <<'PY'
+          import os,numpy as np,torch
+          r=os.environ['RUNNER_TEMP'];off=np.fromfile(os.path.join(r,'official.f32'),np.float32);bits=np.fromfile(os.path.join(r,'official.u16'),np.uint16);c=np.fromfile(os.path.join(r,'c.f32'),np.float32)
+          cb=torch.from_numpy(c.copy()).to(torch.bfloat16).float().numpy();cbits=torch.from_numpy(c.copy()).to(torch.bfloat16).view(torch.uint16).numpy();neq=np.flatnonzero(bits!=cbits);d=cb.astype(np.float64)-off.astype(np.float64)
+          print(f'EXPERIMENT mismatches={neq.size}/{off.size} ({100*neq.size/off.size:.4f}%)')
+          print(f'EXPERIMENT max_abs={np.max(np.abs(d)):.9g} rms={np.sqrt(np.mean(d*d)):.9g}')
+          PY
