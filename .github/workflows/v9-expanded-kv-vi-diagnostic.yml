@@ -1,0 +1,96 @@
+name: V9 expanded KV exact VI diagnostic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  expanded-kv-vi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Patch expanded KV state and build
+        run: |
+          python tools/patch_expanded_kv_decode.py
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate_vl
+      - name: Restore exact VI and tokenizer
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+      - name: Fetch metadata and official vision tensors
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json,os
+          repo='moonshotai/Kimi-VL-A3B-Instruct'; rev='398eede0903cd983a2bfa0cc634e9ac1d843f375'; root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):
+              hf_hub_download(repo,filename=name,local_dir=root,revision=rev)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for name in shards: hf_hub_download(repo,filename=name,local_dir=root,revision=rev)
+          PY
+      - name: Produce official BF16 media features
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'),os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14)
+          PY
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/official-media.f32" "$RUNNER_TEMP/official-media.u16"
+      - name: Pack official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+      - name: Build exact VI prompt IDs
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'; enc,_,special=build_encoding(root)
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          ids=encode_image_chat(enc,prompt,49); assert len(ids)==136
+          assert [i for i,x in enumerate(ids) if x==special['<|media_pad|>']]==list(range(15,64))
+          (Path(os.environ['RUNNER_TEMP'])/'prompt.ids').write_text('\n'.join(map(str,ids))+'\n')
+          PY
+      - name: Generate with expanded KV state and official media
+        run: |
+          ./build/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/official-media.f32" \
+            536870912 12 0 1 \
+            2> >(tee "$RUNNER_TEMP/stderr.txt" >&2) | tee "$RUNNER_TEMP/tokens.txt"
+      - name: Decode expanded-KV output
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,decode_generated
+          root=Path(os.environ['RUNNER_TEMP']); enc,_,_=build_encoding(root/'packed-v9')
+          ids=[int(x.split()[1]) for x in (root/'tokens.txt').read_text().splitlines() if x.startswith('TOKEN ')]
+          text=decode_generated(enc,ids,{163585,163586})
+          print('EXPANDED_KV_IDS=',ids)
+          print('EXPANDED_KV_TEXT=',text)
+          print('KNOWN_BAD_PREFIX=',ids[:8]==[39,150340,13271,118,96,42955,437,16032])
+          PY
