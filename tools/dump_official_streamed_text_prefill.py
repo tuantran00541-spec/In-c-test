@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import pathlib
 import struct
 
@@ -120,6 +119,22 @@ def layer_state_dict(tr: Trunk, ex: Experts, tc, layer: int) -> dict[str, torch.
     return sd
 
 
+def repair_meta_rotary(rotary, tc, seq_len: int) -> None:
+    """A meta-created layer leaves non-persistent RoPE buffers on meta.
+
+    They are intentionally absent from state_dict, so assign=True cannot materialize them.
+    Rebuild the released class' standard inverse-frequency buffer on CPU, then let its own
+    cache builder create cos/sin exactly as a normally constructed CPU layer would.
+    """
+    inv = getattr(rotary, "inv_freq", None)
+    if inv is None or inv.device.type == "meta":
+        dim = int(getattr(rotary, "dim", tc.qk_rope_head_dim))
+        base = float(getattr(rotary, "base", tc.rope_theta))
+        inv = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        rotary.inv_freq = inv
+    rotary._set_cos_sin_cache(seq_len, torch.device("cpu"), torch.bfloat16)
+
+
 def official_rms(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     dtype = x.dtype
     xf = x.float()
@@ -177,8 +192,7 @@ def main() -> None:
         miss = layer_mod.load_state_dict(sd, strict=True, assign=True)
         if miss.missing_keys or miss.unexpected_keys:
             raise RuntimeError(miss)
-        # Rotary caches created on meta by the meta constructor must be rebuilt on CPU.
-        layer_mod.self_attn.rotary_emb._set_cos_sin_cache(S, torch.device("cpu"), torch.bfloat16)
+        repair_meta_rotary(layer_mod.self_attn.rotary_emb, tc, S)
         layer_mod.eval()
         with torch.inference_mode():
             x = layer_mod(x, attention_mask=attention_mask, position_ids=position_ids, use_cache=False)[0]
@@ -202,7 +216,6 @@ def main() -> None:
         vv=float(v); ii=a+int(i)
         if vv > best_val:
             best_val=vv; best_id=ii
-        # retain a small global top list for debugging
         kk=min(8, logits.numel()); vals, inds=torch.topk(logits, kk)
         top_vals.extend((float(vv2), a+int(ii2)) for vv2,ii2 in zip(vals,inds))
     top_vals=sorted(top_vals, reverse=True)[:16]
