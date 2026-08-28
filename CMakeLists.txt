@@ -44,3 +44,6 @@ target_link_libraries(kvl_logits_probe PRIVATE kvl_storage)
 
 add_executable(kvl_mla_incremental_probe src/mla_incremental_probe.c)
 target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
+
+add_executable(kvl_mla_real_probe src/mla_real_probe.c)
+target_link_libraries(kvl_mla_real_probe PRIVATE kvl_storage)
