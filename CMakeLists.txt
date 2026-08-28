@@ -8,7 +8,13 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(OpenMP)
+# MSVC's default OpenMP mode is the legacy 2.0 frontend and rejects several C11
+# canonical-loop forms used by the reference kernels. Keep the Windows correctness/direct-I/O
+# build independent from that legacy runtime. V8's Windows performance path will use the
+# dedicated fast-kernel/threading backend instead of silently relying on old MSVC OpenMP.
+if(NOT MSVC)
+  find_package(OpenMP)
+endif()
 
 add_library(kvl_storage
   src/expert_store.c
