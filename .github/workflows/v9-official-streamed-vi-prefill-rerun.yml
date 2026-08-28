@@ -1,4 +1,4 @@
-name: V9 official VI content-order A-B oracle
+name: V9 official VI prompt-semantics sweep
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  official-vi-order-ab:
+  official-vi-prompt-sweep:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -74,74 +74,59 @@ jobs:
         run: |
           python tools/pack_full_text.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" --revision "$REV"
 
-      - name: Build image-first and text-first VI token streams
+      - name: Build prompt sweep and known-bad prefix
         run: |
           python - <<'PY'
           import os,sys
           from pathlib import Path
           sys.path.insert(0,'tools')
-          from kimi_tokenizer import build_encoding,format_image_chat
+          from kimi_tokenizer import build_encoding,encode_image_chat
 
           root=Path(os.environ['RUNNER_TEMP'])/'packed'
+          out=Path(os.environ['RUNNER_TEMP'])
           enc,_,special=build_encoding(root)
-          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
-          media=(
-              '<|media_start|>image<|media_content|>'
-              + '<|media_pad|>'*49
-              + '<|media_end|>'
-          )
-          system='You are a helpful assistant'
-          image_first=format_image_chat(prompt,49,system)
-          text_first=(
-              f'<|im_system|>system<|im_middle|>{system}<|im_end|>'
-              f'<|im_user|>user<|im_middle|>{prompt}{media}<|im_end|>'
-              f'<|im_assistant|>assistant<|im_middle|>'
-          )
-          pad=special['<|media_pad|>']
-          for name,text in [('image-first',image_first),('text-first',text_first)]:
-              ids=enc.encode(text,allowed_special='all')
-              pos=[i for i,x in enumerate(ids) if x==pad]
-              assert len(pos)==49,(name,len(pos))
-              (Path(os.environ['RUNNER_TEMP'])/f'{name}.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
-              print(f'{name}: seq={len(ids)} media={pos[0]}..{pos[-1]}')
-              print(f'{name}: tail={ids[-12:]}')
+          prompts={
+            'baseline': 'Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.',
+            'vi-short': 'Mô tả ảnh này bằng một câu tiếng Việt.',
+            'vi-direct': 'Ảnh này có gì? Mô tả nhân vật và biểu cảm bằng một câu tiếng Việt.',
+            'vi-natural': 'Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn.',
+            'hybrid-en-task-vi-answer': 'Describe the character and facial expression in this image in one short sentence. Answer in Vietnamese.',
+            'english-control': 'Look at this image and answer only in English. Describe the character and facial expression in one short sentence.',
+          }
+          for name,prompt in prompts.items():
+              ids=encode_image_chat(enc,prompt,49)
+              assert sum(x==special['<|media_pad|>'] for x in ids)==49
+              (out/f'{name}.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+              print(f'{name}: seq={len(ids)} prompt={prompt!r}')
+          bad=[39,150340,13271,118,96,42955,437,16032]
+          (out/'bad8.ids').write_text('\n'.join(map(str,bad))+'\n',encoding='ascii')
+          print('BAD8_TEXT=',repr(enc.decode(bad)))
           PY
 
-      - name: Official prefill image first baseline
+      - name: Score known-bad attractor under each prompt
         run: |
-          python tools/dump_official_streamed_text_prefill.py \
-            "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" \
-            "$RUNNER_TEMP/image-first.ids" "$RUNNER_TEMP/media.u16" \
-            "$RUNNER_TEMP/image-first.npz" \
-            --revision "$REV" | tee "$RUNNER_TEMP/image-first.log"
-          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/image-first.log"
+          set -euo pipefail
+          for name in baseline vi-short vi-direct vi-natural hybrid-en-task-vi-answer english-control; do
+            echo "===== $name ====="
+            python tools/dump_official_teacher_forced_bad_prefix.py \
+              "$RUNNER_TEMP/packed" "$RUNNER_TEMP/$name.ids" "$RUNNER_TEMP/media.u16" "$RUNNER_TEMP/bad8.ids" \
+              --revision "$REV" | tee "$RUNNER_TEMP/$name.log"
+            grep -q '^FIRST_DIVERGENCE=' "$RUNNER_TEMP/$name.log"
+          done
 
-      - name: Official prefill text first candidate
-        run: |
-          python tools/dump_official_streamed_text_prefill.py \
-            "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" \
-            "$RUNNER_TEMP/text-first.ids" "$RUNNER_TEMP/media.u16" \
-            "$RUNNER_TEMP/text-first.npz" \
-            --revision "$REV" | tee "$RUNNER_TEMP/text-first.log"
-          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/text-first.log"
-
-      - name: Compare official first-token semantics
+      - name: Summarize escape points
         run: |
           python - <<'PY'
-          import os,re,sys
+          import os,re
           from pathlib import Path
-          sys.path.insert(0,'tools')
-          from kimi_tokenizer import build_encoding
           root=Path(os.environ['RUNNER_TEMP'])
-          enc,_,_=build_encoding(root/'packed')
-          def get(name):
+          names=['baseline','vi-short','vi-direct','vi-natural','hybrid-en-task-vi-answer','english-control']
+          for name in names:
               s=(root/f'{name}.log').read_text()
-              m=re.search(r'^OFFICIAL_FIRST_TOKEN=(\d+)\s+logit=([^\s]+)',s,re.M); assert m,name
-              return int(m.group(1)),float(m.group(2))
-          a,al=get('image-first'); b,bl=get('text-first')
-          print('IMAGE_FIRST_TOKEN=',a,'TEXT=',repr(enc.decode([a])),'LOGIT=',al)
-          print('TEXT_FIRST_TOKEN=',b,'TEXT=',repr(enc.decode([b])),'LOGIT=',bl)
-          print('IMAGE_FIRST_IS_KNOWN_BAD=',a==39)
-          print('TEXT_FIRST_ESCAPES_KNOWN_BAD=',b!=39)
-          print('ORDER_CHANGES_TOP1=',a!=b)
+              div=int(re.search(r'^FIRST_DIVERGENCE=(-?\d+)',s,re.M).group(1))
+              greedy=re.search(r'^OFFICIAL_GREEDY_IDS=(.*)$',s,re.M).group(1)
+              flags=re.search(r'^MATCH_FLAGS=(.*)$',s,re.M).group(1)
+              detail=re.search(r'^DIVERGENCE_DETAIL (.*)$',s,re.M)
+              print(f'SWEEP {name}: first_divergence={div} greedy={greedy} flags={flags}')
+              if detail: print(f'  {detail.group(1)}')
           PY
