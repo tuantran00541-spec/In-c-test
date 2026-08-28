@@ -1,4 +1,4 @@
-name: V9 official streamed VI prefill oracle rerun
+name: V9 official VI content-order A-B oracle
 
 on:
   push:
@@ -9,10 +9,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  official-streamed-vi-rerun:
+  official-vi-order-ab:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
     env:
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
       OMP_NUM_THREADS: "2"
       OMP_DYNAMIC: "FALSE"
     steps:
@@ -28,86 +30,118 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install checkpoint-compatible CPU dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
           python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Restore exact VI image and frontend assets
+      - name: Restore VI image and fetch pinned frontend and vision assets
         run: |
           base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
-          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
-
-      - name: Fetch official metadata and vision tensors
-        run: |
           python - <<'PY'
+          import json,os,shutil
           from huggingface_hub import hf_hub_download
-          import json, os
-          repo='moonshotai/Kimi-VL-A3B-Instruct'; root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
-          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):
-              hf_hub_download(repo,filename=name,local_dir=root)
-          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
-          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
-          for name in shards: hf_hub_download(repo,filename=name,local_dir=root)
-          print('vision shards',shards)
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          work=os.path.join(os.environ['RUNNER_TEMP'],'kimi')
+          packed=os.path.join(os.environ['RUNNER_TEMP'],'packed')
+          os.makedirs(work,exist_ok=True); os.makedirs(packed,exist_ok=True)
+          for n in ('config.json','preprocessor_config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=work)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=work)
+              shutil.copy2(p,os.path.join(packed,n))
+          idx=json.load(open(os.path.join(work,'model.safetensors.index.json')))
+          for n in sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')}):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=work)
           PY
 
-      - name: Produce exact official BF16 media embeddings
+      - name: Produce exact pinned official BF16 media
         run: |
           python - <<'PY'
           import os,sys
           sys.path.insert(0,'tools')
           from kimi_image import write_patches
-          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'),os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi')
+          gh,gw=write_patches(root,os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
           assert (gh,gw)==(14,14),(gh,gw)
           PY
           python tools/dump_official_bf16_vision_reference.py \
-            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 \
-            "$RUNNER_TEMP/official-media.f32" "$RUNNER_TEMP/official-media.u16"
+            "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/patches.f32" 14 14 \
+            "$RUNNER_TEMP/media.f32" "$RUNNER_TEMP/media.u16" \
+            --revision "$REV"
 
-      - name: Pack complete official text model into runtime stores
+      - name: Pack pinned complete text model once
         run: |
-          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
-          du -h "$RUNNER_TEMP/packed-v9"/*.bin
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" --revision "$REV"
 
-      - name: Build exact VI processor-matching prompt IDs
+      - name: Build image-first and text-first VI token streams
         run: |
           python - <<'PY'
           import os,sys
           from pathlib import Path
           sys.path.insert(0,'tools')
-          from kimi_tokenizer import build_encoding,encode_image_chat
-          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'; enc,_,special=build_encoding(root)
+          from kimi_tokenizer import build_encoding,format_image_chat
+
+          root=Path(os.environ['RUNNER_TEMP'])/'packed'
+          enc,_,special=build_encoding(root)
           prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
-          ids=encode_image_chat(enc,prompt,49); pad=special['<|media_pad|>']
-          assert len(ids)==136,len(ids)
-          assert [i for i,x in enumerate(ids) if x==pad]==list(range(15,64))
-          (Path(os.environ['RUNNER_TEMP'])/'prompt.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
-          print('prompt_tokens=136 media_positions=15..63')
+          media=(
+              '<|media_start|>image<|media_content|>'
+              + '<|media_pad|>'*49
+              + '<|media_end|>'
+          )
+          system='You are a helpful assistant'
+          image_first=format_image_chat(prompt,49,system)
+          text_first=(
+              f'<|im_system|>system<|im_middle|>{system}<|im_end|>'
+              f'<|im_user|>user<|im_middle|>{prompt}{media}<|im_end|>'
+              f'<|im_assistant|>assistant<|im_middle|>'
+          )
+          pad=special['<|media_pad|>']
+          for name,text in [('image-first',image_first),('text-first',text_first)]:
+              ids=enc.encode(text,allowed_special='all')
+              pos=[i for i,x in enumerate(ids) if x==pad]
+              assert len(pos)==49,(name,len(pos))
+              (Path(os.environ['RUNNER_TEMP'])/f'{name}.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+              print(f'{name}: seq={len(ids)} media={pos[0]}..{pos[-1]}')
+              print(f'{name}: tail={ids[-12:]}')
           PY
 
-      - name: Run released decoder code one layer at a time
+      - name: Official prefill image first baseline
         run: |
           python tools/dump_official_streamed_text_prefill.py \
-            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9" \
-            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/official-media.u16" \
-            "$RUNNER_TEMP/official-prefill.npz" \
-            | tee "$RUNNER_TEMP/oracle.txt"
-          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/oracle.txt"
+            "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" \
+            "$RUNNER_TEMP/image-first.ids" "$RUNNER_TEMP/media.u16" \
+            "$RUNNER_TEMP/image-first.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/image-first.log"
+          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/image-first.log"
 
-      - name: Decode official first token
+      - name: Official prefill text first candidate
+        run: |
+          python tools/dump_official_streamed_text_prefill.py \
+            "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" \
+            "$RUNNER_TEMP/text-first.ids" "$RUNNER_TEMP/media.u16" \
+            "$RUNNER_TEMP/text-first.npz" \
+            --revision "$REV" | tee "$RUNNER_TEMP/text-first.log"
+          grep -q '^OFFICIAL_FIRST_TOKEN=' "$RUNNER_TEMP/text-first.log"
+
+      - name: Compare official first-token semantics
         run: |
           python - <<'PY'
           import os,re,sys
           from pathlib import Path
           sys.path.insert(0,'tools')
           from kimi_tokenizer import build_encoding
-          root=Path(os.environ['RUNNER_TEMP']); enc,_,_=build_encoding(root/'packed-v9')
-          text=(root/'oracle.txt').read_text()
-          m=re.search(r'^OFFICIAL_FIRST_TOKEN=(\d+)',text,re.M); assert m
-          tid=int(m.group(1))
-          print('OFFICIAL_FIRST_TOKEN_ID=',tid)
-          print('OFFICIAL_FIRST_TOKEN_TEXT=',repr(enc.decode([tid])))
-          print('KNOWN_BAD_C_FIRST_TOKEN=39')
-          print('MATCHES_KNOWN_BAD_C=',tid==39)
+          root=Path(os.environ['RUNNER_TEMP'])
+          enc,_,_=build_encoding(root/'packed')
+          def get(name):
+              s=(root/f'{name}.log').read_text()
+              m=re.search(r'^OFFICIAL_FIRST_TOKEN=(\d+)\s+logit=([^\s]+)',s,re.M); assert m,name
+              return int(m.group(1)),float(m.group(2))
+          a,al=get('image-first'); b,bl=get('text-first')
+          print('IMAGE_FIRST_TOKEN=',a,'TEXT=',repr(enc.decode([a])),'LOGIT=',al)
+          print('TEXT_FIRST_TOKEN=',b,'TEXT=',repr(enc.decode([b])),'LOGIT=',bl)
+          print('IMAGE_FIRST_IS_KNOWN_BAD=',a==39)
+          print('TEXT_FIRST_ESCAPES_KNOWN_BAD=',b!=39)
+          print('ORDER_CHANGES_TOP1=',a!=b)
           PY
