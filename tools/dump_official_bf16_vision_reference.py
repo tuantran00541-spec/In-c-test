@@ -30,6 +30,8 @@ def main() -> None:
     ap.add_argument("grid_w", type=int)
     ap.add_argument("output_f32", type=Path)
     ap.add_argument("output_u16", type=Path)
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--revision", default="main")
     args = ap.parse_args()
 
     gh, gw = args.grid_h, args.grid_w
@@ -38,17 +40,17 @@ def main() -> None:
     if raw.size != expected:
         raise SystemExit(f"patch file has {raw.size} floats, expected {expected}")
 
-    cfg = AutoConfig.from_pretrained(REPO, trust_remote_code=True)
+    cfg = AutoConfig.from_pretrained(args.repo, trust_remote_code=True, revision=args.revision)
     # Make the released implementation use its explicit eager path. This avoids depending on
     # optional FlashAttention/SDPA kernels and preserves the checkpoint source's BF16 matmul +
     # FP32-softmax->BF16 behavior on CPU.
     cfg.vision_config._attn_implementation = "eager"
 
     vision_cls = get_class_from_dynamic_module(
-        "modeling_kimi_vl.MoonVitPretrainedModel", REPO
+        "modeling_kimi_vl.MoonVitPretrainedModel", args.repo, revision=args.revision
     )
     projector_cls = get_class_from_dynamic_module(
-        "modeling_kimi_vl.KimiVLMultiModalProjector", REPO
+        "modeling_kimi_vl.KimiVLMultiModalProjector", args.repo, revision=args.revision
     )
     vision = vision_cls(cfg.vision_config).eval().to(dtype=torch.bfloat16)
     projector = projector_cls(cfg).eval().to(dtype=torch.bfloat16)
@@ -95,7 +97,7 @@ def main() -> None:
     p = projected.float()
     print(
         "official BF16 vision: "
-        f"grid={gh}x{gw} media_tokens={projected.shape[0]} dtype={projected.dtype} "
+        f"revision={args.revision} grid={gh}x{gw} media_tokens={projected.shape[0]} dtype={projected.dtype} "
         f"min={p.min().item():.7g} max={p.max().item():.7g} "
         f"rms={p.square().mean().sqrt().item():.7g}"
     )
