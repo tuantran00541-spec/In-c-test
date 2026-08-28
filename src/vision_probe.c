@@ -1,5 +1,6 @@
 #include "kvl/vision.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -43,7 +44,8 @@ int main(int argc, char **argv) {
     float mn = out[0], mx = out[0];
     for (size_t i = 0; i < (size_t)produced * 2048; ++i) {
         const double v = out[i]; l2 += v * v;
-        if (out[i] < mn) mn = out[i]; if (out[i] > mx) mx = out[i];
+        if (out[i] < mn) mn = out[i];
+        if (out[i] > mx) mx = out[i];
     }
     fprintf(stderr, "kvl_vision: grid=%dx%d media_tokens=%d direct_io=%s min=%.7g max=%.7g rms=%.7g\n",
             gh, gw, produced, vs.direct_io ? "yes" : "no", mn, mx,
