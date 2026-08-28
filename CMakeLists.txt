@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(kimi_vl_lowram C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+option(KVL_USE_AVX2 "Use AVX2 BF16-to-FP32 GEMV backend" OFF)
+
 if(MSVC)
   add_compile_options(/W4)
 else()
@@ -10,8 +12,8 @@ endif()
 
 # MSVC's default OpenMP mode is the legacy 2.0 frontend and rejects several C11
 # canonical-loop forms used by the reference kernels. Keep the Windows correctness/direct-I/O
-# build independent from that legacy runtime. V8's Windows performance path will use the
-# dedicated fast-kernel/threading backend instead of silently relying on old MSVC OpenMP.
+# build independent from that legacy runtime. V8's Windows performance path can use the
+# dedicated AVX2 backend without silently depending on old MSVC OpenMP.
 if(NOT MSVC)
   find_package(OpenMP)
 endif()
@@ -27,6 +29,14 @@ add_library(kvl_storage
 target_include_directories(kvl_storage PUBLIC include)
 if (OpenMP_C_FOUND)
   target_link_libraries(kvl_storage PUBLIC OpenMP::OpenMP_C)
+endif()
+if (KVL_USE_AVX2)
+  target_compile_definitions(kvl_storage PRIVATE KVL_USE_AVX2=1)
+  if(MSVC)
+    target_compile_options(kvl_storage PRIVATE /arch:AVX2)
+  else()
+    target_compile_options(kvl_storage PRIVATE -mavx2)
+  endif()
 endif()
 if (WIN32)
   target_compile_definitions(kvl_storage PRIVATE _CRT_SECURE_NO_WARNINGS)
