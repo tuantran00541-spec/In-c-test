@@ -1,0 +1,46 @@
+name: V9 136-token prefill diagnostic
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-long-prefill-diagnostic.yml"
+      - "tests/test_stack_oracle.py"
+      - "src/ops.c"
+      - "src/stack_probe.c"
+
+jobs:
+  long-prefill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --no-cache-dir torch safetensors numpy
+      - name: Build AVX2 probe
+        run: |
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 -j 2
+      - name: Run the proven stack oracle at sequence length 136
+        run: |
+          cp tests/test_stack_oracle.py "$RUNNER_TEMP/test_stack_oracle_136.py"
+          python - <<'PY'
+          import os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'test_stack_oracle_136.py'
+          s=p.read_text()
+          old="c=dict(S=4,H=16,N=2,DN=4,DR=4,DV=4,R=6"
+          new="c=dict(S=136,H=16,N=2,DN=4,DR=4,DV=4,R=6"
+          assert old in s
+          s=s.replace(old,new,1)
+          # Keep __file__.parents[1] pointing at the repository so pack scripts resolve.
+          s=s.replace("root=pathlib.Path(__file__).parents[1]", "root=pathlib.Path.cwd()", 1)
+          p.write_text(s)
+          PY
+          python "$RUNNER_TEMP/test_stack_oracle_136.py" --build-dir build-avx2 | tee "$RUNNER_TEMP/long.txt"
+          grep -q 'router_ids=OK' "$RUNNER_TEMP/long.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/long.txt"
+          echo 'PASS: 136-token causal prefill / RoPE / router path matches the Torch oracle'
