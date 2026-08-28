@@ -1,4 +1,4 @@
-name: V9 VI-natural full C generation diagnostic
+name: V9 observable-feature VI grounding diagnostic
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
       - ".github/workflows/v9-user-cross-language-diagnostic.yml"
 
 jobs:
-  vi-natural-full-c:
+  vi-observable-full-c:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -53,7 +53,7 @@ jobs:
           from huggingface_hub import hf_hub_download
           repo=os.environ['REPO']; rev=os.environ['REV']
           dst=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
-          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-natural')
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-observable')
           os.makedirs(dst,exist_ok=True); os.makedirs(root,exist_ok=True)
           for name in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
               p=hf_hub_download(repo,revision=rev,filename=name,local_dir=root)
@@ -64,34 +64,33 @@ jobs:
 
       - name: Pack pinned vision and complete text checkpoint
         run: |
-          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-natural" "$RUNNER_TEMP/packed-v9"
-          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-natural" "$RUNNER_TEMP/packed-v9" --revision "$REV"
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-observable" "$RUNNER_TEMP/packed-v9"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-observable" "$RUNNER_TEMP/packed-v9" --revision "$REV"
           du -h "$RUNNER_TEMP/packed-v9"/*.bin
 
-      - name: Full C greedy generation with VI-natural prompt
+      - name: Full C greedy generation with observable-feature VI prompt
         run: |
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-vi.jpg" \
-            "Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn." \
+            "Quan sát khuôn mặt nhân vật trong hình. Hãy mô tả bằng tiếng Việt các đặc điểm nhìn thấy ở mắt, lông mày và miệng trong một câu ngắn; không suy đoán cảm xúc." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
-            --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+            --cache-mib 512 --ram-mib 4096 --max-new 28 --temperature 0 --seed 1 \
             --show-tokens \
-            2> >(tee "$RUNNER_TEMP/vi-natural-stderr.txt" >&2) \
-            | tee "$RUNNER_TEMP/vi-natural-output.txt"
-          test -s "$RUNNER_TEMP/vi-natural-output.txt"
-          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-natural-stderr.txt"
-          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-natural-stderr.txt"
-          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-natural-stderr.txt"
-          grep -q '\[kvl-vl\] token=45 ' "$RUNNER_TEMP/vi-natural-stderr.txt"
-          if grep -Eqi 'chưa (được )?cung|không (có|thấy).*ảnh|không.*hình ảnh' "$RUNNER_TEMP/vi-natural-output.txt"; then
-            echo 'VI-natural still fell into missing-image semantics' >&2
+            2> >(tee "$RUNNER_TEMP/vi-observable-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/vi-observable-output.txt"
+          test -s "$RUNNER_TEMP/vi-observable-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-observable-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-observable-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-observable-stderr.txt"
+          if grep -Eqi 'chưa (được )?cung|không (có|thấy).*ảnh|không.*hình ảnh' "$RUNNER_TEMP/vi-observable-output.txt"; then
+            echo 'observable VI prompt fell into missing-image semantics' >&2
             exit 1
           fi
 
-      - name: Print VI-natural result
+      - name: Print observable VI result
         run: |
-          echo '===== VI-NATURAL OUTPUT ====='
-          cat "$RUNNER_TEMP/vi-natural-output.txt"
+          echo '===== VI OBSERVABLE OUTPUT ====='
+          cat "$RUNNER_TEMP/vi-observable-output.txt"
           echo
           echo '===== GENERATED IDS ====='
-          grep 'generated ids:' "$RUNNER_TEMP/vi-natural-stderr.txt" || true
+          grep 'generated ids:' "$RUNNER_TEMP/vi-observable-stderr.txt" || true
