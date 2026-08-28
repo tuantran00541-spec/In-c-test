@@ -1,0 +1,99 @@
+name: V9 official BF16 vision execution oracle
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-official-bf16-vision-oracle.yml"
+      - "tools/dump_official_bf16_vision_reference.py"
+      - "src/vision.c"
+      - "src/vision_probe.c"
+      - "tools/kimi_image.py"
+      - ".github/testdata/kimi-user-vi.jpg.b64"
+
+jobs:
+  official-bf16-vision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install checkpoint-compatible CPU dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build AVX2 C vision runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_vision
+
+      - name: Restore exact Vietnamese regression image
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+
+      - name: Fetch only official vision assets
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json, os
+          repo='moonshotai/Kimi-VL-A3B-Instruct'
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):
+              hf_hub_download(repo, filename=name, local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          print('vision shards:', shards)
+          for name in shards:
+              hf_hub_download(repo, filename=name, local_dir=root)
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed"
+
+      - name: Preprocess exact image once
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'), os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'), os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          print(f'grid={gh}x{gw}')
+          assert (gh,gw)==(14,14)
+          PY
+
+      - name: Run official BF16 code and C vision
+        run: |
+          python tools/dump_official_bf16_vision_reference.py \
+            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 \
+            "$RUNNER_TEMP/official.f32" "$RUNNER_TEMP/official.u16"
+          ./build/kvl_vision \
+            "$RUNNER_TEMP/packed/vision.bin" "$RUNNER_TEMP/packed/vision.idx" \
+            "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/c.f32"
+
+      - name: Measure the actual text-boundary difference
+        run: |
+          python - <<'PY'
+          import os, numpy as np, torch
+          root=os.environ['RUNNER_TEMP']
+          official=np.fromfile(os.path.join(root,'official.f32'),dtype=np.float32)
+          official_bits=np.fromfile(os.path.join(root,'official.u16'),dtype=np.uint16)
+          c=np.fromfile(os.path.join(root,'c.f32'),dtype=np.float32)
+          assert official.shape==c.shape==(49*2048,)
+          c_bits=torch.from_numpy(c.copy()).to(torch.bfloat16).view(torch.uint16).numpy()
+          neq=np.flatnonzero(official_bits != c_bits)
+          # Compare after both sides have crossed the exact BF16 media boundary.
+          c_boundary=torch.from_numpy(c.copy()).to(torch.bfloat16).float().numpy()
+          d=c_boundary.astype(np.float64)-official.astype(np.float64)
+          print(f'official_bf16_vs_c_boundary: mismatches={neq.size}/{official.size} ({100.0*neq.size/official.size:.4f}%)')
+          print(f'boundary max_abs={float(np.max(np.abs(d))):.9g} rms={float(np.sqrt(np.mean(d*d))):.9g}')
+          if neq.size:
+              j=int(neq[0])
+              print(f'first mismatch={j} official={official[j]:.9g} c_boundary={c_boundary[j]:.9g} official_bits={int(official_bits[j])} c_bits={int(c_bits[j])}')
+          print('DIAGNOSTIC COMPLETE: values above compare the released BF16 execution against the C media boundary')
+          PY
