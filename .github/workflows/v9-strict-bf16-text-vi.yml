@@ -1,0 +1,167 @@
+name: V9 strict BF16 text semantics VI diagnostic
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-strict-bf16-text-vi.yml"
+  workflow_dispatch:
+
+jobs:
+  strict-bf16-vi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply CI-only strict BF16 text activation experiment
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p=Path('src/ops.c'); s=p.read_text()
+          anchor='''float kvl_bf16_to_f32(uint16_t x) {\n    uint32_t bits = (uint32_t)x << 16;\n    float f;\n    memcpy(&f, &bits, sizeof f);\n    return f;\n}\n'''
+          helper=anchor+'''\n/* CI-only diagnostic: emulate released BF16 activation boundaries. */\nstatic float kvl_debug_round_bf16(float x) {\n    uint32_t u; memcpy(&u,&x,sizeof u);\n    const uint32_t exp=u&UINT32_C(0x7f800000);\n    if(exp==UINT32_C(0x7f800000)){ if(u&UINT32_C(0x007fffff))u|=UINT32_C(0x00400000); u&=UINT32_C(0xffff0000); }\n    else { u+=UINT32_C(0x00007fff)+((u>>16)&1u); u&=UINT32_C(0xffff0000); }\n    memcpy(&x,&u,sizeof x); return x;\n}\n'''
+          assert anchor in s; s=s.replace(anchor,helper,1)
+          old='''#ifdef KVL_USE_AVX2\n        y[o] = dot_bf16_avx2(row, x, in);\n#else\n        y[o] = dot_bf16_ref(row, x, in);\n#endif\n'''
+          new=old+'''        y[o] = kvl_debug_round_bf16(y[o]);\n'''
+          assert old in s; s=s.replace(old,new,1)
+          assert 'y[i] = silu * up[i];' in s
+          s=s.replace('y[i] = silu * up[i];','y[i] = kvl_debug_round_bf16(silu * up[i]);',1)
+          old='''        y[i] = x[i] * inv * kvl_bf16_to_f32(weight[i]);'''
+          assert old in s; s=s.replace(old,'''        y[i] = kvl_debug_round_bf16(x[i] * inv * kvl_bf16_to_f32(weight[i]));''',1)
+          old='''        dst[i] = a * c - b * si;\n        dst[half + i] = b * c + a * si;'''
+          new='''        dst[i] = kvl_debug_round_bf16(a * c - b * si);\n        dst[half + i] = kvl_debug_round_bf16(b * c + a * si);'''
+          assert old in s; s=s.replace(old,new,1)
+          old='''                scores[j] = (float)dot * scale;'''
+          assert old in s; s=s.replace(old,'''                scores[j] = kvl_debug_round_bf16((float)dot * scale);''',1)
+          old='''            double denom = 0.0;\n            for (int j = 0; j <= t; ++j) {\n                scores[j] = expf(scores[j] - max_score);\n                denom += scores[j];\n            }\n            float *ho = head_out + (size_t)h * DV;\n            for (int d = 0; d < DV; ++d) {\n                double acc = 0.0;\n                for (int j = 0; j <= t; ++j) {\n                    const float *v = v_states + ((size_t)j * NH + h) * DV;\n                    acc += ((double)scores[j] / denom) * (double)v[d];\n                }\n                ho[d] = (float)acc;\n            }'''
+          new='''            double denom = 0.0;\n            for (int j = 0; j <= t; ++j) {\n                scores[j] = expf(scores[j] - max_score);\n                denom += scores[j];\n            }\n            for (int j = 0; j <= t; ++j)\n                scores[j] = kvl_debug_round_bf16((float)((double)scores[j] / denom));\n            float *ho = head_out + (size_t)h * DV;\n            for (int d = 0; d < DV; ++d) {\n                double acc = 0.0;\n                for (int j = 0; j <= t; ++j) {\n                    const float *v = v_states + ((size_t)j * NH + h) * DV;\n                    acc += (double)scores[j] * (double)v[d];\n                }\n                ho[d] = kvl_debug_round_bf16((float)acc);\n            }'''
+          assert old in s; s=s.replace(old,new,1)
+          p.write_text(s)
+
+          p=Path('src/generate.c'); s=p.read_text()
+          anchor='''static void expand(float *dst, const uint16_t *src, size_t n) {\n    for (size_t i = 0; i < n; ++i) dst[i] = kvl_bf16_to_f32(src[i]);\n}\n'''
+          helper=anchor+'''\nstatic float kvl_debug_text_bf16(float x) {\n    uint32_t u; memcpy(&u,&x,sizeof u);\n    const uint32_t exp=u&UINT32_C(0x7f800000);\n    if(exp==UINT32_C(0x7f800000)){ if(u&UINT32_C(0x007fffff))u|=UINT32_C(0x00400000); u&=UINT32_C(0xffff0000); }\n    else { u+=UINT32_C(0x00007fff)+((u>>16)&1u); u&=UINT32_C(0xffff0000); }\n    memcpy(&x,&u,sizeof x); return x;\n}\n'''
+          assert anchor in s; s=s.replace(anchor,helper,1)
+          reps={
+            'r1[i] = x[i] + attn[i];':'r1[i] = kvl_debug_text_bf16(x[i] + attn[i]);',
+            'x[i] = r1[i] + y[i];':'x[i] = kvl_debug_text_bf16(r1[i] + y[i]);',
+            'r1[base + i] = x[base + i] + attn[base + i];':'r1[base + i] = kvl_debug_text_bf16(x[base + i] + attn[base + i]);',
+            'x[i] = r1[i] + y[i];':'x[i] = kvl_debug_text_bf16(r1[i] + y[i]);',
+          }
+          for old,new in reps.items():
+              assert old in s, old
+              s=s.replace(old,new)
+          p.write_text(s)
+
+          p=Path('src/generate_vl.c'); s=p.read_text()
+          for old,new in [
+            ('r1[base + i] = x[base + i] + attn[base + i];','r1[base + i] = kvl_debug_text_bf16(x[base + i] + attn[base + i]);'),
+            ('x[i] = r1[i] + y[i];','x[i] = kvl_debug_text_bf16(r1[i] + y[i]);'),
+          ]:
+              assert old in s, old
+              s=s.replace(old,new)
+          p.write_text(s)
+          print('strict BF16 text activation experiment applied')
+          PY
+          git diff -- src/ops.c src/generate.c src/generate_vl.c
+
+      - name: Install checkpoint-compatible dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build strict-BF16 AVX2 diagnostic runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate_vl
+
+      - name: Restore exact VI image and frontend assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+
+      - name: Fetch official metadata and vision shard
+        run: |
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import json, os
+          repo='moonshotai/Kimi-VL-A3B-Instruct'; root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','preprocessor_config.json'):
+              hf_hub_download(repo,filename=name,local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith('vision_tower.') or k.startswith('multi_modal_projector.')})
+          for name in shards: hf_hub_download(repo,filename=name,local_dir=root)
+          PY
+
+      - name: Produce official released-BF16 media features
+        run: |
+          python - <<'PY'
+          import os,sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl'),os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'),os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          assert (gh,gw)==(14,14)
+          PY
+          python tools/dump_official_bf16_vision_reference.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/official-media.f32" "$RUNNER_TEMP/official-media.u16"
+
+      - name: Pack complete official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+
+      - name: Build exact VI prompt IDs
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,encode_image_chat
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'; enc,_,special=build_encoding(root)
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          ids=encode_image_chat(enc,prompt,49); pad=special['<|media_pad|>']
+          assert len(ids)==136 and [i for i,x in enumerate(ids) if x==pad]==list(range(15,64))
+          (Path(os.environ['RUNNER_TEMP'])/'prompt.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+          PY
+
+      - name: Generate exact VI case with strict BF16 text activations
+        run: |
+          ./build/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/official-media.f32" \
+            536870912 8 0 1 \
+            2> >(tee "$RUNNER_TEMP/stderr.txt" >&2) | tee "$RUNNER_TEMP/tokens.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/stderr.txt"
+
+      - name: Decode diagnostic output
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding,decode_generated
+          root=Path(os.environ['RUNNER_TEMP']); enc,_,_=build_encoding(root/'packed-v9')
+          ids=[int(x.split()[1]) for x in (root/'tokens.txt').read_text().splitlines() if x.startswith('TOKEN ')]
+          text=decode_generated(enc,ids,{163585,163586})
+          print('STRICT_BF16_IDS=',ids)
+          print('STRICT_BF16_TEXT=',text)
+          assert text != 'Hình ảnh vẫn chưa được cung', 'strict BF16 kept exact known-bad output'
+          PY
