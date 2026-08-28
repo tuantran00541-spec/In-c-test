@@ -1,0 +1,96 @@
+name: V9 official AutoProcessor parity
+
+on:
+  push:
+    branches:
+      - debug/v9-strict-bf16-text
+    paths:
+      - ".github/workflows/v9-official-processor-parity.yml"
+  workflow_dispatch:
+
+jobs:
+  processor-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install exact processor dependencies
+        run: |
+          python -m pip install --no-cache-dir "transformers==4.50.3" huggingface_hub numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Restore exact VI image and tokenizer assets
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+      - name: Compare official processor with repo frontend byte-for-byte
+        run: |
+          python - <<'PY'
+          import os,sys
+          from pathlib import Path
+          import numpy as np
+          import torch
+          from PIL import Image
+          from transformers import AutoProcessor
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding, encode_image_chat
+          from kimi_image import write_patches
+
+          repo='moonshotai/Kimi-VL-A3B-Instruct'
+          rev='398eede0903cd983a2bfa0cc634e9ac1d843f375'
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          image_path=os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg')
+          image=Image.open(image_path).convert('RGB')
+          processor=AutoProcessor.from_pretrained(repo,trust_remote_code=True,revision=rev)
+          messages=[{'role':'user','content':[{'type':'image','image':image_path},{'type':'text','text':prompt}]}]
+          text=processor.apply_chat_template(messages,add_generation_prompt=True,tokenize=False)
+          official=processor(images=image,text=text,return_tensors='pt',padding=True,truncation=True)
+          oid=official.input_ids[0].tolist()
+
+          root=Path(os.environ['RUNNER_TEMP'])/'packed-v9'
+          enc,_,special=build_encoding(root)
+          pad=special['<|media_pad|>']
+
+          patches=Path(os.environ['RUNNER_TEMP'])/'ours-patches.f32'
+          gh,gw=write_patches(root,image_path,patches)
+          media_tokens=(gh//2)*(gw//2)
+          cid=encode_image_chat(enc,prompt,media_tokens)
+
+          print('OFFICIAL_TEXT=',repr(text))
+          print('OURS_GRID=',gh,gw,'OURS_MEDIA_TOKENS=',media_tokens)
+          print('OFFICIAL_LEN=',len(oid),'OURS_LEN=',len(cid))
+          print('OFFICIAL_MEDIA_POS=',[i for i,x in enumerate(oid) if x==pad])
+          print('OURS_MEDIA_POS=',[i for i,x in enumerate(cid) if x==pad])
+          print('IDS_EQUAL=',oid==cid)
+          if oid!=cid:
+              n=max(len(oid),len(cid))
+              diffs=[]
+              for i in range(n):
+                  a=oid[i] if i<len(oid) else None; b=cid[i] if i<len(cid) else None
+                  if a!=b: diffs.append((i,a,b))
+              print('FIRST_ID_DIFFS=',diffs[:32])
+              print('OFFICIAL_DECODE=',repr(processor.tokenizer.decode(oid,skip_special_tokens=False)))
+              print('OURS_DECODE=',repr(enc.decode(cid)))
+
+          for k,v in official.items():
+              if torch.is_tensor(v):
+                  print('OFFICIAL_FIELD',k,'shape',tuple(v.shape),'dtype',v.dtype,
+                        'min',float(v.min()) if v.numel() else 0.0,
+                        'max',float(v.max()) if v.numel() else 0.0)
+              else:
+                  print('OFFICIAL_FIELD',k,type(v),v)
+
+          # If the processor exposes the flattened pre-ViT patch tensor, compare it to ours.
+          ours=np.fromfile(patches,dtype=np.float32)
+          print('OURS_PATCH_ELEMS=',ours.size,'min=',float(ours.min()),'max=',float(ours.max()),'rms=',float(np.sqrt(np.mean(ours.astype(np.float64)**2))))
+          pix=official.get('pixel_values',None)
+          if pix is not None:
+              op=pix.detach().cpu().float().contiguous().numpy().reshape(-1)
+              print('OFFICIAL_PIXEL_ELEMS=',op.size,'rms=',float(np.sqrt(np.mean(op.astype(np.float64)**2))))
+              if op.size==ours.size:
+                  d=np.abs(op-ours)
+                  print('PIXEL_MAXABS=',float(d.max()),'PIXEL_MEANABS=',float(d.mean()),'PIXEL_EQUAL=',bool(np.array_equal(op,ours)))
+          assert oid==cid, 'official AutoProcessor input_ids differ from repo frontend'
+          PY
