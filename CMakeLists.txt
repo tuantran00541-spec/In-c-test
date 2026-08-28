@@ -10,10 +10,6 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# MSVC's default OpenMP mode is the legacy 2.0 frontend and rejects several C11
-# canonical-loop forms used by the reference kernels. Keep the Windows correctness/direct-I/O
-# build independent from that legacy runtime. V8's Windows performance path can use the
-# dedicated AVX2 backend without silently depending on old MSVC OpenMP.
 if(NOT MSVC)
   find_package(OpenMP)
 endif()
@@ -25,6 +21,7 @@ add_library(kvl_storage
   src/ops.c
   src/mla_state.c
   src/mla_compressed_state.c
+  src/vision.c
 )
 target_include_directories(kvl_storage PUBLIC include)
 if (OpenMP_C_FOUND)
@@ -46,30 +43,23 @@ endif()
 
 add_executable(kvl_probe src/main.c)
 target_link_libraries(kvl_probe PRIVATE kvl_storage)
-
 add_executable(kvl_cache_probe src/cache_probe.c)
 target_link_libraries(kvl_cache_probe PRIVATE kvl_storage)
-
 add_executable(kvl_moe_probe src/moe_probe.c)
 target_link_libraries(kvl_moe_probe PRIVATE kvl_storage)
-
 add_executable(kvl_layer_probe src/layer_probe.c)
 target_link_libraries(kvl_layer_probe PRIVATE kvl_storage)
-
 add_executable(kvl_stack_probe src/stack_probe.c)
 target_link_libraries(kvl_stack_probe PRIVATE kvl_storage)
-
 add_executable(kvl_logits_probe src/logits_probe.c)
 target_link_libraries(kvl_logits_probe PRIVATE kvl_storage)
-
 add_executable(kvl_mla_incremental_probe src/mla_incremental_probe.c)
 target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
-
 add_executable(kvl_mla_real_probe src/mla_real_probe.c)
 target_link_libraries(kvl_mla_real_probe PRIVATE kvl_storage)
-
 add_executable(kvl_decode_probe src/decode_probe.c)
 target_link_libraries(kvl_decode_probe PRIVATE kvl_storage)
-
 add_executable(kvl_generate src/generate.c)
 target_link_libraries(kvl_generate PRIVATE kvl_storage)
+add_executable(kvl_vision src/vision_probe.c)
+target_link_libraries(kvl_vision PRIVATE kvl_storage)
