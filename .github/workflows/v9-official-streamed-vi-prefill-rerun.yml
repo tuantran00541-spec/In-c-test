@@ -1,4 +1,4 @@
-name: V9 official VI prompt-semantics sweep
+name: V9 official check C VI-natural prefix
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  official-vi-prompt-sweep:
+  official-check-c-prefix:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -74,59 +74,32 @@ jobs:
         run: |
           python tools/pack_full_text.py "$RUNNER_TEMP/kimi" "$RUNNER_TEMP/packed" --revision "$REV"
 
-      - name: Build prompt sweep and known-bad prefix
+      - name: Build VI-natural prompt and exact C prefix
         run: |
           python - <<'PY'
           import os,sys
           from pathlib import Path
           sys.path.insert(0,'tools')
           from kimi_tokenizer import build_encoding,encode_image_chat
-
           root=Path(os.environ['RUNNER_TEMP'])/'packed'
           out=Path(os.environ['RUNNER_TEMP'])
           enc,_,special=build_encoding(root)
-          prompts={
-            'baseline': 'Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.',
-            'vi-short': 'Mô tả ảnh này bằng một câu tiếng Việt.',
-            'vi-direct': 'Ảnh này có gì? Mô tả nhân vật và biểu cảm bằng một câu tiếng Việt.',
-            'vi-natural': 'Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn.',
-            'hybrid-en-task-vi-answer': 'Describe the character and facial expression in this image in one short sentence. Answer in Vietnamese.',
-            'english-control': 'Look at this image and answer only in English. Describe the character and facial expression in one short sentence.',
-          }
-          for name,prompt in prompts.items():
-              ids=encode_image_chat(enc,prompt,49)
-              assert sum(x==special['<|media_pad|>'] for x in ids)==49
-              (out/f'{name}.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
-              print(f'{name}: seq={len(ids)} prompt={prompt!r}')
-          bad=[39,150340,13271,118,96,42955,437,16032]
-          (out/'bad8.ids').write_text('\n'.join(map(str,bad))+'\n',encoding='ascii')
-          print('BAD8_TEXT=',repr(enc.decode(bad)))
+          prompt='Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn.'
+          ids=encode_image_chat(enc,prompt,49)
+          assert sum(x==special['<|media_pad|>'] for x in ids)==49
+          (out/'vi-natural.ids').write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+          c=[45,71,68053,437,80256,83,326,10615,88,74365,275,3187,72,326,68228,275,63124,124792,258,47766,133235,72,258,16032]
+          (out/'c24.ids').write_text('\n'.join(map(str,c))+'\n',encoding='ascii')
+          print('C24_TEXT=',repr(enc.decode(c)))
           PY
 
-      - name: Score known-bad attractor under each prompt
+      - name: Teacher-force exact C 24-token prefix through official decoder
         run: |
-          set -euo pipefail
-          for name in baseline vi-short vi-direct vi-natural hybrid-en-task-vi-answer english-control; do
-            echo "===== $name ====="
-            python tools/dump_official_teacher_forced_bad_prefix.py \
-              "$RUNNER_TEMP/packed" "$RUNNER_TEMP/$name.ids" "$RUNNER_TEMP/media.u16" "$RUNNER_TEMP/bad8.ids" \
-              --revision "$REV" | tee "$RUNNER_TEMP/$name.log"
-            grep -q '^FIRST_DIVERGENCE=' "$RUNNER_TEMP/$name.log"
-          done
+          python tools/dump_official_teacher_forced_bad_prefix.py \
+            "$RUNNER_TEMP/packed" "$RUNNER_TEMP/vi-natural.ids" "$RUNNER_TEMP/media.u16" "$RUNNER_TEMP/c24.ids" \
+            --revision "$REV" | tee "$RUNNER_TEMP/check.log"
+          grep -q '^FIRST_DIVERGENCE=' "$RUNNER_TEMP/check.log"
 
-      - name: Summarize escape points
+      - name: Print decisive comparison
         run: |
-          python - <<'PY'
-          import os,re
-          from pathlib import Path
-          root=Path(os.environ['RUNNER_TEMP'])
-          names=['baseline','vi-short','vi-direct','vi-natural','hybrid-en-task-vi-answer','english-control']
-          for name in names:
-              s=(root/f'{name}.log').read_text()
-              div=int(re.search(r'^FIRST_DIVERGENCE=(-?\d+)',s,re.M).group(1))
-              greedy=re.search(r'^OFFICIAL_GREEDY_IDS=(.*)$',s,re.M).group(1)
-              flags=re.search(r'^MATCH_FLAGS=(.*)$',s,re.M).group(1)
-              detail=re.search(r'^DIVERGENCE_DETAIL (.*)$',s,re.M)
-              print(f'SWEEP {name}: first_divergence={div} greedy={greedy} flags={flags}')
-              if detail: print(f'  {detail.group(1)}')
-          PY
+          grep -E '^(CANDIDATE_IDS|OFFICIAL_GREEDY_IDS|MATCH_FLAGS|FIRST_DIVERGENCE|DIVERGENCE_DETAIL)=' "$RUNNER_TEMP/check.log" || true
