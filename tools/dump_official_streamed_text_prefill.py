@@ -120,12 +120,6 @@ def layer_state_dict(tr: Trunk, ex: Experts, tc, layer: int) -> dict[str, torch.
 
 
 def repair_meta_rotary(rotary, tc, seq_len: int) -> None:
-    """A meta-created layer leaves non-persistent RoPE buffers on meta.
-
-    They are intentionally absent from state_dict, so assign=True cannot materialize them.
-    Rebuild the released class' standard inverse-frequency buffer on CPU, then let its own
-    cache builder create cos/sin exactly as a normally constructed CPU layer would.
-    """
     inv = getattr(rotary, "inv_freq", None)
     if inv is None or inv.device.type == "meta":
         dim = int(getattr(rotary, "dim", tc.qk_rope_head_dim))
@@ -149,33 +143,38 @@ def main() -> None:
     ap.add_argument("prompt_ids", type=pathlib.Path)
     ap.add_argument("media_u16", type=pathlib.Path)
     ap.add_argument("out_npz", type=pathlib.Path)
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--revision", default="main")
     ap.add_argument("--logit-chunk", type=int, default=8192)
     args = ap.parse_args()
 
     torch.set_grad_enabled(False)
     torch.set_num_threads(max(1, int(__import__('os').environ.get('OMP_NUM_THREADS', '2'))))
 
-    cfg = AutoConfig.from_pretrained(REPO, trust_remote_code=True)
+    cfg = AutoConfig.from_pretrained(args.repo, trust_remote_code=True, revision=args.revision)
     tc = cfg.text_config
     tc._attn_implementation = "eager"
-    decoder_cls = get_class_from_dynamic_module("modeling_kimi_vl.DeepseekV3DecoderLayer", REPO)
+    decoder_cls = get_class_from_dynamic_module(
+        "modeling_kimi_vl.DeepseekV3DecoderLayer", args.repo, revision=args.revision
+    )
 
     tr = Trunk(args.packed_dir); ex = Experts(args.packed_dir)
     ids = [int(x) for x in args.prompt_ids.read_text().split()]
     S = len(ids); H = int(tc.hidden_size)
-    if S != 136:
-        raise SystemExit(f"expected exact VI 136-token prompt, got {S}")
+    if S <= 0:
+        raise SystemExit("empty prompt")
     positions = [i for i,t in enumerate(ids) if t == MEDIA_PAD]
-    if positions != list(range(15,64)):
-        raise SystemExit(f"unexpected media positions: {positions}")
+    if not positions:
+        raise SystemExit("prompt has no media placeholders")
 
     embed = tr.get(GLOBAL, EMBED)
     x = embed[torch.tensor(ids, dtype=torch.long)].clone().unsqueeze(0)
     del embed
     bits = np.fromfile(args.media_u16, dtype=np.uint16)
-    if bits.size != 49 * H:
-        raise SystemExit(f"media u16 size={bits.size}, expected {49*H}")
-    media = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(49,H)
+    expected_media = len(positions) * H
+    if bits.size != expected_media:
+        raise SystemExit(f"media u16 size={bits.size}, expected {expected_media}")
+    media = torch.from_numpy(bits.copy()).view(torch.bfloat16).reshape(len(positions),H)
     x[0, torch.tensor(positions)] = media
     assert x.dtype == torch.bfloat16
 
@@ -184,7 +183,10 @@ def main() -> None:
     position_ids = torch.arange(S, dtype=torch.long).unsqueeze(0)
     last_by_layer = []
 
-    print(f"official streamed prefill: seq={S} hidden={H} media={len(positions)} dtype={x.dtype}", flush=True)
+    print(
+        f"official streamed prefill: revision={args.revision} seq={S} hidden={H} "
+        f"media={len(positions)} dtype={x.dtype}", flush=True
+    )
     for L in range(int(tc.num_hidden_layers)):
         with torch.device("meta"):
             layer_mod = decoder_cls(tc, L)
