@@ -32,6 +32,20 @@ jobs:
           python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
           python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Materialize and verify user images
+        run: |
+          base64 -d tests/assets/user-smoke/image_vi.jpg > "$RUNNER_TEMP/image_vi.jpg"
+          base64 -d tests/assets/user-smoke/image_en.jpg > "$RUNNER_TEMP/image_en.jpg"
+          python - <<'PY'
+          from PIL import Image
+          import os
+          for name in ('image_vi.jpg','image_en.jpg'):
+              p=os.path.join(os.environ['RUNNER_TEMP'], name)
+              with Image.open(p) as im:
+                  im.load()
+                  print(name, im.size, im.mode, im.format)
+          PY
+
       - name: Build V9 AVX2 runtime
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
@@ -62,7 +76,7 @@ jobs:
       - name: Vietnamese image prompt
         shell: bash
         run: |
-          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" tests/assets/user-smoke/image_vi.jpg \
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/image_vi.jpg" \
             "Hãy nhìn ảnh và mô tả nội dung chính bằng đúng một câu tiếng Việt ngắn." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
@@ -78,7 +92,7 @@ jobs:
       - name: English image prompt
         shell: bash
         run: |
-          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" tests/assets/user-smoke/image_en.jpg \
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/image_en.jpg" \
             "Look at the image and describe the main content in exactly one short English sentence." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
