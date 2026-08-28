@@ -1,0 +1,60 @@
+name: Real Kimi-VL V7 text generation
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v7-text.yml"
+      - "src/generate.c"
+      - "tools/kimi_tokenizer.py"
+      - "tools/kvl_chat.py"
+      - "tools/fetch_tokenizer.py"
+      - "tests/test_tokenizer_oracle.py"
+      - "CMakeLists.txt"
+
+jobs:
+  text-generation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h /
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install V7 dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers
+      - name: Build C runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+          ./build/kvl_mla_incremental_probe
+      - name: Fetch and verify official tokenizer
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v7"
+          python tests/test_tokenizer_oracle.py "$RUNNER_TEMP/packed-v7"
+      - name: Convert complete official text model
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v7-full" "$RUNNER_TEMP/packed-v7"
+          du -h "$RUNNER_TEMP/packed-v7"/*
+          df -h /
+      - name: Generate real text through C runtime
+        run: |
+          python tools/kvl_chat.py "$RUNNER_TEMP/packed-v7" \
+            "Reply with exactly one short word: hello" \
+            --binary ./build/kvl_generate \
+            --cache-mib 512 \
+            --max-new 6 \
+            --temperature 0 \
+            --seed 1 \
+            --show-tokens | tee "$RUNNER_TEMP/v7-output.txt"
+          test -s "$RUNNER_TEMP/v7-output.txt"
