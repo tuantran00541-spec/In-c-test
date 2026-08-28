@@ -30,7 +30,7 @@ static double max_abs(const float *a, const float *b, size_t n) {
 }
 
 int main(void) {
-    enum { S=4, H=16, NH=2, DN=4, DR=4, DV=4, R=6 };
+    enum { S=5, PREFIX=4, H=16, NH=2, DN=4, DR=4, DV=4, R=6 };
     enum { QD=DN+DR, QO=NH*QD, KVO=R+DR, KVB=NH*(DN+DV) };
 
     uint16_t *q = malloc((size_t)QO*H*sizeof(uint16_t));
@@ -42,7 +42,8 @@ int main(void) {
     float *prefill = calloc((size_t)S*H,sizeof(float));
     float *expanded = calloc((size_t)S*H,sizeof(float));
     float *compressed = calloc((size_t)S*H,sizeof(float));
-    if (!q||!kva||!kvan||!kvb||!o||!x||!prefill||!expanded||!compressed) return 2;
+    float *batch_next = calloc((size_t)H,sizeof(float));
+    if (!q||!kva||!kvan||!kvb||!o||!x||!prefill||!expanded||!compressed||!batch_next) return 2;
 
     fill_bf16(q,(size_t)QO*H,0.037f,0.0f);
     fill_bf16(kva,(size_t)KVO*H,0.041f,0.0f);
@@ -76,19 +77,35 @@ int main(void) {
     for(int t=0;t<S;++t)
         if(kvl_mla_decode_compressed_bf16(compressed+(size_t)t*H,x+(size_t)t*H,t,&cfg,&w,&cs)!=0)return 1;
     const double dc=max_abs(prefill,compressed,(size_t)S*H);
-    const double dce=max_abs(expanded+(size_t)0,compressed,(size_t)S*H); /* expanded[0] was regenerated after reset; see thresholds below */
     const size_t compressed_bytes=kvl_mla_compressed_state_bytes(&cs);
     kvl_mla_compressed_state_free(&cs);
 
-    printf("seq=%d expanded_bytes=%zu compressed_bytes=%zu ratio=%.3fx expanded_max=%.9g compressed_max=%.9g\n",
-           S,expanded_bytes,compressed_bytes,(double)expanded_bytes/(double)compressed_bytes,de,dc);
-
-    free(q);free(kva);free(kvan);free(kvb);free(o);free(x);free(prefill);free(expanded);free(compressed);
-    (void)dce;
-    if (bad_order || !reset_ok || de>1e-6 || dc>2e-6) {
-        fprintf(stderr,"V6 MLA incremental/compressed mismatch\n");
+    /* V8 regression: fill the first four compressed history entries in one batch, then
+     * decode only token five. This must equal the fifth output from full causal prefill. */
+    KvlMlaCompressedState bs;
+    if(kvl_mla_compressed_state_init(&bs,&cfg,S)!=0)return 1;
+    if(kvl_mla_compressed_state_prefill_bf16(x,PREFIX,&cfg,&w,&bs)!=0 || bs.len!=PREFIX) {
+        fprintf(stderr,"batch compressed-state prefill failed\n");
         return 1;
     }
-    puts("PASS: expanded and compressed incremental MLA match causal prefill");
+    if(kvl_mla_decode_compressed_bf16(batch_next,x+(size_t)PREFIX*H,PREFIX,&cfg,&w,&bs)!=0) {
+        fprintf(stderr,"decode after batch history fill failed\n");
+        return 1;
+    }
+    const double db=max_abs(prefill+(size_t)PREFIX*H,batch_next,H);
+    kvl_mla_compressed_state_free(&bs);
+
+    printf("seq=%d prefix=%d expanded_bytes=%zu compressed_bytes=%zu ratio=%.3fx "
+           "expanded_max=%.9g compressed_max=%.9g batch_next_max=%.9g\n",
+           S,PREFIX,expanded_bytes,compressed_bytes,
+           (double)expanded_bytes/(double)compressed_bytes,de,dc,db);
+
+    free(q);free(kva);free(kvan);free(kvb);free(o);free(x);free(prefill);
+    free(expanded);free(compressed);free(batch_next);
+    if (bad_order || !reset_ok || de>1e-6 || dc>2e-6 || db>2e-6) {
+        fprintf(stderr,"MLA incremental/compressed/batch-history mismatch\n");
+        return 1;
+    }
+    puts("PASS: expanded, compressed and batch-history MLA match causal prefill");
     return 0;
 }
