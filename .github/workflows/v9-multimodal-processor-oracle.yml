@@ -11,6 +11,7 @@ on:
       - ".github/testdata/kimi-user-vi.jpg.b64"
       - ".github/testdata/kimi-user-en.jpg.b64"
 
+# This oracle intentionally uses the exact staged user images and prompts.
 jobs:
   processor-oracle:
     runs-on: ubuntu-latest
