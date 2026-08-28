@@ -1,0 +1,157 @@
+name: V9 exact VI official-vs-C media injection A/B
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/v9-vi-media-source-ab.yml"
+
+jobs:
+  media-source-ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_vision
+          test -x ./build/kvl_generate_vl
+
+      - name: Restore exact Vietnamese image
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+
+      - name: Fetch frontend and official vision shard
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root))
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+
+      - name: Produce the exact same patches and both projected media sources
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0,'tools')
+          from kimi_image import write_patches
+          gh,gw=write_patches(os.path.join(os.environ['RUNNER_TEMP'],'packed-v9'), os.path.join(os.environ['RUNNER_TEMP'],'user-vi.jpg'), os.path.join(os.environ['RUNNER_TEMP'],'patches.f32'))
+          print(f'grid={gh}x{gw}')
+          assert (gh,gw)==(14,14)
+          PY
+          python tools/dump_vision_reference_from_patches.py \
+            "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/media-official.f32"
+          ./build/kvl_vision \
+            "$RUNNER_TEMP/packed-v9/vision.bin" "$RUNNER_TEMP/packed-v9/vision.idx" \
+            "$RUNNER_TEMP/patches.f32" 14 14 "$RUNNER_TEMP/media-c.f32"
+
+      - name: Quantify exact BF16 boundary difference
+        run: |
+          python - <<'PY'
+          import os, numpy as np, torch
+          root=os.environ['RUNNER_TEMP']
+          a=np.fromfile(os.path.join(root,'media-official.f32'),dtype=np.float32)
+          b=np.fromfile(os.path.join(root,'media-c.f32'),dtype=np.float32)
+          assert a.shape==b.shape==(49*2048,), (a.shape,b.shape)
+          d=b.astype(np.float64)-a.astype(np.float64)
+          print(f'fp32_max_abs={np.max(np.abs(d)):.9g} fp32_rms={np.sqrt(np.mean(d*d)):.9g}')
+          ab=torch.from_numpy(a.copy()).to(torch.bfloat16).view(torch.uint16)
+          bb=torch.from_numpy(b.copy()).to(torch.bfloat16).view(torch.uint16)
+          neq=(ab != bb).nonzero().flatten()
+          print(f'bf16_boundary_mismatches={neq.numel()} / {a.size}')
+          PY
+
+      - name: Pack complete official text model once
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl" "$RUNNER_TEMP/packed-v9"
+          du -h "$RUNNER_TEMP/packed-v9"/*.bin
+
+      - name: Build one exact VI prompt id stream
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding, encode_image_chat
+          root=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          prompt='Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu.'
+          enc,_,special=build_encoding(root)
+          ids=encode_image_chat(enc,prompt,49)
+          mid=special['<|media_pad|>']
+          assert len(ids)==136, len(ids)
+          assert [i for i,x in enumerate(ids) if x==mid] == list(range(15,64))
+          with open(os.path.join(os.environ['RUNNER_TEMP'],'prompt.ids'),'w',encoding='ascii') as f:
+              f.write('\n'.join(map(str,ids))+'\n')
+          print('prompt_tokens=136 media_positions=15..63')
+          PY
+
+      - name: A - C text decoder with OFFICIAL projected media
+        run: |
+          ./build/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/media-official.f32" \
+            $((512*1024*1024)) 16 0 1 \
+            2> >(tee "$RUNNER_TEMP/official-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/official-tokens.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/official-stderr.txt"
+
+      - name: B - identical C text decoder with C projected media
+        run: |
+          ./build/kvl_generate_vl \
+            "$RUNNER_TEMP/packed-v9/trunk.bin" "$RUNNER_TEMP/packed-v9/trunk.idx" \
+            "$RUNNER_TEMP/packed-v9/experts.bin" "$RUNNER_TEMP/packed-v9/experts.idx" \
+            "$RUNNER_TEMP/prompt.ids" "$RUNNER_TEMP/media-c.f32" \
+            $((512*1024*1024)) 16 0 1 \
+            2> >(tee "$RUNNER_TEMP/c-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/c-tokens.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/c-stderr.txt"
+
+      - name: Decode and compare A/B outputs
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          sys.path.insert(0,'tools')
+          from kimi_tokenizer import build_encoding, decode_generated
+          root=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          enc,_,_=build_encoding(root)
+          def read(name):
+              ids=[]
+              for line in open(os.path.join(os.environ['RUNNER_TEMP'],name),encoding='utf-8'):
+                  m=re.match(r'TOKEN\s+(\d+)',line.strip())
+                  if m: ids.append(int(m.group(1)))
+              return ids, decode_generated(enc,ids,{163585,163586})
+          ai,at=read('official-tokens.txt')
+          bi,bt=read('c-tokens.txt')
+          print('===== OFFICIAL MEDIA -> C TEXT =====')
+          print(at)
+          print('ids=',ai)
+          print('===== C MEDIA -> SAME C TEXT =====')
+          print(bt)
+          print('ids=',bi)
+          print('same_token_stream=',ai==bi)
+          PY
