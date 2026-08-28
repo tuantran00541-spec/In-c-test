@@ -1,16 +1,20 @@
-name: V9 user image-language cross diagnostic
+name: V9 VI-natural full C generation diagnostic
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - debug/v9-strict-bf16-text
     paths:
       - ".github/workflows/v9-user-cross-language-diagnostic.yml"
 
 jobs:
-  cross-language:
+  vi-natural-full-c:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
       OMP_NUM_THREADS: "2"
       OMP_DYNAMIC: "FALSE"
     steps:
@@ -38,65 +42,56 @@ jobs:
           test -x ./build/kvl_vision
           test -x ./build/kvl_generate_vl
 
-      - name: Restore exact user images
+      - name: Restore exact VI image
         run: |
           base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
-          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
 
-      - name: Fetch runtime assets
-        run: |
-          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
-
-      - name: Fetch and pack complete official checkpoint
+      - name: Fetch pinned runtime frontend assets
         run: |
           python - <<'PY'
+          import os,shutil
           from huggingface_hub import hf_hub_download
-          import os
-          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-cross')
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          dst=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-natural')
+          os.makedirs(dst,exist_ok=True); os.makedirs(root,exist_ok=True)
+          for name in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=name,local_dir=root)
+              shutil.copy2(p,os.path.join(dst,name))
           for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
-              print(hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root))
+              print(hf_hub_download(repo,revision=rev,filename=name,local_dir=root))
           PY
-          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-cross" "$RUNNER_TEMP/packed-v9"
-          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-cross" "$RUNNER_TEMP/packed-v9"
+
+      - name: Pack pinned vision and complete text checkpoint
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-natural" "$RUNNER_TEMP/packed-v9"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-natural" "$RUNNER_TEMP/packed-v9" --revision "$REV"
           du -h "$RUNNER_TEMP/packed-v9"/*.bin
 
-      - name: Image 1 with exact English prompt
+      - name: Full C greedy generation with VI-natural prompt
         run: |
-          echo '=== IMAGE1 + ENGLISH PROMPT ==='
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-vi.jpg" \
-            "Look at this image and answer only in English. Describe the character and facial expression in one short sentence." \
+            "Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
             --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
             --show-tokens \
-            2> >(tee "$RUNNER_TEMP/image1-en-stderr.txt" >&2) \
-            | tee "$RUNNER_TEMP/image1-en-output.txt"
-          test -s "$RUNNER_TEMP/image1-en-output.txt"
-          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/image1-en-stderr.txt"
-          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/image1-en-stderr.txt"
-          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/image1-en-stderr.txt"
+            2> >(tee "$RUNNER_TEMP/vi-natural-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/vi-natural-output.txt"
+          test -s "$RUNNER_TEMP/vi-natural-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-natural-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-natural-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-natural-stderr.txt"
+          grep -q '\[kvl-vl\] token=45 ' "$RUNNER_TEMP/vi-natural-stderr.txt"
+          if grep -Eqi 'chưa (được )?cung|không (có|thấy).*ảnh|không.*hình ảnh' "$RUNNER_TEMP/vi-natural-output.txt"; then
+            echo 'VI-natural still fell into missing-image semantics' >&2
+            exit 1
+          fi
 
-      - name: Image 2 with exact Vietnamese prompt
+      - name: Print VI-natural result
         run: |
-          echo '=== IMAGE2 + VIETNAMESE PROMPT ==='
-          python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-en.jpg" \
-            "Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu." \
-            --vision-binary ./build/kvl_vision \
-            --generate-binary ./build/kvl_generate_vl \
-            --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
-            --show-tokens \
-            2> >(tee "$RUNNER_TEMP/image2-vi-stderr.txt" >&2) \
-            | tee "$RUNNER_TEMP/image2-vi-output.txt"
-          test -s "$RUNNER_TEMP/image2-vi-output.txt"
-          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/image2-vi-stderr.txt"
-          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/image2-vi-stderr.txt"
-          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/image2-vi-stderr.txt"
-
-      - name: Print crossed outputs
-        run: |
-          echo '===== IMAGE1 + EN ====='
-          cat "$RUNNER_TEMP/image1-en-output.txt"
+          echo '===== VI-NATURAL OUTPUT ====='
+          cat "$RUNNER_TEMP/vi-natural-output.txt"
           echo
-          echo '===== IMAGE2 + VI ====='
-          cat "$RUNNER_TEMP/image2-vi-output.txt"
-          echo
+          echo '===== GENERATED IDS ====='
+          grep 'generated ids:' "$RUNNER_TEMP/vi-natural-stderr.txt" || true
