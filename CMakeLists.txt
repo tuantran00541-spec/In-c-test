@@ -12,6 +12,7 @@ add_library(kvl_storage
   src/trunk_store.c
   src/ops.c
   src/mla_state.c
+  src/mla_compressed_state.c
 )
 target_include_directories(kvl_storage PUBLIC include)
 if (OpenMP_C_FOUND)
