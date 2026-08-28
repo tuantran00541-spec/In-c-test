@@ -1,16 +1,9 @@
 name: Real Kimi-VL V7 text generation
 
+# V7 is an accepted historical correctness baseline. Keep the expensive ~30 GiB full-model
+# workflow manual so V8/V9 kernel and portability commits do not re-download/repack the model.
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/real-v7-text.yml"
-      - "src/generate.c"
-      - "tools/kimi_tokenizer.py"
-      - "tools/kvl_chat.py"
-      - "tools/fetch_tokenizer.py"
-      - "tests/test_tokenizer_oracle.py"
-      - "CMakeLists.txt"
 
 jobs:
   text-generation:
@@ -54,6 +47,7 @@ jobs:
             "Reply with exactly one short word: hello" \
             --binary ./build/kvl_generate \
             --cache-mib 512 \
+            --ram-mib 4096 \
             --max-new 6 \
             --temperature 0 \
             --seed 1 \
