@@ -11,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
+      REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      REPO: "moonshotai/Kimi-VL-A3B-Instruct"
       OMP_NUM_THREADS: "2"
       OMP_DYNAMIC: "FALSE"
     steps:
@@ -51,34 +53,36 @@ jobs:
               print(n, im.size, im.mode)
           PY
 
-      - name: Fetch runtime assets
-        run: |
-          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-v9"
-
-      - name: Fetch vision shard and pack MoonViT store
+      - name: Fetch pinned runtime assets and checkpoint index
         run: |
           python - <<'PY'
+          import os,shutil
           from huggingface_hub import hf_hub_download
-          import os
+          repo=os.environ['REPO']; rev=os.environ['REV']
           root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vl-v9-user')
+          packed=os.path.join(os.environ['RUNNER_TEMP'],'packed-v9')
+          os.makedirs(root,exist_ok=True); os.makedirs(packed,exist_ok=True)
+          for name in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=name,local_dir=root)
+              shutil.copy2(p,os.path.join(packed,name))
           for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
-              print(hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root))
+              print(hf_hub_download(repo,revision=rev,filename=name,local_dir=root))
           PY
-          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9"
 
-      - name: Convert complete official text model once
+      - name: Pack pinned MoonViT and complete text checkpoint once
         run: |
-          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9"
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v9-user" "$RUNNER_TEMP/packed-v9" --revision "$REV"
           du -h "$RUNNER_TEMP/packed-v9"/*.bin
 
       - name: Test image 1 with Vietnamese prompt
         run: |
           echo '=== VIETNAMESE TEST ==='
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/packed-v9" "$RUNNER_TEMP/user-vi.jpg" \
-            "Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu." \
+            "Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn." \
             --vision-binary ./build/kvl_vision \
             --generate-binary ./build/kvl_generate_vl \
-            --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+            --cache-mib 512 --ram-mib 4096 --max-new 24 --temperature 0 --seed 1 \
             --show-tokens \
             2> >(tee "$RUNNER_TEMP/vi-stderr.txt" >&2) \
             | tee "$RUNNER_TEMP/vi-output.txt"
@@ -86,6 +90,11 @@ jobs:
           grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/vi-stderr.txt"
           grep -q 'media_boundary=bf16' "$RUNNER_TEMP/vi-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/vi-stderr.txt"
+          grep -q '\[kvl-vl\] token=45 ' "$RUNNER_TEMP/vi-stderr.txt"
+          if grep -Eqi 'chưa (được )?cung|không (có|thấy).*ảnh|không.*hình ảnh' "$RUNNER_TEMP/vi-output.txt"; then
+            echo 'Vietnamese output fell into missing-image semantics' >&2
+            exit 1
+          fi
 
       - name: Test image 2 with English prompt
         run: |
@@ -102,12 +111,20 @@ jobs:
           grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/en-stderr.txt"
           grep -q 'media_boundary=bf16' "$RUNNER_TEMP/en-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/en-stderr.txt"
+          if grep -Eqi 'not (been )?provided|no image|cannot see (the )?image|image.*missing' "$RUNNER_TEMP/en-output.txt"; then
+            echo 'English output fell into missing-image semantics' >&2
+            exit 1
+          fi
 
       - name: Print final outputs
         run: |
           echo '===== VI OUTPUT ====='
           cat "$RUNNER_TEMP/vi-output.txt"
           echo
+          grep 'generated ids:' "$RUNNER_TEMP/vi-stderr.txt" || true
+          echo
           echo '===== EN OUTPUT ====='
           cat "$RUNNER_TEMP/en-output.txt"
+          echo
+          grep 'generated ids:' "$RUNNER_TEMP/en-stderr.txt" || true
           echo
