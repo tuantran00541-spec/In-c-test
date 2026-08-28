@@ -26,6 +26,21 @@ static int read_media_f32(const char *path, float **out, int count) {
     return 0;
 }
 
+/* Official Kimi-VL casts token embeddings to image_features.dtype before replacing media-pad
+ * positions. Released weights are BF16, so preserve our FP32 compute kernels but round the
+ * projector output through an IEEE BF16 value at this exact multimodal boundary. */
+static float v9_round_bf16(float x) {
+    uint32_t u;
+    memcpy(&u, &x, sizeof u);
+    const uint32_t exp = u & UINT32_C(0x7f800000);
+    if (exp != UINT32_C(0x7f800000)) {
+        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u); /* nearest, ties to even */
+    }
+    u &= UINT32_C(0xffff0000);
+    memcpy(&x, &u, sizeof x);
+    return x;
+}
+
 static int forward_input_v9(KvlTrunkStore *ts, KvlExpertCache *cache,
                             KvlMlaCompressedState *states,
                             const KvlTrunkTensor *final_norm,
@@ -122,14 +137,15 @@ int main(int argc, char **argv) {
 
     fprintf(stderr,
             "kvl_generate_vl: prompt=%d media=%d max_new=%d temperature=%.4g "
-            "state=%.2f MiB cache=%.2f MiB prefill=token-major-media\n",
+            "state=%.2f MiB cache=%.2f MiB prefill=token-major-media media_boundary=bf16\n",
             prompt_n, media_n, max_new, temperature, state_bytes / 1048576.0,
             cache_bytes / 1048576.0);
 
     int mi = 0;
     for (int position = 0; position < prompt_n; ++position) {
         if (prompt[position] == MEDIA_PAD_ID_V9) {
-            memcpy(input, media + (size_t)mi * H, (size_t)H * sizeof(float));
+            const float *src = media + (size_t)mi * H;
+            for (int i = 0; i < H; ++i) input[i] = v9_round_bf16(src[i]);
             ++mi;
         } else {
             const int token = prompt[position];
