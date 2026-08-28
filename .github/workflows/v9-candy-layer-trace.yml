@@ -42,19 +42,18 @@ jobs:
           p=Path('src/generate_vl.c')
           s=p.read_text()
           old='        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];\n'
-          new='''        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];
-        {
-            const char *trace_path = getenv("KVL_TRACE_LAYER_LAST");
-            if (trace_path && *trace_path) {
-                FILE *tf = fopen(trace_path, layer == 0 ? "wb" : "ab");
-                if (!tf) goto done;
-                const float *last = x + (size_t)(seq_len - 1) * H;
-                const size_t wrote = fwrite(last, sizeof(float), H, tf);
-                fclose(tf);
-                if (wrote != H) goto done;
-            }
-        }
-'''
+          new=(old +
+               '        {\n'
+               '            const char *trace_path = getenv("KVL_TRACE_LAYER_LAST");\n'
+               '            if (trace_path && *trace_path) {\n'
+               '                FILE *tf = fopen(trace_path, layer == 0 ? "wb" : "ab");\n'
+               '                if (!tf) goto done;\n'
+               '                const float *last = x + (size_t)(seq_len - 1) * H;\n'
+               '                const size_t wrote = fwrite(last, sizeof(float), H, tf);\n'
+               '                fclose(tf);\n'
+               '                if (wrote != H) goto done;\n'
+               '            }\n'
+               '        }\n')
           assert s.count(old)==1, s.count(old)
           p.write_text(s.replace(old,new))
           PY
@@ -70,42 +69,49 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           p=Path('src/ops.c'); s=p.read_text()
-          marker='''float kvl_bf16_to_f32(uint16_t x) {
-    uint32_t bits = (uint32_t)x << 16;
-    float f;
-    memcpy(&f, &bits, sizeof f);
-    return f;
-}
-'''
-          helper=marker+'''\nstatic float kvl_strict_bf16(float x) {
-    uint32_t u;
-    memcpy(&u, &x, sizeof u);
-    const uint32_t exp = u & UINT32_C(0x7f800000);
-    if (exp != UINT32_C(0x7f800000))
-        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u);
-    u &= UINT32_C(0xffff0000);
-    memcpy(&x, &u, sizeof x);
-    return x;
-}
-'''
+          marker=('float kvl_bf16_to_f32(uint16_t x) {\n'
+                  '    uint32_t bits = (uint32_t)x << 16;\n'
+                  '    float f;\n'
+                  '    memcpy(&f, &bits, sizeof f);\n'
+                  '    return f;\n'
+                  '}\n')
+          helper=(marker + '\n'
+                  'static float kvl_strict_bf16(float x) {\n'
+                  '    uint32_t u;\n'
+                  '    memcpy(&u, &x, sizeof u);\n'
+                  '    const uint32_t exp = u & UINT32_C(0x7f800000);\n'
+                  '    if (exp != UINT32_C(0x7f800000))\n'
+                  '        u += UINT32_C(0x00007fff) + ((u >> 16) & 1u);\n'
+                  '    u &= UINT32_C(0xffff0000);\n'
+                  '    memcpy(&x, &u, sizeof x);\n'
+                  '    return x;\n'
+                  '}\n')
           assert s.count(marker)==1
           s=s.replace(marker,helper)
-          s=s.replace('y[o] = dot_bf16_avx2(row, x, in);','y[o] = kvl_strict_bf16(dot_bf16_avx2(row, x, in));')
-          s=s.replace('y[o] = dot_bf16_ref(row, x, in);','y[o] = kvl_strict_bf16(dot_bf16_ref(row, x, in));')
-          s=s.replace('y[i] = silu * up[i];','y[i] = kvl_strict_bf16(silu * up[i]);')
-          s=s.replace('y[i] = x[i] * inv * kvl_bf16_to_f32(weight[i]);','y[i] = kvl_strict_bf16(x[i] * inv * kvl_bf16_to_f32(weight[i]));')
-          s=s.replace('dst[i] = a * c - b * si;','dst[i] = kvl_strict_bf16(a * c - b * si);')
-          s=s.replace('dst[half + i] = b * c + a * si;','dst[half + i] = kvl_strict_bf16(b * c + a * si);')
-          s=s.replace('scores[j] = (float)dot * scale;','scores[j] = kvl_strict_bf16((float)dot * scale);')
-          s=s.replace('acc += ((double)scores[j] / denom) * (double)v[d];','acc += (double)kvl_strict_bf16((float)((double)scores[j] / denom)) * (double)v[d];')
-          s=s.replace('ho[d] = (float)acc;','ho[d] = kvl_strict_bf16((float)acc);')
-          # Official decoder layer returns BF16, including routed/shared MoE aggregation.
-          s=s.replace('        for (int i = 0; i < H; ++i) out[i] += tmp[i];','        for (int i = 0; i < H; ++i) out[i] = kvl_strict_bf16(out[i] + tmp[i]);')
+          replacements={
+            'y[o] = dot_bf16_avx2(row, x, in);':'y[o] = kvl_strict_bf16(dot_bf16_avx2(row, x, in));',
+            'y[o] = dot_bf16_ref(row, x, in);':'y[o] = kvl_strict_bf16(dot_bf16_ref(row, x, in));',
+            'y[i] = silu * up[i];':'y[i] = kvl_strict_bf16(silu * up[i]);',
+            'y[i] = x[i] * inv * kvl_bf16_to_f32(weight[i]);':'y[i] = kvl_strict_bf16(x[i] * inv * kvl_bf16_to_f32(weight[i]));',
+            'dst[i] = a * c - b * si;':'dst[i] = kvl_strict_bf16(a * c - b * si);',
+            'dst[half + i] = b * c + a * si;':'dst[half + i] = kvl_strict_bf16(b * c + a * si);',
+            'scores[j] = (float)dot * scale;':'scores[j] = kvl_strict_bf16((float)dot * scale);',
+            'acc += ((double)scores[j] / denom) * (double)v[d];':'acc += (double)kvl_strict_bf16((float)((double)scores[j] / denom)) * (double)v[d];',
+            'ho[d] = (float)acc;':'ho[d] = kvl_strict_bf16((float)acc);',
+            '        for (int i = 0; i < H; ++i) out[i] += tmp[i];':'        for (int i = 0; i < H; ++i) out[i] = kvl_strict_bf16(out[i] + tmp[i]);'
+          }
+          for a,b in replacements.items():
+              assert a in s, a
+              s=s.replace(a,b)
           p.write_text(s)
 
           p=Path('src/generate_vl.c'); s=p.read_text()
-          s=s.replace('r1[base + i] = x[base + i] + attn[base + i];','r1[base + i] = v9_round_bf16(x[base + i] + v9_round_bf16(attn[base + i]));')
-          s=s.replace('for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];','for (size_t i = 0; i < elems; ++i) x[i] = v9_round_bf16(r1[i] + v9_round_bf16(y[i]));')
+          a='r1[base + i] = x[base + i] + attn[base + i];'
+          b='r1[base + i] = v9_round_bf16(x[base + i] + v9_round_bf16(attn[base + i]));'
+          assert a in s; s=s.replace(a,b)
+          a='for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];'
+          b='for (size_t i = 0; i < elems; ++i) x[i] = v9_round_bf16(r1[i] + v9_round_bf16(y[i]));'
+          assert a in s; s=s.replace(a,b)
           p.write_text(s)
           PY
           cmake -S . -B build-strict -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
