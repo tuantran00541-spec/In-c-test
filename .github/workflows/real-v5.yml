@@ -1,0 +1,72 @@
+name: Real Kimi-VL V5 full text logits
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/real-v5.yml"
+
+jobs:
+  full-text-logits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build C runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 2
+
+      - name: Existing numerical regressions
+        run: |
+          python tests/test_moe_oracle.py --build-dir build
+          python tests/test_layer_oracle.py --build-dir build
+          python tests/test_stack_oracle.py --build-dir build
+
+      - name: Convert all 27 text layers with bounded source-shard working set
+        run: |
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-vl-v5" "$RUNNER_TEMP/packed-v5"
+          echo "--- packed sizes ---"
+          du -h "$RUNNER_TEMP/packed-v5"/*
+          echo "--- source directory after converter cleanup ---"
+          du -h "$RUNNER_TEMP/kimi-vl-v5" || true
+          df -h /
+
+      - name: Generate one-token 27-layer packed Torch oracle and full vocabulary logits
+        run: |
+          python tools/dump_packed_logits_reference.py \
+            "$RUNNER_TEMP/kimi-vl-v5" \
+            "$RUNNER_TEMP/packed-v5" \
+            "$RUNNER_TEMP/packed-v5/v5.fixture" \
+            --token-id 1
+
+      - name: Compare C 27-layer forward and 163840-way logits under 512 MiB expert cache
+        run: |
+          ./build/kvl_logits_probe \
+            "$RUNNER_TEMP/packed-v5/trunk.bin" \
+            "$RUNNER_TEMP/packed-v5/trunk.idx" \
+            "$RUNNER_TEMP/packed-v5/experts.bin" \
+            "$RUNNER_TEMP/packed-v5/experts.idx" \
+            "$RUNNER_TEMP/packed-v5/v5.fixture" \
+            536870912
