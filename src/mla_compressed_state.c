@@ -44,6 +44,40 @@ size_t kvl_mla_compressed_state_bytes(const KvlMlaCompressedState *state){
     return sizeof(*state)+(size_t)state->capacity*((size_t)state->kv_lora_rank+(size_t)state->qk_rope_dim)*sizeof(float);
 }
 
+int kvl_mla_compressed_state_prefill_bf16(const float *x,
+                                          int seq_len,
+                                          const KvlMlaConfig *cfg,
+                                          const KvlMlaBF16 *w,
+                                          KvlMlaCompressedState *state) {
+    if (!x || !cfg || !w || !state || !w->kv_a_proj || !w->kv_a_norm ||
+        seq_len <= 0 || state->len != 0 || seq_len > state->capacity ||
+        state->kv_lora_rank != cfg->kv_lora_rank ||
+        state->qk_rope_dim != cfg->qk_rope_dim)
+        return -1;
+
+    const int H = cfg->hidden_size;
+    const int R = cfg->kv_lora_rank;
+    const int DR = cfg->qk_rope_dim;
+    const int KVO = R + DR;
+    if (H <= 0 || R <= 0 || DR <= 0 || (DR & 1) || cfg->rope_theta <= 0.0f)
+        return -1;
+
+    float *katmp = (float *)malloc((size_t)KVO * sizeof(float));
+    if (!katmp) return -1;
+
+    for (int t = 0; t < seq_len; ++t) {
+        const float *xt = x + (size_t)t * H;
+        float *latent = state->latent + (size_t)t * R;
+        float *rope = state->rope + (size_t)t * DR;
+        kvl_matvec_bf16(katmp, xt, w->kv_a_proj, H, KVO);
+        kvl_rmsnorm_bf16(latent, katmp, w->kv_a_norm, R, cfg->rms_eps);
+        rope_interleaved_v6c(rope, katmp + R, DR, t, cfg->rope_theta);
+    }
+    state->len = seq_len;
+    free(katmp);
+    return 0;
+}
+
 int kvl_mla_decode_compressed_bf16(float *out,
                                    const float *x,
                                    int position,
