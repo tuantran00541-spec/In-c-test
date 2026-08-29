@@ -43,6 +43,10 @@ typedef struct {
 float kvl_bf16_to_f32(uint16_t x);
 void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
                      int in, int out);
+/* Experimental expert-only format: each matrix blob is [out FP32 row scales]
+ * followed by row-major signed int8 weights [out,in]. */
+void kvl_matvec_q8_rowwise(float *y, const float *x, const void *blob,
+                           int in, int out);
 void kvl_silu_mul(float *y, const float *gate, const float *up, int n);
 void kvl_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
                       int n, float eps);
@@ -52,17 +56,25 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
 int kvl_mlp_bf16(float *y, const float *x, const KvlMlpBF16 *mlp,
                  int hidden_size, float *scratch);
 
-/* Kimi/DeepSeek noaux_tc router. Router weights are row-major [n_experts, hidden].
- * Selection uses sigmoid(logit) + correction_bias. Mixing weights use the unbiased
- * sigmoid scores, optionally normalized, then multiplied by routed_scaling_factor. */
 int kvl_router_noaux_tc(const KvlRouterConfig *cfg, const float *x,
                         const float *router_weight, const float *correction_bias,
                         int *top_ids, float *top_weights);
 
-/* One-token routed+shared MoE forward. Routed expert bytes come from the V1 cache.
- * Shared expert weights stay resident and may be NULL. `scratch` must hold at least
- * 3*max(expert_intermediate_size, shared_intermediate_size) + hidden_size floats. */
 int kvl_moe_token_bf16(KvlExpertCache *cache, int layer,
+                       const KvlRouterConfig *router_cfg,
+                       const float *x,
+                       const float *router_weight,
+                       const float *correction_bias,
+                       int expert_intermediate_size,
+                       const KvlMlpBF16 *shared,
+                       float *out,
+                       int *top_ids,
+                       float *top_weights,
+                       float *scratch);
+
+/* Lab dispatch: BF16 stores delegate to the production function above byte-for-byte;
+ * KVL_DTYPE_Q8_ROW stores use row-wise Q8 only for routed expert gate/up/down matrices. */
+int kvl_moe_token_auto(KvlExpertCache *cache, int layer,
                        const KvlRouterConfig *router_cfg,
                        const float *x,
                        const float *router_weight,

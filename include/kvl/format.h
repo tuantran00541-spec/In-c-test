@@ -8,6 +8,7 @@
 #define KVL_EXPERT_ALIGN 4096u
 #define KVL_DTYPE_BF16 1u
 #define KVL_DTYPE_MXFP4 2u
+#define KVL_DTYPE_Q8_ROW 3u
 
 #pragma pack(push, 1)
 typedef struct {
