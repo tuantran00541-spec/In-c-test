@@ -1,0 +1,58 @@
+name: V9 lab real-weight Q8 expert oracle
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - "tools/pack_experts_q8.py"
+      - "tests/test_real_q8_expert.py"
+      - ".github/workflows/v9-lab-real-q8-expert.yml"
+
+jobs:
+  real-q8-expert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build AVX2 lab runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x build/kvl_q8_probe
+      - name: Fetch pinned model metadata and layer-1 shard
+        run: |
+          python - <<'PY'
+          import json, os
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']; root=os.path.join(os.environ['RUNNER_TEMP'],'model')
+          for n in ('config.json','model.safetensors.index.json'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
+          prefix='language_model.model.layers.1.mlp.experts.'
+          shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith(prefix)})
+          print('L1_EXPERT_SHARDS=',shards)
+          assert len(shards)==1,shards
+          hf_hub_download(repo,revision=rev,filename=shards[0],local_dir=root)
+          PY
+      - name: Pack released layer-1 Q8 experts
+        run: |
+          mkdir -p "$RUNNER_TEMP/q8"
+          python tools/pack_experts_q8.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8" --layer 1
+          du -h "$RUNNER_TEMP/q8"/experts.bin
+      - name: Compare released expert 0 to Q8 C kernel
+        run: |
+          python tests/test_real_q8_expert.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8" --build-dir build --layer 1 --expert 0
