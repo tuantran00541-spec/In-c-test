@@ -33,6 +33,7 @@ add_library(kvl_storage
   src/q8_ops.c
   src/mla_state.c
   src/mla_compressed_state.c
+  src/mla_compressed_q8_state.c
   src/vision.c
 )
 target_include_directories(kvl_storage PUBLIC include)
@@ -76,6 +77,8 @@ add_executable(kvl_mla_prefill_bench src/mla_prefill_bench.c)
 target_link_libraries(kvl_mla_prefill_bench PRIVATE kvl_storage)
 add_executable(kvl_decode_probe src/decode_probe.c)
 target_link_libraries(kvl_decode_probe PRIVATE kvl_storage)
+add_executable(kvl_spec_q8_lab_probe src/spec_q8_lab_probe.c)
+target_link_libraries(kvl_spec_q8_lab_probe PRIVATE kvl_storage)
 add_executable(kvl_generate src/generate.c)
 target_link_libraries(kvl_generate PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
