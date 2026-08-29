@@ -1,0 +1,88 @@
+name: V9 Vietnamese two-turn chat benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-two-turn-vi-chat
+    paths:
+      - ".github/workflows/v9-two-turn-vi-chat.yml"
+      - "tools/kvl_vl_two_turn.py"
+
+jobs:
+  two-turn-vi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build candidate AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          ./build/kvl_mla_streaming_probe
+          test -x build/kvl_generate_vl
+          test -x build/kvl_vision
+      - name: Restore Vietnamese acceptance image
+        run: |
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
+      - name: Fetch pinned frontend and initial vision shard
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          root=os.path.join(os.environ['RUNNER_TEMP'],'model')
+          out=os.path.join(os.environ['RUNNER_TEMP'],'q8-runtime')
+          os.makedirs(root,exist_ok=True); os.makedirs(out,exist_ok=True)
+          for n in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+              shutil.copy2(p,os.path.join(out,n))
+          PY
+      - name: Pack pinned BF16 vision plus Q8 routed text
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
+          python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          p=Path(os.environ['RUNNER_TEMP'])/'q8-runtime'/'experts.bin'
+          print('Q8_EXPERT_GIB=',p.stat().st_size/1024**3)
+          PY
+      - name: Run Vietnamese two-turn chat
+        run: |
+          python tools/kvl_vl_two_turn.py \
+            "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-vi.jpg" \
+            "Hãy nhìn kỹ bức ảnh này. Nhân vật trong ảnh đang có biểu cảm gì? Trả lời bằng tiếng Việt trong một câu ngắn." \
+            "Dựa trên câu trả lời vừa rồi, hãy đoán nhân vật có thể đang cảm thấy gì và giải thích ngắn gọn trong một câu." \
+            --system "Bạn là một trợ lý hữu ích. Luôn trả lời bằng tiếng Việt." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 \
+            --max-new-turn1 32 --max-new-turn2 32 \
+            --temperature 0 --seed 1 --show-tokens \
+            2>&1 | tee "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^TURN1_ANSWER=' "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^TURN2_ANSWER=' "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^TURN1_TIMING ' "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^TURN2_TIMING ' "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^CHAT_TIMING ' "$RUNNER_TEMP/two-turn-vi.log"
+          grep -q '^CHAT_MODE=turn2_full_history_reprefill vision_reused=yes persistent_state=no' "$RUNNER_TEMP/two-turn-vi.log"
