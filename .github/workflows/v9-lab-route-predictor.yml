@@ -1,0 +1,107 @@
+name: V9 lab next-layer router predictor
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - ".github/workflows/v9-lab-route-predictor.yml"
+
+jobs:
+  route-predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Patch diagnostic and build Q8 runtime
+        run: |
+          python tools/patch_route_predict_diag.py
+          grep -q 'kvl_route_pred:' src/generate.c
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          python tests/test_q8_matvec.py --build-dir build
+      - name: Restore exact English V9 image
+        run: base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+      - name: Fetch pinned frontend and initial vision shard
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          root=os.path.join(os.environ['RUNNER_TEMP'],'model')
+          out=os.path.join(os.environ['RUNNER_TEMP'],'q8-runtime')
+          os.makedirs(root,exist_ok=True); os.makedirs(out,exist_ok=True)
+          for n in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+              shutil.copy2(p,os.path.join(out,n))
+          PY
+      - name: Pack full Q8 model
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
+          python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
+      - name: Generate exact EN case and trace predictions
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" \
+            "Look at this image and answer only in English. Describe the character and facial expression in one short sentence." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 1536 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+            --show-tokens \
+            2> >(tee "$RUNNER_TEMP/predict.stderr" >&2) \
+            | tee "$RUNNER_TEMP/predict.out"
+          grep -q 'kvl_route_pred:' "$RUNNER_TEMP/predict.stderr"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/predict.stderr"
+      - name: Score next-layer predictor variants and assert output parity
+        run: |
+          python - <<'PY'
+          import os,re
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          err=(root/'predict.stderr').read_text(errors='replace')
+          out=(root/'predict.out').read_text(errors='replace').strip()
+          expected=[1008,6162,924,4393,11,98717,11002,316,261,21478,528,54275,37632,11276,13,163586]
+          m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m
+          ids=[int(x) for x in m.group(1).split()]
+          assert ids==expected, ids
+          assert out=='The character has large, expressive eyes and a surprised or shocked facial expression.'
+          rows=re.findall(r'kvl_route_pred: position=(\d+) layer=(\d+) n2_hit=(\d+) r1_hit=(\d+) x_hit=(\d+)',err)
+          assert len(rows)>=300, len(rows)
+          sums={'n2':0,'r1':0,'x':0}
+          exact={'n2':0,'r1':0,'x':0}
+          for _,_,a,b,c in rows:
+              vals={'n2':int(a),'r1':int(b),'x':int(c)}
+              for k,v in vals.items():
+                  sums[k]+=v
+                  exact[k]+=v==6
+          denom=6*len(rows)
+          print('ROUTE_PRED_SAMPLES=',len(rows))
+          for k in ('n2','r1','x'):
+              print(f'ROUTE_PRED_{k.upper()}_TOP6_RECALL={sums[k]/denom:.6f}')
+              print(f'ROUTE_PRED_{k.upper()}_EXACT_SET_RATE={exact[k]/len(rows):.6f}')
+          best=max(sums,key=sums.get)
+          print('ROUTE_PRED_BEST=',best)
+          print(f'ROUTE_PRED_BEST_RECALL={sums[best]/denom:.6f}')
+          for pat in (r'kvl_cache:.*',r'\[kvl-vl\] timing.*'):
+              mm=re.search(pat,err)
+              if mm: print(mm.group(0))
+          PY
