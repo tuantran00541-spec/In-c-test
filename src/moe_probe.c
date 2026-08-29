@@ -65,13 +65,19 @@ int main(int argc, char **argv) {
         if(found<0){id_ok=0;continue;}
         double d=fabs((double)weights[found]-exp_w[i]); if(d>max_w)max_w=d;
     }
-    double max_out=0.0, rms=0.0;
-    for(int i=0;i<H;i++){double d=(double)out[i]-exp_out[i]; double a=fabs(d);if(a>max_out)max_out=a;rms+=d*d;}
-    rms=sqrt(rms/H);
-    printf("router_ids=%s max_weight_abs=%.8g moe_max_abs=%.8g moe_rms=%.8g direct_io=%s\n",
-           id_ok?"OK":"BAD",max_w,max_out,rms,st.direct_io?"yes":"no");
+    double max_out=0.0, rms=0.0, signal=0.0;
+    for(int i=0;i<H;i++){
+        double d=(double)out[i]-exp_out[i]; double a=fabs(d);
+        if(a>max_out)max_out=a; rms+=d*d; signal+=(double)exp_out[i]*exp_out[i];
+    }
+    rms=sqrt(rms/H); signal=sqrt(signal/H);
+    const double rel_rms=rms/(signal+1e-30);
+    printf("router_ids=%s max_weight_abs=%.8g moe_max_abs=%.8g moe_rms=%.8g moe_rel_rms=%.8g dtype=%u direct_io=%s\n",
+           id_ok?"OK":"BAD",max_w,max_out,rms,rel_rms,st.hdr.dtype,st.direct_io?"yes":"no");
     kvl_expert_cache_report(&cache);
-    const int ok=id_ok && max_w<2e-5 && max_out<3e-4;
+    const int ok = st.hdr.dtype == KVL_DTYPE_Q8_ROW
+        ? (id_ok && max_w<2e-5 && rel_rms<0.05)
+        : (id_ok && max_w<2e-5 && max_out<3e-4);
 
     free(x);free(rw);free(bias);free(sg);free(su);free(sd);free(exp_ids);free(exp_w);free(exp_out);
     free(ids);free(weights);free(out);free(scratch);

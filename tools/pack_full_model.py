@@ -5,6 +5,10 @@ Expected input is the normal Hugging Face snapshot with config.json,
 model.safetensors.index.json and all seven shard files. The output intentionally contains
 runtime-packed weights and small frontend assets only; neither source nor packed weights are
 meant to be committed to git.
+
+Routed experts default to the release BF16 format. Pass ``--expert-format q8`` to use the
+validated symmetric per-row int8 routed-expert format while keeping trunk, routers, shared
+experts and vision weights BF16.
 """
 from __future__ import annotations
 
@@ -24,6 +28,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Pack the complete Kimi-VL V9 low-RAM runtime")
     ap.add_argument("model_dir")
     ap.add_argument("out_dir")
+    ap.add_argument("--expert-format", choices=("bf16", "q8"), default="bf16",
+                    help="routed expert storage format; default: bf16")
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -43,7 +49,8 @@ def main() -> int:
     layers = ",".join(str(i) for i in range(27))
     run(py, str(tools / "pack_trunk.py"), str(src), str(out),
         "--layers", layers, "--include-globals")
-    run(py, str(tools / "pack_experts.py"), str(src), str(out))
+    expert_packer = tools / ("pack_experts_q8.py" if args.expert_format == "q8" else "pack_experts.py")
+    run(py, str(expert_packer), str(src), str(out))
     run(py, str(tools / "pack_vision.py"), str(src), str(out))
     run(py, str(tools / "fetch_tokenizer.py"), str(out))
 
@@ -62,6 +69,7 @@ def main() -> int:
 
     total = sum((out / n).stat().st_size for n in expected if n.endswith((".bin", ".idx")))
     print(f"PASS: complete V9 runtime at {out}")
+    print(f"routed expert format={args.expert_format}")
     print(f"packed binary/index bytes={total} ({total/1024**3:.3f} GiB)")
     return 0
 

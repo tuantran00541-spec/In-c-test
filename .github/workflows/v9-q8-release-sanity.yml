@@ -1,0 +1,59 @@
+name: V9 Q8 release sanity
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - release/v9-q8-experts
+    paths:
+      - "CMakeLists.txt"
+      - "include/kvl/format.h"
+      - "include/kvl/ops.h"
+      - "src/q8_ops.c"
+      - "src/q8_probe.c"
+      - "src/moe_probe.c"
+      - "tools/pack_experts_q8.py"
+      - "tools/pack_full_text.py"
+      - "tools/pack_full_model.py"
+      - "tests/test_q8_matvec.py"
+      - ".github/workflows/v9-q8-release-sanity.yml"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --no-cache-dir numpy
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+      - name: Q8 kernel and packer sanity
+        run: |
+          python tests/test_q8_matvec.py --build-dir build
+          python -m py_compile tools/pack_experts_q8.py tools/pack_full_text.py tools/pack_full_model.py
+          python tools/pack_full_model.py --help | grep -q -- '--expert-format'
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --no-cache-dir numpy
+      - name: Build AVX2 runtime with MSVC
+        run: |
+          cmake -S . -B build -DKVL_USE_AVX2=ON
+          cmake --build build --config Release --parallel 2
+      - name: Q8 kernel and packer sanity
+        shell: pwsh
+        run: |
+          python tests/test_q8_matvec.py --build-dir build
+          python -m py_compile tools/pack_experts_q8.py tools/pack_full_text.py tools/pack_full_model.py
+          $helpText = (python tools/pack_full_model.py --help) -join "`n"
+          if ($helpText -notmatch '--expert-format') { throw 'missing --expert-format' }
