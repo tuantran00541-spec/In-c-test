@@ -43,6 +43,10 @@ typedef struct {
 float kvl_bf16_to_f32(uint16_t x);
 void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
                      int in, int out);
+/* Experimental expert-only format: each matrix blob is [out FP32 row scales]
+ * followed by row-major signed int8 weights [out,in]. */
+void kvl_matvec_q8_rowwise(float *y, const float *x, const void *blob,
+                           int in, int out);
 void kvl_silu_mul(float *y, const float *gate, const float *up, int n);
 void kvl_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
                       int n, float eps);
@@ -59,8 +63,8 @@ int kvl_router_noaux_tc(const KvlRouterConfig *cfg, const float *x,
                         const float *router_weight, const float *correction_bias,
                         int *top_ids, float *top_weights);
 
-/* One-token routed+shared MoE forward. Routed expert bytes come from the V1 cache.
- * Shared expert weights stay resident and may be NULL. `scratch` must hold at least
+/* One-token routed+shared MoE forward. Routed experts may be BF16 or the experimental
+ * row-wise Q8 store; router/shared expert weights remain BF16. `scratch` must hold at least
  * 3*max(expert_intermediate_size, shared_intermediate_size) + hidden_size floats. */
 int kvl_moe_token_bf16(KvlExpertCache *cache, int layer,
                        const KvlRouterConfig *router_cfg,
