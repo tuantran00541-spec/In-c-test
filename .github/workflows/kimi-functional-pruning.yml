@@ -8,6 +8,8 @@ on:
       - "src/q8_ops.c"
       - "tools/analyze_kimi_moe_trace.py"
       - "tests/test_kimi_functional_pruning.py"
+      - "tests/test_kimi_functional_suite.py"
+      - "tests/data/kimi-functional-pruning-suite.json"
       - ".github/workflows/kimi-functional-pruning.yml"
   workflow_dispatch:
 
@@ -27,5 +29,8 @@ jobs:
         run: |
           python -m py_compile tools/analyze_kimi_moe_trace.py
           python -m py_compile tests/test_kimi_functional_pruning.py
+          python -m py_compile tests/test_kimi_functional_suite.py
       - name: Synthetic functional-pruning analysis
         run: python tests/test_kimi_functional_pruning.py
+      - name: Functional suite validation
+        run: python tests/test_kimi_functional_suite.py

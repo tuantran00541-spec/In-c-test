@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "notes": "Calibration and held-out prompts are intentionally disjoint. Calibration is for route/saliency coverage only; held-out is for full-vs-pruned evaluation.",
+  "calibration": [
+    {"id": "cal-en-science-01", "category": "english_science", "max_new": 1, "prompt": "Explain in one short sentence why leaves are usually green."},
+    {"id": "cal-arithmetic-01", "category": "arithmetic", "max_new": 1, "prompt": "What is 24 multiplied by 13? Reply with only the integer."},
+    {"id": "cal-en-vi-01", "category": "translation_en_vi", "max_new": 1, "prompt": "Translate 'A small cat is sleeping.' into Vietnamese. Reply with only the translation."},
+    {"id": "cal-vi-science-01", "category": "vietnamese_science", "max_new": 1, "prompt": "Trả lời bằng một câu ngắn: Vì sao nước đóng băng khi đủ lạnh?"},
+    {"id": "cal-c-01", "category": "c_programming", "max_new": 1, "prompt": "In C, what keyword exits a loop immediately? Reply with only the keyword."},
+    {"id": "cal-vi-en-01", "category": "translation_vi_en", "max_new": 1, "prompt": "Translate 'Chiếc xe đang đỗ trước cửa nhà.' into English. Reply with only the translation."},
+    {"id": "cal-python-01", "category": "python_programming", "max_new": 1, "prompt": "In Python, write the single expression that returns the length of list xs."},
+    {"id": "cal-logic-01", "category": "logic", "max_new": 1, "prompt": "All roses are flowers. Some flowers fade quickly. Does it follow that some roses fade quickly? Answer yes or no and give one short reason."},
+    {"id": "cal-fact-01", "category": "factual_knowledge", "max_new": 1, "prompt": "Name the largest ocean on Earth and the continent immediately east of most of it."},
+    {"id": "cal-json-01", "category": "instruction_following", "max_new": 1, "prompt": "Return a compact JSON object with keys animal and count for this fact: there are three dogs. Do not add markdown."},
+    {"id": "cal-comparison-01", "category": "comparison", "max_new": 1, "prompt": "Which is heavier: 2 kilograms of iron or 1500 grams of rice? Answer with the heavier item and the difference in grams."},
+    {"id": "cal-summary-01", "category": "summarization", "max_new": 1, "prompt": "Summarize in one sentence: Solar panels convert sunlight into electricity, produce no exhaust while operating, and their output varies with available light."},
+    {"id": "cal-units-01", "category": "unit_reasoning", "max_new": 1, "prompt": "A train travels 120 km in 2 hours at constant speed. How far does it travel in 30 minutes? Reply with the number and unit."},
+    {"id": "cal-debug-01", "category": "code_debugging", "max_new": 1, "prompt": "This C loop should print 0 1 2 but never stops: for (int i=0; i<3; ) printf(\"%d \", i); State the missing operation only."},
+    {"id": "cal-vi-colloquial-01", "category": "vietnamese_colloquial", "max_new": 1, "prompt": "Nói tự nhiên bằng tiếng Việt trong một câu: vì sao điện thoại nóng lên khi vừa sạc vừa chơi game nặng?"},
+    {"id": "cal-context-01", "category": "reading_comprehension", "max_new": 1, "prompt": "Read this note: Minh left home at 7:10, rode the bus for 35 minutes, then walked 10 minutes to class. Class starts at 8:00. Did Minh arrive before class, and by how many minutes?"}
+  ],
+  "heldout": [
+    {"id": "eval-arithmetic-01", "category": "arithmetic", "max_new": 8, "prompt": "What is 46 multiplied by 17? Reply with only the integer.", "sanity_contains": ["782"]},
+    {"id": "eval-fact-01", "category": "factual_knowledge", "max_new": 8, "prompt": "What is the capital of Japan? Reply with only the city name.", "sanity_contains": ["Tokyo"]},
+    {"id": "eval-en-vi-01", "category": "translation_en_vi", "max_new": 12, "prompt": "Translate 'The book is on the table.' into Vietnamese. Reply with only the translation."},
+    {"id": "eval-vi-en-01", "category": "translation_vi_en", "max_new": 12, "prompt": "Translate 'Trời hôm nay nhiều mây.' into English. Reply with only the translation."},
+    {"id": "eval-c-01", "category": "c_programming", "max_new": 8, "prompt": "In C, what keyword skips the rest of the current loop iteration and starts the next one? Reply with only the keyword.", "sanity_contains": ["continue"]},
+    {"id": "eval-python-01", "category": "python_programming", "max_new": 12, "prompt": "In Python, give a one-line expression that sums the squares of numbers in xs."},
+    {"id": "eval-vi-01", "category": "vietnamese_language", "max_new": 8, "prompt": "Trả lời bằng đúng một từ: trái nghĩa của 'nhanh' là gì?", "sanity_contains": ["chậm"]},
+    {"id": "eval-format-01", "category": "instruction_following", "max_new": 16, "prompt": "Reply with exactly two lines. Line 1: YES. Line 2: 7+8=15."},
+    {"id": "eval-logic-01", "category": "logic", "max_new": 16, "prompt": "Every square is a rectangle. No circle is a rectangle. Can any square be a circle? Answer yes or no, then give one short reason."},
+    {"id": "eval-science-long-01", "category": "english_science", "max_new": 32, "prompt": "In two concise sentences, explain why a metal spoon feels colder than a wooden spoon in the same room."},
+    {"id": "eval-vi-long-01", "category": "vietnamese_explanation", "max_new": 32, "prompt": "Giải thích trong hai câu ngắn vì sao trời có thể sáng trước khi Mặt Trời ló khỏi đường chân trời."},
+    {"id": "eval-code-long-01", "category": "code_reasoning", "max_new": 32, "prompt": "Explain briefly what is wrong with this C code and how to fix it: int *p = NULL; *p = 3;"},
+    {"id": "eval-context-01", "category": "reading_comprehension", "max_new": 20, "prompt": "Lan has 5 red marbles and 7 blue marbles. She gives away 3 blue marbles and then buys 2 red marbles. How many marbles does she have now? Show one short calculation."},
+    {"id": "eval-summary-01", "category": "summarization", "max_new": 32, "prompt": "Summarize this in one sentence: A battery stores chemical energy, converts it to electrical energy when connected to a circuit, and eventually needs recharging or replacement after its stored energy is depleted."}
+  ],
+  "planned_metrics": [
+    "full_vs_variant_generated_token_exact",
+    "first_generated_token_divergence_position",
+    "heldout_baseline_sanity",
+    "per_layer_route_set_overlap",
+    "per_layer_route_substitution_count",
+    "expert_cache_reads_and_bytes",
+    "ttft_and_avg_next_token",
+    "next_token_logit_delta_when_runtime_dump_is_added",
+    "top1_and_topk_logit_agreement_when_runtime_dump_is_added",
+    "kl_or_js_divergence_when_runtime_dump_is_added"
+  ]
+}
