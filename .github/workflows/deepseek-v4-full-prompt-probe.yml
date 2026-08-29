@@ -1,0 +1,49 @@
+name: DeepSeek V4 full prompt feasibility
+
+on:
+  push:
+    branches:
+      - research/deepseek-v4-flash-0731
+    paths:
+      - .github/workflows/deepseek-v4-full-prompt-probe.yml
+  workflow_dispatch:
+
+jobs:
+  full-prompt-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check runner disk
+        id: disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          free_bytes=$(df --output=avail -B1 "$GITHUB_WORKSPACE" | tail -n 1 | tr -d ' ')
+          need_bytes=$((180 * 1024 * 1024 * 1024))
+          echo "free_bytes=$free_bytes"
+          echo "need_bytes=$need_bytes"
+          if [ "$free_bytes" -ge "$need_bytes" ]; then
+            echo "enough=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enough=false" >> "$GITHUB_OUTPUT"
+            echo "DSV4_FULL_PROMPT_SKIPPED_DISK free=$free_bytes need=$need_bytes"
+          fi
+      - name: Build pinned target reference
+        if: steps.disk.outputs.enough == 'true'
+        run: bash tools/dsv4_reference_gate.sh build-dsv4-reference
+      - name: Download pinned full checkpoint
+        if: steps.disk.outputs.enough == 'true'
+        env:
+          DSV4_DOWNLOAD_JOBS: "4"
+        run: bash build-dsv4-reference/scripts/download-dsv4.sh "$RUNNER_TEMP/DeepSeek-V4-Flash-0731"
+      - name: Run strong target-only prompt
+        if: steps.disk.outputs.enough == 'true'
+        env:
+          DSV4_REF_DIR: build-dsv4-reference
+          DSV4_THREADS: "8"
+          DSV4_CONTEXT: "4096"
+          DSV4_MAX_TOKENS: "160"
+          OMP_WAIT_POLICY: PASSIVE
+        run: bash tools/dsv4_strong_prompt.sh "$RUNNER_TEMP/DeepSeek-V4-Flash-0731"
