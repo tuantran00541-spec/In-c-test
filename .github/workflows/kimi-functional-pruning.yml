@@ -10,6 +10,7 @@ on:
       - "src/logits_dump.c"
       - "src/logits_dump_probe.c"
       - "tools/analyze_kimi_moe_trace.py"
+      - "tools/analyze_kimi_mask_novelty.py"
       - "tools/compare_kimi_moe_routes.py"
       - "tools/compare_kimi_logits.py"
       - "tools/run_kimi_pruning_phase_a.py"
@@ -21,6 +22,7 @@ on:
       - "tests/test_kimi_phase_a_gate.py"
       - "tests/test_kimi_phase_b.py"
       - "tests/test_compact_expert_store.py"
+      - "tests/test_kimi_mask_novelty.py"
       - "tests/data/kimi-functional-pruning-suite.json"
       - ".github/workflows/kimi-functional-pruning.yml"
   workflow_dispatch:
@@ -40,6 +42,7 @@ jobs:
       - name: Python syntax
         run: |
           python -m py_compile tools/analyze_kimi_moe_trace.py
+          python -m py_compile tools/analyze_kimi_mask_novelty.py
           python -m py_compile tools/compare_kimi_moe_routes.py
           python -m py_compile tools/compare_kimi_logits.py
           python -m py_compile tools/run_kimi_pruning_phase_a.py
@@ -51,6 +54,7 @@ jobs:
           python -m py_compile tests/test_kimi_phase_a_gate.py
           python -m py_compile tests/test_kimi_phase_b.py
           python -m py_compile tests/test_compact_expert_store.py
+          python -m py_compile tests/test_kimi_mask_novelty.py
       - name: Phase A suite validation
         run: python tools/run_kimi_pruning_phase_a.py --validate-only
       - name: Phase A gate synthetic test
@@ -61,6 +65,8 @@ jobs:
         run: python tests/test_kimi_phase_b.py
       - name: Expert-store compaction synthetic test
         run: python tests/test_compact_expert_store.py
+      - name: Mask novelty synthetic test
+        run: python tests/test_kimi_mask_novelty.py
       - name: C logits dump roundtrip
         shell: bash
         run: |
