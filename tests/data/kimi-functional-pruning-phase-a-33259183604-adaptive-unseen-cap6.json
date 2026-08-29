@@ -1,0 +1,62 @@
+{
+  "calibration_coverage": {
+    "layer_expert_slots": 1664,
+    "layers": 26,
+    "seen_fraction": 0.9699519230769231,
+    "seen_max_per_layer": 64,
+    "seen_mean_per_layer": 62.07692307692308,
+    "seen_min_per_layer": 58,
+    "seen_slots": 1614,
+    "trace_file_support_histogram": {
+      "0": 50,
+      "1": 48,
+      "10": 65,
+      "11": 47,
+      "12": 55,
+      "13": 56,
+      "14": 54,
+      "15": 60,
+      "16": 824,
+      "2": 42,
+      "3": 48,
+      "4": 51,
+      "5": 76,
+      "6": 53,
+      "7": 38,
+      "8": 51,
+      "9": 46
+    },
+    "unseen_slots": 50
+  },
+  "candidate": "adaptive-unseen-cap6",
+  "claim_boundary": "Phase-A next-token sensitivity candidate only; not a global quality or long-generation safety claim.",
+  "mask_diagnostics": {
+    "disabled_count": 50,
+    "disabled_seen_count": 0,
+    "max_keep_per_layer": 64,
+    "mean_keep_per_layer": 62.07692307692308,
+    "min_keep_per_layer": 58
+  },
+  "mask_file": "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.mask",
+  "mask_sha256": "13ddf32e65c0dad8848fdf4ae299f12b7151a3bcc09145e89a4328c2b241ff6b",
+  "phase_a_aggregate": {
+    "cache_bytes_read_mib_total": 141392.46000000002,
+    "cache_read_ops_total": 17098,
+    "first_token_exact": 14,
+    "first_token_seconds_total": 549.322,
+    "logit_argmax_agree": 14,
+    "logit_max_abs_delta": 0.3475543260574341,
+    "logit_max_js_divergence": 0.0003017319127978834,
+    "logit_min_topk_overlap": 1.0,
+    "prompts": 14,
+    "route_min_selected_retention": 0.9977106227106227,
+    "route_min_set_exact_fraction": 0.9862637362637363,
+    "route_substitutions": 102
+  },
+  "schema_version": 1,
+  "source_artifact_id": 9717382899,
+  "source_artifact_name": "kimi-functional-pruning-phase-a-evidence",
+  "source_artifact_sha256": "a47483f37c51979df001a6adfe88d788d3618c6fa71981960b6de598045c0fd4",
+  "source_workflow_head_sha": "27c20fdafd9941e45d25129d1f4f4fae9897f589",
+  "source_workflow_run_id": 33259183604
+}
