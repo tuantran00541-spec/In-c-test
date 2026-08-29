@@ -16,6 +16,14 @@ jobs:
       OMP_DYNAMIC: "FALSE"
     steps:
       - uses: actions/checkout@v4
+      - name: User helper Python syntax
+        run: |
+          python3 -m py_compile \
+            tools/prepare_kimi_vl_q8.py \
+            tools/fetch_tokenizer.py \
+            tools/kvl_doctor.py \
+            tools/kvl_vl_chat.py \
+            tools/kvl_chat.py
       - name: Planner 8k 16k 32k gates
         run: python3 tools/test_long_context_planner.py
       - name: Build scalar
@@ -42,6 +50,12 @@ jobs:
       OMP_DYNAMIC: "FALSE"
     steps:
       - uses: actions/checkout@v4
+      - name: User helper syntax
+        shell: pwsh
+        run: |
+          py -3 -m py_compile tools/prepare_kimi_vl_q8.py tools/fetch_tokenizer.py tools/kvl_doctor.py tools/kvl_vl_chat.py tools/kvl_chat.py
+          $text = Get-Content -Raw tools/windows_setup_q8.ps1
+          [void][scriptblock]::Create($text)
       - name: Planner 8k 16k 32k gates
         shell: pwsh
         run: py -3 tools/test_long_context_planner.py
