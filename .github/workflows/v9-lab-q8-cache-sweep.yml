@@ -1,0 +1,113 @@
+name: V9 lab Q8 expert cache sweep
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - ".github/workflows/v9-lab-q8-cache-sweep.yml"
+
+jobs:
+  cache-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build Q8 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          python tests/test_q8_matvec.py --build-dir build
+      - name: Restore exact English V9 image
+        run: base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+      - name: Fetch pinned frontend and initial vision shard
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          root=os.path.join(os.environ['RUNNER_TEMP'],'model')
+          out=os.path.join(os.environ['RUNNER_TEMP'],'q8-runtime')
+          os.makedirs(root,exist_ok=True); os.makedirs(out,exist_ok=True)
+          for n in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+              shutil.copy2(p,os.path.join(out,n))
+          PY
+      - name: Pack full Q8 model once
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
+          python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'q8-runtime'/'experts.bin'
+          print(f'Q8_EXPERT_GIB={p.stat().st_size/1024**3:.9f}')
+          assert p.stat().st_size < 14*1024**3
+          PY
+      - name: Sweep 512 1024 1536 2048 MiB expert cache
+        run: |
+          set -euo pipefail
+          prompt='Look at this image and answer only in English. Describe the character and facial expression in one short sentence.'
+          for cache in 512 1024 1536 2048; do
+            echo "===== CACHE ${cache} MiB ====="
+            python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" "$prompt" \
+              --vision-binary ./build/kvl_vision \
+              --generate-binary ./build/kvl_generate_vl \
+              --cache-mib "$cache" --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+              --show-tokens \
+              2> >(tee "$RUNNER_TEMP/cache-${cache}.stderr" >&2) \
+              | tee "$RUNNER_TEMP/cache-${cache}.out"
+            grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/cache-${cache}.stderr"
+            grep -q 'media_boundary=bf16' "$RUNNER_TEMP/cache-${cache}.stderr"
+            grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/cache-${cache}.stderr"
+          done
+      - name: Assert token parity and summarize cache sweep
+        run: |
+          python - <<'PY'
+          import os,re
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          expected=[1008,6162,924,4393,11,98717,11002,316,261,21478,528,54275,37632,11276,13,163586]
+          expected_text='The character has large, expressive eyes and a surprised or shocked facial expression.'
+          print('CACHE_MIB SLOTS EVICT READS BYTES_MIB FIRST_S AVG_NEXT_S TOTAL_S')
+          rows=[]
+          for cache in (512,1024,1536,2048):
+              err=(root/f'cache-{cache}.stderr').read_text(errors='replace')
+              out=(root/f'cache-{cache}.out').read_text(errors='replace').strip()
+              m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m
+              ids=[int(x) for x in m.group(1).split()]
+              assert ids==expected, (cache,ids)
+              assert out==expected_text, (cache,out)
+              cm=re.search(r'kvl_cache: slots=(\d+).*?evict=(\d+).*?reads=(\d+) bytes=([0-9.]+) MiB',err)
+              tm=re.search(r'timing vision=([0-9.]+)s first_text_token=([0-9.]+)s avg_next=([0-9.]+)s text_total=([0-9.]+)s',err)
+              assert cm and tm, cache
+              slots,evict,reads=int(cm.group(1)),int(cm.group(2)),int(cm.group(3))
+              bytes_mib=float(cm.group(4)); first=float(tm.group(2)); avg=float(tm.group(3)); total=float(tm.group(4))
+              rows.append((cache,slots,evict,reads,bytes_mib,first,avg,total))
+              print(cache,slots,evict,reads,f'{bytes_mib:.2f}',f'{first:.3f}',f'{avg:.3f}',f'{total:.3f}')
+          base=rows[0]
+          print('===== RELATIVE TO 512 MiB =====')
+          for r in rows[1:]:
+              print(f'CACHE={r[0]} READ_REDUCTION={100*(1-r[3]/base[3]):.2f}% BYTE_REDUCTION={100*(1-r[4]/base[4]):.2f}% FIRST_SPEEDUP={base[5]/r[5]:.3f}x NEXT_SPEEDUP={base[6]/r[6]:.3f}x TOTAL_SPEEDUP={base[7]/r[7]:.3f}x')
+          print('ALL_CACHE_TOKEN_PARITY=True')
+          PY
