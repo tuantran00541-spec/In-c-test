@@ -4,11 +4,15 @@ on:
   push:
     branches:
       - research/v9-long-context
+      - research/v9-long-context-parallel-prefill
   workflow_dispatch:
 
 jobs:
   linux:
     runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
     steps:
       - uses: actions/checkout@v4
       - name: Planner 8k 16k 32k gates
@@ -28,6 +32,9 @@ jobs:
 
   windows-msvc:
     runs-on: windows-latest
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
     steps:
       - uses: actions/checkout@v4
       - name: Planner 8k 16k 32k gates

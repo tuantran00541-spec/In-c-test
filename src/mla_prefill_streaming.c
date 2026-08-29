@@ -8,6 +8,9 @@
 #ifdef KVL_USE_AVX2
 #include <immintrin.h>
 #endif
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* Long-context exact prefill path.
  *
@@ -103,19 +106,25 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
     const int KVO = R + DR;
     const int KHV = DN + DV;
     const int HO = NH * DV;
+    int worker_count = 1;
+#ifdef _OPENMP
+    worker_count = omp_get_max_threads();
+    if (worker_count < 1) worker_count = 1;
+    if (worker_count > S) worker_count = S;
+#endif
 
     float *latent_states = (float *)malloc((size_t)S * R * sizeof(float));
     float *rope_states = (float *)malloc((size_t)S * DR * sizeof(float));
     float *k_nope = (float *)malloc((size_t)S * DN * sizeof(float));
     float *v_states = (float *)malloc((size_t)S * DV * sizeof(float));
-    float *scores = (float *)malloc((size_t)S * sizeof(float));
-    float *qtmp = (float *)malloc((size_t)QD * sizeof(float));
+    float *scores_all = (float *)malloc((size_t)worker_count * S * sizeof(float));
+    float *qtmp_all = (float *)malloc((size_t)worker_count * QD * sizeof(float));
     float *katmp = (float *)malloc((size_t)KVO * sizeof(float));
     float *kvtmp = (float *)malloc((size_t)KHV * sizeof(float));
-    float *qrope = (float *)malloc((size_t)DR * sizeof(float));
+    float *qrope_all = (float *)malloc((size_t)worker_count * DR * sizeof(float));
     float *head_tmp = (float *)malloc((size_t)HO * sizeof(float));
     float *head_states = NULL;
-    double *value_acc = (double *)malloc((size_t)DV * sizeof(double));
+    double *value_acc_all = (double *)malloc((size_t)worker_count * DV * sizeof(double));
 
     /* Official Kimi has HO == H, so write concatenated heads directly into the
      * caller's output and keep the long-context fast path at the same memory cost.
@@ -125,11 +134,12 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
         head_states = (float *)malloc((size_t)S * HO * sizeof(float));
     float *head_seq = (HO == H) ? out : head_states;
 
-    if (!latent_states || !rope_states || !k_nope || !v_states || !scores ||
-        !qtmp || !katmp || !kvtmp || !qrope || !head_tmp || !value_acc || !head_seq) {
+    if (!latent_states || !rope_states || !k_nope || !v_states || !scores_all ||
+        !qtmp_all || !katmp || !kvtmp || !qrope_all || !head_tmp ||
+        !value_acc_all || !head_seq) {
         free(latent_states); free(rope_states); free(k_nope); free(v_states);
-        free(scores); free(qtmp); free(katmp); free(kvtmp); free(qrope);
-        free(head_tmp); free(head_states); free(value_acc);
+        free(scores_all); free(qtmp_all); free(katmp); free(kvtmp); free(qrope_all);
+        free(head_tmp); free(head_states); free(value_acc_all);
         return -1;
     }
 
@@ -156,7 +166,19 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
         }
 
         const uint16_t *q_head = w->q_proj + (size_t)h * QD * H;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 8) if(S >= 128) num_threads(worker_count)
+#endif
         for (int t = 0; t < S; ++t) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            float *scores = scores_all + (size_t)tid * S;
+            float *qtmp = qtmp_all + (size_t)tid * QD;
+            float *qrope = qrope_all + (size_t)tid * DR;
+            double *value_acc = value_acc_all + (size_t)tid * DV;
+
             kvl_matvec_bf16(qtmp, x + (size_t)t * H, q_head, H, QD);
             rope_interleaved_stream(qrope, qtmp + DN, DR, t, cfg->rope_theta);
 
@@ -197,7 +219,7 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
     }
 
     free(latent_states); free(rope_states); free(k_nope); free(v_states);
-    free(scores); free(qtmp); free(katmp); free(kvtmp); free(qrope);
-    free(head_tmp); free(head_states); free(value_acc);
+    free(scores_all); free(qtmp_all); free(katmp); free(kvtmp); free(qrope_all);
+    free(head_tmp); free(head_states); free(value_acc_all);
     return 0;
 }

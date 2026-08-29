@@ -10,9 +10,9 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-if(NOT MSVC)
-  find_package(OpenMP)
-endif()
+# OpenMP is useful for long-context query parallelism on both GCC/Clang and
+# MSVC. Find it opportunistically so unsupported toolchains keep the scalar path.
+find_package(OpenMP)
 
 # Keep the old fully-materialized MLA prefill available as a lab oracle while
 # routing production callers on this branch to the exact low-memory implementation.

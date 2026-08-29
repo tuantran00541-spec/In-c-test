@@ -92,7 +92,7 @@ static int run_case(int seq_len, int dv) {
 }
 
 int main(void) {
-    const int cases[] = {1, 7, 64};
+    const int cases[] = {1, 7, 64, 257};
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         const int rc = run_case(cases[i], 8); /* HO == H: official-style fast path. */
         if (rc != 0) {
