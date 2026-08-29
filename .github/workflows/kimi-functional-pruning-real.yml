@@ -1,6 +1,7 @@
 name: Real Kimi functional pruning experiment
 
 # Expensive official-weight calibration + held-out logical-mask sweep.
+# Kept as a separate workflow so ordinary research commits do not repack weights.
 on:
   workflow_dispatch:
   push:
