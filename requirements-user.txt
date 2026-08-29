@@ -1,0 +1,7 @@
+# User-facing Python dependencies for packing/tokenization/image preprocessing.
+# Install CPU-only PyTorch separately first; see docs/USER_GUIDE_WINDOWS.md.
+huggingface_hub>=0.34
+safetensors>=0.4
+numpy>=1.26
+Pillow>=10
+tiktoken>=0.7
