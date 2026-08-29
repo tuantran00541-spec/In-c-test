@@ -152,7 +152,12 @@ static int forward_token(KvlTrunkStore *ts, KvlExpertCache *cache,
  * once per layer for the complete prompt, causal MLA runs as a batch, and routed experts are
  * evaluated token-by-token while staying within the same layer so the LRU can reuse recurring
  * experts. The resulting compressed MLA histories are then used by the unchanged V6 decode
- * path for newly generated tokens. */
+ * path for newly generated tokens.
+ *
+ * Long-context V9 reuses exactly three full [seq,H] FP32 matrices. work_a changes role from
+ * input-norm output to post-attention norm, work_b changes from attention output to the
+ * attention residual, and x is overwritten by the MLP only after the old layer input is no
+ * longer needed. This keeps the arithmetic order unchanged while halving sequence workspace. */
 static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
                           KvlMlaCompressedState *states,
                           const KvlTrunkTensor *emb,
@@ -168,13 +173,10 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
 
     const size_t elems = (size_t)seq_len * H;
     float *x = (float *)malloc(elems * sizeof(float));
-    float *n1 = (float *)malloc(elems * sizeof(float));
-    float *attn = (float *)malloc(elems * sizeof(float));
-    float *r1 = (float *)malloc(elems * sizeof(float));
-    float *n2 = (float *)malloc(elems * sizeof(float));
-    float *y = (float *)malloc(elems * sizeof(float));
+    float *work_a = (float *)malloc(elems * sizeof(float));
+    float *work_b = (float *)malloc(elems * sizeof(float));
     int rc = -1;
-    if (!x || !n1 || !attn || !r1 || !n2 || !y) goto done;
+    if (!x || !work_a || !work_b) goto done;
 
     for (int t = 0; t < seq_len; ++t) {
         if (prompt[t] < 0 || prompt[t] >= V) goto done;
@@ -203,7 +205,7 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
         }
 
         for (int t = 0; t < seq_len; ++t)
-            kvl_rmsnorm_bf16(n1 + (size_t)t * H, x + (size_t)t * H,
+            kvl_rmsnorm_bf16(work_a + (size_t)t * H, x + (size_t)t * H,
                               (const uint16_t *)in.data, H, RMS_EPS);
 
         KvlMlaBF16 aw = {
@@ -213,8 +215,8 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
             (const uint16_t *)kvb.data,
             (const uint16_t *)o.data
         };
-        if (kvl_mla_prefill_bf16(attn, n1, seq_len, &cfg, &aw) != 0 ||
-            kvl_mla_compressed_state_prefill_bf16(n1, seq_len, &cfg, &aw,
+        if (kvl_mla_prefill_bf16(work_b, work_a, seq_len, &cfg, &aw) != 0 ||
+            kvl_mla_compressed_state_prefill_bf16(work_a, seq_len, &cfg, &aw,
                                                    &states[layer]) != 0) {
             kvl_trunk_tensor_free(&in); kvl_trunk_tensor_free(&q);
             kvl_trunk_tensor_free(&kva); kvl_trunk_tensor_free(&kvan);
@@ -225,8 +227,9 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
 
         for (int t = 0; t < seq_len; ++t) {
             const size_t base = (size_t)t * H;
-            for (int i = 0; i < H; ++i) r1[base + i] = x[base + i] + attn[base + i];
-            kvl_rmsnorm_bf16(n2 + base, r1 + base,
+            for (int i = 0; i < H; ++i)
+                work_b[base + i] = x[base + i] + work_b[base + i];
+            kvl_rmsnorm_bf16(work_a + base, work_b + base,
                               (const uint16_t *)pn.data, H, RMS_EPS);
         }
 
@@ -250,7 +253,7 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
             };
             for (int t = 0; t < seq_len; ++t) {
                 const size_t base = (size_t)t * H;
-                if (kvl_mlp_bf16(y + base, n2 + base, &dense, H, scratch) != 0) {
+                if (kvl_mlp_bf16(x + base, work_a + base, &dense, H, scratch) != 0) {
                     kvl_trunk_tensor_free(&g); kvl_trunk_tensor_free(&u);
                     kvl_trunk_tensor_free(&d);
                     goto done;
@@ -278,8 +281,8 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
             };
             for (int t = 0; t < seq_len; ++t) {
                 const size_t base = (size_t)t * H;
-                if (kvl_moe_token_bf16(cache, layer, &router_cfg, n2 + base,
-                                       router, bias, EXP_I, &shared, y + base,
+                if (kvl_moe_token_bf16(cache, layer, &router_cfg, work_a + base,
+                                       router, bias, EXP_I, &shared, x + base,
                                        ids, weights, scratch) != 0) {
                     kvl_trunk_tensor_free(&rt); kvl_trunk_tensor_free(&rb);
                     kvl_trunk_tensor_free(&sg); kvl_trunk_tensor_free(&su);
@@ -292,7 +295,7 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
             kvl_trunk_tensor_free(&sd);
         }
 
-        for (size_t i = 0; i < elems; ++i) x[i] = r1[i] + y[i];
+        for (size_t i = 0; i < elems; ++i) x[i] = work_b[i] + x[i];
     }
 
     kvl_rmsnorm_bf16(z, x + (size_t)(seq_len - 1) * H,
@@ -301,7 +304,7 @@ static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
     rc = 0;
 
 done:
-    free(x); free(n1); free(attn); free(r1); free(n2); free(y);
+    free(x); free(work_a); free(work_b);
     return rc;
 }
 
@@ -421,10 +424,10 @@ int main(int argc, char **argv) {
     if (!logits || !x || !r1 || !n2 || !y || !z || !router || !bias ||
         !top_ids || !top_weights || !scratch) return 2;
 
-    const double batch_mib = (double)((size_t)6 * (size_t)prompt_n * H * sizeof(float)) / 1048576.0;
+    const double batch_mib = (double)((size_t)3 * (size_t)prompt_n * H * sizeof(float)) / 1048576.0;
     fprintf(stderr,
             "kvl_generate: prompt=%d max_new=%d temperature=%.4g rms_eps=1e-5 "
-            "state=%.2f MiB cache=%.2f MiB prefill=batch layer-major batch_ws=%.2f MiB\n",
+            "state=%.2f MiB cache=%.2f MiB prefill=batch layer-major buffers=3 batch_ws=%.2f MiB\n",
             prompt_n, max_new, temperature, state_bytes / 1048576.0,
             cache_bytes / 1048576.0, batch_mib);
 
