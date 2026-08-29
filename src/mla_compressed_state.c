@@ -38,6 +38,11 @@ int kvl_mla_compressed_state_init(KvlMlaCompressedState *state,
 }
 
 void kvl_mla_compressed_state_reset(KvlMlaCompressedState *state){if(state)state->len=0;}
+int kvl_mla_compressed_state_truncate(KvlMlaCompressedState *state,int new_len){
+    if(!state||new_len<0||new_len>state->len)return -1;
+    state->len=new_len;
+    return 0;
+}
 void kvl_mla_compressed_state_free(KvlMlaCompressedState *state){if(!state)return;free(state->latent);free(state->rope);memset(state,0,sizeof(*state));}
 size_t kvl_mla_compressed_state_bytes(const KvlMlaCompressedState *state){
     if(!state||state->capacity<=0)return 0;
@@ -153,5 +158,28 @@ int kvl_mla_decode_compressed_bf16(float *out,
     kvl_matvec_bf16(out,head_out,w->o_proj,NH*DV,H);
     state->len=position+1;
     free(qtmp);free(katmp);free(qrope);free(q_lat);free(mix);free(scores);free(head_out);
+    return 0;
+}
+
+int kvl_mla_decode_compressed_block_bf16(float *out,
+                                         const float *x,
+                                         int count,
+                                         int start_position,
+                                         const KvlMlaConfig *cfg,
+                                         const KvlMlaBF16 *w,
+                                         KvlMlaCompressedState *state) {
+    if (!out || !x || !cfg || !w || !state || count <= 0 ||
+        start_position != state->len || start_position < 0 ||
+        count > state->capacity - start_position)
+        return -1;
+    const int H = cfg->hidden_size;
+    if (H <= 0) return -1;
+    for (int t = 0; t < count; ++t) {
+        if (kvl_mla_decode_compressed_bf16(out + (size_t)t * H,
+                                           x + (size_t)t * H,
+                                           start_position + t,
+                                           cfg, w, state) != 0)
+            return -1;
+    }
     return 0;
 }
