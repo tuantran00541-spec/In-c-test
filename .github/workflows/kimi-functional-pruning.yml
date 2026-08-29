@@ -1,0 +1,31 @@
+name: Kimi functional pruning lab
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - "src/q8_ops.c"
+      - "tools/analyze_kimi_moe_trace.py"
+      - "tests/test_kimi_functional_pruning.py"
+      - ".github/workflows/kimi-functional-pruning.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-synthetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j2
+      - name: Python syntax
+        run: |
+          python -m py_compile tools/analyze_kimi_moe_trace.py
+          python -m py_compile tests/test_kimi_functional_pruning.py
+      - name: Synthetic functional-pruning analysis
+        run: python tests/test_kimi_functional_pruning.py
