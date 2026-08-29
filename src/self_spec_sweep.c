@@ -397,6 +397,7 @@ static int popcount_mask_lab(uint32_t m) {
 typedef struct {
     const char *name;
     uint32_t mask;
+    int focused;
 } DraftMask;
 
 int main(int argc, char **argv) {
@@ -484,11 +485,20 @@ int main(int argc, char **argv) {
     const int s4[] = {6, 12, 18, 24};
     const int s7[] = {4, 8, 12, 16, 20, 24, 26};
     const int s13[] = {2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26};
+    const uint32_t m4 = bit_layers_lab(s4, (int)(sizeof s4 / sizeof s4[0]));
+    const uint32_t m7 = bit_layers_lab(s7, (int)(sizeof s7 / sizeof s7[0]));
+    const uint32_t m13 = bit_layers_lab(s13, (int)(sizeof s13 / sizeof s13[0]));
     DraftMask masks[] = {
-        {"q8_only", 0},
-        {"skip4", bit_layers_lab(s4, (int)(sizeof s4 / sizeof s4[0]))},
-        {"skip7", bit_layers_lab(s7, (int)(sizeof s7 / sizeof s7[0]))},
-        {"skip13", bit_layers_lab(s13, (int)(sizeof s13 / sizeof s13[0]))}
+        {"q8_only", 0, 0},
+        {"skip4", m4, 0},
+        {"skip7", m7, 0},
+        {"skip13", m13, 0},
+        {"skip12_keep2",  m13 & ~(UINT32_C(1) << 2), 1},
+        {"skip12_keep6",  m13 & ~(UINT32_C(1) << 6), 1},
+        {"skip12_keep10", m13 & ~(UINT32_C(1) << 10), 1},
+        {"skip12_keep14", m13 & ~(UINT32_C(1) << 14), 1},
+        {"skip12_keep18", m13 & ~(UINT32_C(1) << 18), 1},
+        {"skip12_keep22", m13 & ~(UINT32_C(1) << 22), 1}
     };
     const int nmasks = (int)(sizeof masks / sizeof masks[0]);
 
@@ -506,6 +516,8 @@ int main(int argc, char **argv) {
            q8_bytes ? (double)f32_bytes / (double)q8_bytes : 0.0);
 
     int failures = 0;
+    int focus_exact = 0;
+    int focus_full_accept = 0;
     for (int mi = 0; mi < nmasks; ++mi) {
         KvlMlaCompressedQ8State draft_states[LN];
         KvlMlaCompressedState target_states[LN], cmp_states[LN];
@@ -578,18 +590,35 @@ int main(int argc, char **argv) {
         const double speedup = cycle_s > 0.0 ? base_s / cycle_s : 0.0;
         const double tok_s = cycle_s > 0.0 ? (double)resolved / cycle_s : 0.0;
         const double acc = (double)accept / (double)K;
-        printf("SELF_SPEC mask=%s skipped=%d acceptance=%d/%d(%.3f) resolved=%d "
-               "draft_s=%.3f verify_s=%.3f commit_s=%.3f cycle_s=%.3f "
-               "baseline_s=%.3f speedup=%.3fx resolved_tok_s=%.4f "
-               "draft_bytes_mib=%.2f target_bytes_mib=%.2f baseline_bytes_mib=%.2f "
-               "draft_reads=%" PRIu64 " target_reads=%" PRIu64 " "
-               "seq_ok=%s commit_state_max=%.9g\n",
-               masks[mi].name, popcount_mask_lab(masks[mi].mask), accept, K, acc,
-               resolved, draft_s, verify_s, commit_s, cycle_s, base_s, speedup, tok_s,
-               draft_bytes / 1048576.0, target_bytes / 1048576.0,
-               baseline_bytes[resolved] / 1048576.0,
-               draft_reads, target_reads, seq_ok ? "yes" : "no", commit_state_max);
-        printf("DRAFT_IDS mask=%s", masks[mi].name);
+        if (!masks[mi].focused) {
+            printf("SELF_SPEC mask=%s skipped=%d acceptance=%d/%d(%.3f) resolved=%d "
+                   "draft_s=%.3f verify_s=%.3f commit_s=%.3f cycle_s=%.3f "
+                   "baseline_s=%.3f speedup=%.3fx resolved_tok_s=%.4f "
+                   "draft_bytes_mib=%.2f target_bytes_mib=%.2f baseline_bytes_mib=%.2f "
+                   "draft_reads=%" PRIu64 " target_reads=%" PRIu64 " "
+                   "seq_ok=%s commit_state_max=%.9g\n",
+                   masks[mi].name, popcount_mask_lab(masks[mi].mask), accept, K, acc,
+                   resolved, draft_s, verify_s, commit_s, cycle_s, base_s, speedup, tok_s,
+                   draft_bytes / 1048576.0, target_bytes / 1048576.0,
+                   baseline_bytes[resolved] / 1048576.0,
+                   draft_reads, target_reads, seq_ok ? "yes" : "no", commit_state_max);
+            printf("DRAFT_IDS mask=%s", masks[mi].name);
+        } else {
+            printf("FOCUS_SELF_SPEC mask=%s skipped=%d acceptance=%d/%d(%.3f) resolved=%d "
+                   "draft_s=%.3f verify_s=%.3f commit_s=%.3f cycle_s=%.3f "
+                   "baseline_s=%.3f speedup=%.3fx resolved_tok_s=%.4f "
+                   "draft_bytes_mib=%.2f target_bytes_mib=%.2f baseline_bytes_mib=%.2f "
+                   "draft_reads=%" PRIu64 " target_reads=%" PRIu64 " "
+                   "focus_seq_ok=%s focus_commit_state_max=%.9g\n",
+                   masks[mi].name, popcount_mask_lab(masks[mi].mask), accept, K, acc,
+                   resolved, draft_s, verify_s, commit_s, cycle_s, base_s, speedup, tok_s,
+                   draft_bytes / 1048576.0, target_bytes / 1048576.0,
+                   baseline_bytes[resolved] / 1048576.0,
+                   draft_reads, target_reads, seq_ok ? "yes" : "no", commit_state_max);
+            printf("FOCUS_DRAFT_IDS mask=%s", masks[mi].name);
+            if (seq_ok && commit_state_max == 0.0) focus_exact++;
+            if (accept == K) focus_full_accept++;
+        }
         for (int t = 0; t < K; ++t) printf(" %d", draft[t]);
         printf("\n");
         if (!seq_ok || commit_state_max != 0.0) failures++;
@@ -598,6 +627,9 @@ int main(int argc, char **argv) {
         free_f32_states_lab(target_states);
         free_f32_states_lab(cmp_states);
     }
+
+    printf("FOCUS_SUMMARY masks=6 exact_commit=%d full_accept=%d\n",
+           focus_exact, focus_full_accept);
 
     free_f32_states_lab(base); free_f32_states_lab(baseline_states);
     kvl_trunk_tensor_free(&emb); kvl_trunk_tensor_free(&fn); kvl_trunk_tensor_free(&lm);
