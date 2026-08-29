@@ -10,9 +10,14 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# OpenMP is useful for long-context query parallelism on both GCC/Clang and
-# MSVC. Find it opportunistically so unsupported toolchains keep the scalar path.
-find_package(OpenMP)
+# Linux keeps the existing target-wide OpenMP behavior. On MSVC, enable OpenMP
+# only for the long-context prefill translation unit so legacy OpenMP parsing does
+# not suddenly change unrelated Q8/cache kernels or their nested behavior.
+if(MSVC)
+  set_source_files_properties(src/mla_prefill_streaming.c PROPERTIES COMPILE_OPTIONS "/openmp")
+else()
+  find_package(OpenMP)
+endif()
 
 # Keep the old fully-materialized MLA prefill available as a lab oracle while
 # routing production callers on this branch to the exact low-memory implementation.

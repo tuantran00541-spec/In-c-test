@@ -166,10 +166,11 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
         }
 
         const uint16_t *q_head = w->q_proj + (size_t)h * QD * H;
+        int t;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 8) if(S >= 128) num_threads(worker_count)
 #endif
-        for (int t = 0; t < S; ++t) {
+        for (t = 0; t < S; ++t) {
             int tid = 0;
 #ifdef _OPENMP
             tid = omp_get_thread_num();
