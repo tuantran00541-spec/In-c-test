@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef KVL_USE_AVX2
+#include <immintrin.h>
+#endif
+
 /* Long-context exact prefill path.
  *
  * The legacy implementation materializes Q, K and V for every token/head. This
@@ -27,6 +31,56 @@ static void rope_interleaved_stream(float *dst, const float *raw, int dim,
         dst[i] = a * c - b * si;
         dst[half + i] = b * c + a * si;
     }
+}
+
+/* Keep FP64 accumulation like the scalar/reference attention path. AVX2 only
+ * changes how independent products are formed and reduced; quality gates below
+ * decide whether the changed reduction order is acceptable. */
+static double dot_f32_f64(const float *a, const float *b, int n) {
+#ifdef KVL_USE_AVX2
+    __m256d acc0 = _mm256_setzero_pd();
+    __m256d acc1 = _mm256_setzero_pd();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128 af0 = _mm_loadu_ps(a + i);
+        const __m128 bf0 = _mm_loadu_ps(b + i);
+        const __m128 af1 = _mm_loadu_ps(a + i + 4);
+        const __m128 bf1 = _mm_loadu_ps(b + i + 4);
+        const __m256d ad0 = _mm256_cvtps_pd(af0);
+        const __m256d bd0 = _mm256_cvtps_pd(bf0);
+        const __m256d ad1 = _mm256_cvtps_pd(af1);
+        const __m256d bd1 = _mm256_cvtps_pd(bf1);
+        acc0 = _mm256_add_pd(acc0, _mm256_mul_pd(ad0, bd0));
+        acc1 = _mm256_add_pd(acc1, _mm256_mul_pd(ad1, bd1));
+    }
+    const __m256d sumv = _mm256_add_pd(acc0, acc1);
+    double lane[4];
+    _mm256_storeu_pd(lane, sumv);
+    double acc = (lane[0] + lane[1]) + (lane[2] + lane[3]);
+    for (; i < n; ++i) acc += (double)a[i] * (double)b[i];
+    return acc;
+#else
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i) acc += (double)a[i] * (double)b[i];
+    return acc;
+#endif
+}
+
+static void value_add_f64(double *acc, const float *v, int n, double p) {
+#ifdef KVL_USE_AVX2
+    const __m256d pv = _mm256_set1_pd(p);
+    int d = 0;
+    for (; d + 4 <= n; d += 4) {
+        const __m128 vf = _mm_loadu_ps(v + d);
+        const __m256d vd = _mm256_cvtps_pd(vf);
+        __m256d av = _mm256_loadu_pd(acc + d);
+        av = _mm256_add_pd(av, _mm256_mul_pd(pv, vd));
+        _mm256_storeu_pd(acc + d, av);
+    }
+    for (; d < n; ++d) acc[d] += p * (double)v[d];
+#else
+    for (int d = 0; d < n; ++d) acc[d] += p * (double)v[d];
+#endif
 }
 
 int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
@@ -108,13 +162,10 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
 
             float max_score = -INFINITY;
             for (int j = 0; j <= t; ++j) {
-                double dot = 0.0;
                 const float *kj = k_nope + (size_t)j * DN;
                 const float *rj = rope_states + (size_t)j * DR;
-                for (int d = 0; d < DN; ++d)
-                    dot += (double)qtmp[d] * (double)kj[d];
-                for (int d = 0; d < DR; ++d)
-                    dot += (double)qrope[d] * (double)rj[d];
+                const double dot = dot_f32_f64(qtmp, kj, DN) +
+                                   dot_f32_f64(qrope, rj, DR);
                 scores[j] = (float)dot * scale;
                 if (scores[j] > max_score) max_score = scores[j];
             }
@@ -129,8 +180,7 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
             for (int j = 0; j <= t; ++j) {
                 const double p = (double)scores[j] / denom;
                 const float *vj = v_states + (size_t)j * DV;
-                for (int d = 0; d < DV; ++d)
-                    value_acc[d] += p * (double)vj[d];
+                value_add_f64(value_acc, vj, DV, p);
             }
             float *ho = head_seq + (size_t)t * HO + (size_t)h * DV;
             for (int d = 0; d < DV; ++d) ho[d] = (float)value_acc[d];
