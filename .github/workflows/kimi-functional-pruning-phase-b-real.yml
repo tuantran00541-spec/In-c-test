@@ -1,0 +1,134 @@
+name: Real Kimi functional pruning phase B
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - ".github/workflows/kimi-functional-pruning-phase-b-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  phase-b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      PHASE_A_RUN_ID: "33259183604"
+      PHASE_A_MASK: "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.mask"
+      PHASE_A_MANIFEST: "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.json"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          python tools/run_kimi_pruning_phase_b.py --validate-only --candidate adaptive-unseen-cap6
+
+      - name: Verify Phase A candidate provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          mask = pathlib.Path(os.environ['PHASE_A_MASK'])
+          manifest = json.loads(pathlib.Path(os.environ['PHASE_A_MANIFEST']).read_text())
+          raw = mask.read_bytes()
+          digest = hashlib.sha256(raw).hexdigest()
+          assert manifest['source_workflow_run_id'] == int(os.environ['PHASE_A_RUN_ID'])
+          assert manifest['candidate'] == 'adaptive-unseen-cap6'
+          assert manifest['mask_sha256'] == digest, (manifest['mask_sha256'], digest)
+          disabled = []
+          for line in raw.decode().splitlines():
+              line = line.split('#', 1)[0].strip()
+              if not line:
+                  continue
+              layer, expert = map(int, line.split())
+              assert 1 <= layer <= 26
+              assert 0 <= expert < 64
+              disabled.append((layer, expert))
+          assert len(disabled) == 50, len(disabled)
+          assert len(set(disabled)) == 50
+          assert manifest['mask_diagnostics']['disabled_count'] == 50
+          assert manifest['mask_diagnostics']['disabled_seen_count'] == 0
+          print(f"PHASE_A_PROVENANCE_PASS run={manifest['source_workflow_run_id']} disabled={len(disabled)} sha256={digest}")
+          PY
+
+      - name: Pack official Kimi text with Q8 routed experts
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-full" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-full" \
+            --revision "$KIMI_REV" --expert-format q8
+          du -h "$RUNNER_TEMP/packed-full"/*.bin
+          df -h "$RUNNER_TEMP"
+
+      - name: Run long-generation full vs adaptive Phase B
+        run: |
+          python tools/run_kimi_pruning_phase_b.py \
+            --model-dir "$RUNNER_TEMP/packed-full" \
+            --binary ./build/kvl_generate \
+            --mask "$PHASE_A_MASK" \
+            --candidate adaptive-unseen-cap6 \
+            --work-dir "$RUNNER_TEMP/phase-b" \
+            --cache-mib 1536 --ram-mib 4096
+
+      - name: Print Phase B summary
+        if: always()
+        run: |
+          if test -s "$RUNNER_TEMP/phase-b/phase-b-summary.json"; then
+            python - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path(os.environ['RUNNER_TEMP'])/'phase-b'/'phase-b-summary.json'
+          r = json.loads(p.read_text())
+          a = r['aggregate']
+          print(
+              f"PHASE_B_AGG candidate={r['candidate']} exact={a['token_exact_prompts']}/{a['prompts']} "
+              f"sanity_candidate={a['candidate_sanity_pass']}/{a['sanity_checked_prompts']} "
+              f"sanity_baseline={a['baseline_sanity_pass']}/{a['sanity_checked_prompts']}"
+          )
+          print(
+              f"PHASE_B_IO full_reads={a['full_cache_read_ops_total']} candidate_reads={a['candidate_cache_read_ops_total']} "
+              f"full_mib={a['full_cache_bytes_read_mib_total']:.2f} candidate_mib={a['candidate_cache_bytes_read_mib_total']:.2f}"
+          )
+          print(
+              f"PHASE_B_TIME full_seconds={a['full_total_seconds']:.3f} "
+              f"candidate_seconds={a['candidate_total_seconds']:.3f}"
+          )
+          for d in a['divergent_prompts']:
+              print(f"PHASE_B_DIVERGENCE id={d['id']} first_token_position={d['first_divergence_position']}")
+          PY
+          else
+            echo "phase-b-summary.json not available"
+          fi
+
+      - name: Upload Phase B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-functional-pruning-phase-b-evidence
+          path: |
+            ${{ runner.temp }}/phase-b/**
+          if-no-files-found: warn
