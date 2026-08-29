@@ -1,0 +1,43 @@
+name: V9 long-context synthetic gates
+
+on:
+  push:
+    branches:
+      - research/v9-long-context
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Planner 8k 16k 32k gates
+        run: python3 tools/test_long_context_planner.py
+      - name: Build scalar
+        run: |
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar --config Release -j 2
+      - name: Scalar streaming-vs-materialized oracle
+        run: ./build-scalar/kvl_mla_streaming_probe
+      - name: Build AVX2
+        run: |
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 --config Release -j 2
+      - name: AVX2 streaming-vs-materialized oracle
+        run: ./build-avx2/kvl_mla_streaming_probe
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Planner 8k 16k 32k gates
+        shell: pwsh
+        run: py -3 tools/test_long_context_planner.py
+      - name: Build MSVC AVX2
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DKVL_USE_AVX2=ON
+          cmake --build build --config Release
+      - name: MSVC streaming-vs-materialized oracle
+        shell: pwsh
+        run: .\build\Release\kvl_mla_streaming_probe.exe
