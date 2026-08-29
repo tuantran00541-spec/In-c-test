@@ -7,6 +7,16 @@ on:
       - research/v9-long-context
     paths:
       - ".github/workflows/v9-long-context-official-short.yml"
+      - "CMakeLists.txt"
+      - "include/kvl/ops.h"
+      - "include/kvl/mla_compressed_state.h"
+      - "src/ops.c"
+      - "src/mla_prefill_streaming.c"
+      - "src/mla_streaming_probe.c"
+      - "src/mla_compressed_state.c"
+      - "src/generate.c"
+      - "src/generate_vl.c"
+      - "tools/kvl_vl_chat.py"
 
 jobs:
   q8-short-trajectory:
