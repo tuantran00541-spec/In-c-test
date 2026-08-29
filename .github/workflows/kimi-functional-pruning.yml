@@ -12,6 +12,7 @@ on:
       - "tools/analyze_kimi_moe_trace.py"
       - "tools/compare_kimi_moe_routes.py"
       - "tools/compare_kimi_logits.py"
+      - "tools/run_kimi_pruning_phase_a.py"
       - "tests/test_kimi_functional_pruning.py"
       - "tests/test_kimi_functional_suite.py"
       - "tests/data/kimi-functional-pruning-suite.json"
@@ -35,8 +36,11 @@ jobs:
           python -m py_compile tools/analyze_kimi_moe_trace.py
           python -m py_compile tools/compare_kimi_moe_routes.py
           python -m py_compile tools/compare_kimi_logits.py
+          python -m py_compile tools/run_kimi_pruning_phase_a.py
           python -m py_compile tests/test_kimi_functional_pruning.py
           python -m py_compile tests/test_kimi_functional_suite.py
+      - name: Phase A suite validation
+        run: python tools/run_kimi_pruning_phase_a.py --validate-only
       - name: C logits dump roundtrip
         shell: bash
         run: |

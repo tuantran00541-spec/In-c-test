@@ -1,0 +1,83 @@
+name: Real Kimi functional pruning phase A
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - ".github/workflows/kimi-functional-pruning-phase-a-real.yml"
+
+jobs:
+  phase-a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          python tools/run_kimi_pruning_phase_a.py --validate-only
+      - name: Pack official Kimi text with Q8 routed experts
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-full"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-full" \
+            --revision "$KIMI_REV" --expert-format q8
+          du -h "$RUNNER_TEMP/packed-full"/*.bin
+          df -h "$RUNNER_TEMP"
+      - name: Run next-token route and logit sensitivity sweep
+        run: |
+          python tools/run_kimi_pruning_phase_a.py \
+            --model-dir "$RUNNER_TEMP/packed-full" \
+            --binary ./build/kvl_generate \
+            --work-dir "$RUNNER_TEMP/phase-a" \
+            --cache-mib 512 --ram-mib 4096
+      - name: Print aggregate summary
+        if: always()
+        run: |
+          if test -s "$RUNNER_TEMP/phase-a/phase-a-summary.json"; then
+            python - <<'PY'
+          import json, os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'phase-a'/'phase-a-summary.json'
+          r=json.loads(p.read_text())
+          c=r['calibration']['coverage']
+          print(f"PHASE_A_COVERAGE seen_slots={c['seen_slots']}/{c['layer_expert_slots']} mean={c['seen_mean_per_layer']:.2f}/64")
+          for name,d in r['aggregate'].items():
+              print(
+                  f"PHASE_A_AGG variant={name} token_exact={d['first_token_exact']}/{d['prompts']} "
+                  f"route_sub={d['route_substitutions']} retention_min={d['route_min_selected_retention']:.6f} "
+                  f"argmax={d['logit_argmax_agree']}/{d['prompts']} max_abs={d['logit_max_abs_delta']:.9g} "
+                  f"max_js={d['logit_max_js_divergence']:.9g} topk_min={d['logit_min_topk_overlap']:.6f} "
+                  f"reads={d['cache_read_ops_total']} bytes_mib={d['cache_bytes_read_mib_total']:.2f}"
+              )
+          PY
+          else
+            echo "phase-a-summary.json not available"
+          fi
+      - name: Upload phase A evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-functional-pruning-phase-a-evidence
+          path: |
+            ${{ runner.temp }}/phase-a/**
+          if-no-files-found: warn
