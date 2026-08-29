@@ -5,6 +5,7 @@ on:
     branches:
       - research/v9-long-context
       - research/v9-long-context-parallel-prefill
+      - research/v9-two-turn-vi-chat
   workflow_dispatch:
 
 jobs:
@@ -23,12 +24,16 @@ jobs:
           cmake --build build-scalar --config Release -j 2
       - name: Scalar streaming-vs-materialized oracle
         run: ./build-scalar/kvl_mla_streaming_probe
+      - name: Scalar speculative block plus Q8 MLA lab gate
+        run: ./build-scalar/kvl_spec_q8_lab_probe
       - name: Build AVX2
         run: |
           cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
           cmake --build build-avx2 --config Release -j 2
       - name: AVX2 streaming-vs-materialized oracle
         run: ./build-avx2/kvl_mla_streaming_probe
+      - name: AVX2 speculative block plus Q8 MLA lab gate
+        run: ./build-avx2/kvl_spec_q8_lab_probe
 
   windows-msvc:
     runs-on: windows-latest
@@ -48,3 +53,6 @@ jobs:
       - name: MSVC streaming-vs-materialized oracle
         shell: pwsh
         run: .\build\Release\kvl_mla_streaming_probe.exe
+      - name: MSVC speculative block plus Q8 MLA lab gate
+        shell: pwsh
+        run: .\build\Release\kvl_spec_q8_lab_probe.exe
