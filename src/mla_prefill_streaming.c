@@ -49,7 +49,6 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
     const int KVO = R + DR;
     const int KHV = DN + DV;
     const int HO = NH * DV;
-    if (HO != H) return -1;
 
     float *latent_states = (float *)malloc((size_t)S * R * sizeof(float));
     float *rope_states = (float *)malloc((size_t)S * DR * sizeof(float));
@@ -60,13 +59,23 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
     float *katmp = (float *)malloc((size_t)KVO * sizeof(float));
     float *kvtmp = (float *)malloc((size_t)KHV * sizeof(float));
     float *qrope = (float *)malloc((size_t)DR * sizeof(float));
-    float *head_tmp = (float *)malloc((size_t)H * sizeof(float));
+    float *head_tmp = (float *)malloc((size_t)HO * sizeof(float));
+    float *head_states = NULL;
     double *value_acc = (double *)malloc((size_t)DV * sizeof(double));
+
+    /* Official Kimi has HO == H, so write concatenated heads directly into the
+     * caller's output and keep the long-context fast path at the same memory cost.
+     * Generic kernels may have HO != H; only those configurations allocate a
+     * fallback [S,HO] staging matrix before the H-wide output projection. */
+    if (HO != H)
+        head_states = (float *)malloc((size_t)S * HO * sizeof(float));
+    float *head_seq = (HO == H) ? out : head_states;
+
     if (!latent_states || !rope_states || !k_nope || !v_states || !scores ||
-        !qtmp || !katmp || !kvtmp || !qrope || !head_tmp || !value_acc) {
+        !qtmp || !katmp || !kvtmp || !qrope || !head_tmp || !value_acc || !head_seq) {
         free(latent_states); free(rope_states); free(k_nope); free(v_states);
         free(scores); free(qtmp); free(katmp); free(kvtmp); free(qrope);
-        free(head_tmp); free(value_acc);
+        free(head_tmp); free(head_states); free(value_acc);
         return -1;
     }
 
@@ -123,21 +132,22 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
                 for (int d = 0; d < DV; ++d)
                     value_acc[d] += p * (double)vj[d];
             }
-            float *ho = out + (size_t)t * H + (size_t)h * DV;
+            float *ho = head_seq + (size_t)t * HO + (size_t)h * DV;
             for (int d = 0; d < DV; ++d) ho[d] = (float)value_acc[d];
         }
     }
 
-    /* `out` currently stores concatenated head outputs. Preserve the input to
-     * o_proj with one token-sized copy so input/output never alias. */
+    /* Preserve one token's concatenated head vector because the official fast
+     * path aliases head_seq with out. o_proj is [H,HO], so generic HO != H is
+     * valid and matches the materialized reference implementation. */
     for (int t = 0; t < S; ++t) {
-        float *ot = out + (size_t)t * H;
-        memcpy(head_tmp, ot, (size_t)H * sizeof(float));
-        kvl_matvec_bf16(ot, head_tmp, w->o_proj, H, H);
+        const float *hs = head_seq + (size_t)t * HO;
+        memcpy(head_tmp, hs, (size_t)HO * sizeof(float));
+        kvl_matvec_bf16(out + (size_t)t * H, head_tmp, w->o_proj, HO, H);
     }
 
     free(latent_states); free(rope_states); free(k_nope); free(v_states);
     free(scores); free(qtmp); free(katmp); free(kvtmp); free(qrope);
-    free(head_tmp); free(value_acc);
+    free(head_tmp); free(head_states); free(value_acc);
     return 0;
 }
