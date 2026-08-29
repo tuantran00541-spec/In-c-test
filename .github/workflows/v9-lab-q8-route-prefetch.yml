@@ -1,0 +1,131 @@
+name: V9 lab Q8 next-layer expert prefetch
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - ".github/workflows/v9-lab-q8-route-prefetch.yml"
+      - "tools/patch_route_prefetch_diag.py"
+
+jobs:
+  q8-route-prefetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build baseline Q8 runtime
+        run: |
+          cmake -S . -B build-base -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-base -j 2
+          python tests/test_q8_matvec.py --build-dir build-base
+          cp build-base/kvl_generate_vl "$RUNNER_TEMP/kvl_generate_vl-base"
+
+      - name: Build attention-overlapped prefetch diagnostic
+        run: |
+          python tools/patch_route_prefetch_diag.py
+          cmake -S . -B build-prefetch -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON \
+            -DCMAKE_C_FLAGS=-pthread -DCMAKE_EXE_LINKER_FLAGS=-pthread
+          cmake --build build-prefetch -j 2
+          test -x build-prefetch/kvl_generate_vl
+
+      - name: Restore exact English V9 image
+        run: base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+
+      - name: Fetch pinned frontend and initial vision shard
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          root=os.path.join(os.environ['RUNNER_TEMP'],'model')
+          out=os.path.join(os.environ['RUNNER_TEMP'],'q8-runtime')
+          os.makedirs(root,exist_ok=True); os.makedirs(out,exist_ok=True)
+          for n in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+              shutil.copy2(p,os.path.join(out,n))
+          PY
+
+      - name: Pack full Q8 model once
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
+          python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
+          du -h "$RUNNER_TEMP/q8-runtime"/*.bin
+
+      - name: Baseline Q8 with 2048 MiB cache
+        run: |
+          prompt='Look at this image and answer only in English. Describe the character and facial expression in one short sentence.'
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" "$prompt" \
+            --vision-binary ./build-base/kvl_vision \
+            --generate-binary "$RUNNER_TEMP/kvl_generate_vl-base" \
+            --cache-mib 2048 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 --show-tokens \
+            2> >(tee "$RUNNER_TEMP/base.stderr" >&2) | tee "$RUNNER_TEMP/base.out"
+
+      - name: Q8 with n2 next-layer prefetch and 2048 MiB cache
+        run: |
+          prompt='Look at this image and answer only in English. Describe the character and facial expression in one short sentence.'
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" "$prompt" \
+            --vision-binary ./build-base/kvl_vision \
+            --generate-binary ./build-prefetch/kvl_generate_vl \
+            --cache-mib 2048 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 --show-tokens \
+            2> >(tee "$RUNNER_TEMP/prefetch.stderr" >&2) | tee "$RUNNER_TEMP/prefetch.out"
+
+      - name: Assert exact parity and summarize prefetch benchmark
+        run: |
+          python - <<'PY'
+          import os,re
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          expected=[1008,6162,924,4393,11,98717,11002,316,261,21478,528,54275,37632,11276,13,163586]
+          expected_text='The character has large, expressive eyes and a surprised or shocked facial expression.'
+          def parse(tag):
+              err=(root/f'{tag}.stderr').read_text(errors='replace')
+              out=(root/f'{tag}.out').read_text(errors='replace').strip()
+              m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m, tag
+              ids=[int(x) for x in m.group(1).split()]
+              assert ids==expected, (tag,ids)
+              assert out==expected_text, (tag,out)
+              cm=re.search(r'kvl_cache: slots=(\d+).*?evict=(\d+).*?reads=(\d+) bytes=([0-9.]+) MiB',err)
+              tm=re.search(r'timing vision=([0-9.]+)s first_text_token=([0-9.]+)s avg_next=([0-9.]+)s text_total=([0-9.]+)s',err)
+              assert cm and tm, tag
+              return dict(slots=int(cm.group(1)),evict=int(cm.group(2)),reads=int(cm.group(3)),bytes=float(cm.group(4)),first=float(tm.group(2)),next=float(tm.group(3)),total=float(tm.group(4)),err=err)
+          b=parse('base'); p=parse('prefetch')
+          lines=re.findall(r'kvl_route_prefetch: position=(\d+) batches=(\d+) loaded=(\d+) failed=(\d+)',p['err'])
+          assert lines, 'missing route-prefetch diagnostics'
+          batches=sum(int(x[1]) for x in lines); loaded=sum(int(x[2]) for x in lines); failed=sum(int(x[3]) for x in lines)
+          assert failed==0, failed
+          print('MODE SLOTS EVICT READS BYTES_MIB FIRST_S AVG_NEXT_S TOTAL_S')
+          print('BASE',b['slots'],b['evict'],b['reads'],f"{b['bytes']:.2f}",f"{b['first']:.3f}",f"{b['next']:.3f}",f"{b['total']:.3f}")
+          print('PREFETCH',p['slots'],p['evict'],p['reads'],f"{p['bytes']:.2f}",f"{p['first']:.3f}",f"{p['next']:.3f}",f"{p['total']:.3f}")
+          print(f'SPEC_BATCHES={batches} SPEC_LOADED={loaded} SPEC_FAILED={failed}')
+          print(f'FIRST_SPEEDUP={b["first"]/p["first"]:.4f}x')
+          print(f'NEXT_SPEEDUP={b["next"]/p["next"]:.4f}x')
+          print(f'TOTAL_SPEEDUP={b["total"]/p["total"]:.4f}x')
+          print(f'READ_CHANGE={100*(p["reads"]/b["reads"]-1):+.2f}%')
+          print(f'BYTE_CHANGE={100*(p["bytes"]/b["bytes"]-1):+.2f}%')
+          print('EXACT_TOKEN_PARITY=True')
+          PY
