@@ -1,4 +1,4 @@
-name: V9 lab real-weight Q8 expert oracle
+name: V9 lab real-weight Q8 MoE oracle
 
 on:
   workflow_dispatch:
@@ -8,10 +8,15 @@ on:
     paths:
       - "tools/pack_experts_q8.py"
       - "tests/test_real_q8_expert.py"
+      - "tests/test_real_q8_moe.py"
+      - "src/moe_probe.c"
+      - "src/q8_ops.c"
+      - "include/kvl/ops.h"
+      - "CMakeLists.txt"
       - ".github/workflows/v9-lab-real-q8-expert.yml"
 
 jobs:
-  real-q8-expert:
+  real-q8-moe:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -33,6 +38,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
           cmake --build build -j 2
           test -x build/kvl_q8_probe
+          test -x build/kvl_moe_probe
       - name: Fetch pinned model metadata and layer-1 shard
         run: |
           python - <<'PY'
@@ -42,11 +48,11 @@ jobs:
           for n in ('config.json','model.safetensors.index.json'):
               hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
           idx=json.load(open(os.path.join(root,'model.safetensors.index.json')))
-          prefix='language_model.model.layers.1.mlp.experts.'
+          prefix='language_model.model.layers.1.'
           shards=sorted({v for k,v in idx['weight_map'].items() if k.startswith(prefix)})
-          print('L1_EXPERT_SHARDS=',shards)
-          assert len(shards)==1,shards
-          hf_hub_download(repo,revision=rev,filename=shards[0],local_dir=root)
+          print('L1_SHARDS=',shards)
+          for shard in shards:
+              hf_hub_download(repo,revision=rev,filename=shard,local_dir=root)
           PY
       - name: Pack released layer-1 Q8 experts
         run: |
@@ -56,3 +62,6 @@ jobs:
       - name: Compare released expert 0 to Q8 C kernel
         run: |
           python tests/test_real_q8_expert.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8" --build-dir build --layer 1 --expert 0
+      - name: Compare released router top-6 routed plus shared MoE
+        run: |
+          python tests/test_real_q8_moe.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8" --build-dir build --layer 1
