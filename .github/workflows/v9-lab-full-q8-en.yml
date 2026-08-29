@@ -1,0 +1,108 @@
+name: V9 lab full Q8 expert image benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - ".github/workflows/v9-lab-full-q8-en.yml"
+
+jobs:
+  full-q8-en:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      REPO: moonshotai/Kimi-VL-A3B-Instruct
+      REV: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build Q8-aware runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x build/kvl_generate_vl
+          test -x build/kvl_vision
+      - name: Restore exact English acceptance image
+        run: base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+      - name: Fetch pinned frontend and initial vision shard
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from huggingface_hub import hf_hub_download
+          repo=os.environ['REPO']; rev=os.environ['REV']
+          root=os.path.join(os.environ['RUNNER_TEMP'],'model'); out=os.path.join(os.environ['RUNNER_TEMP'],'q8-runtime')
+          os.makedirs(root,exist_ok=True); os.makedirs(out,exist_ok=True)
+          for n in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+          for n in ('tiktoken.model','tokenizer_config.json','generation_config.json','chat_template.jinja','preprocessor_config.json'):
+              p=hf_hub_download(repo,revision=rev,filename=n,local_dir=root)
+              shutil.copy2(p,os.path.join(out,n))
+          PY
+      - name: Pack pinned BF16 vision plus full Q8-routed text model
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
+          python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
+          echo '===== Q8 PACK SIZES ====='
+          du -h "$RUNNER_TEMP/q8-runtime"/*.bin
+          python - <<'PY'
+          import pathlib, os
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'q8-runtime'/'experts.bin'
+          print('Q8_EXPERT_BYTES=',p.stat().st_size)
+          print('Q8_EXPERT_GIB=',p.stat().st_size/1024**3)
+          PY
+      - name: Generate from exact English V9 image prompt
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" \
+            "Look at this image and answer only in English. Describe the character and facial expression in one short sentence." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+            --show-tokens \
+            2> >(tee "$RUNNER_TEMP/q8-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/q8-output.txt"
+          test -s "$RUNNER_TEMP/q8-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-stderr.txt"
+          if grep -Eqi 'not (been )?provided|no image|cannot see (the )?image|image.*missing' "$RUNNER_TEMP/q8-output.txt"; then
+            echo 'Q8 output fell into missing-image semantics' >&2
+            exit 1
+          fi
+      - name: Compare Q8 generation to BF16 V9 baseline
+        run: |
+          python - <<'PY'
+          import os,re
+          from pathlib import Path
+          err=(Path(os.environ['RUNNER_TEMP'])/'q8-stderr.txt').read_text(errors='replace')
+          out=(Path(os.environ['RUNNER_TEMP'])/'q8-output.txt').read_text(errors='replace').strip()
+          m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m
+          ids=[int(x) for x in m.group(1).split()]
+          bf=[1008,6162,924,4393,11,98717,11002,316,261,21478,528,54275,37632,11276,13,163586]
+          prefix=0
+          for a,b in zip(ids,bf):
+              if a!=b: break
+              prefix+=1
+          print('Q8_OUTPUT=',repr(out))
+          print('Q8_IDS=',ids)
+          print('BF16_BASELINE_IDS=',bf)
+          print('Q8_BF16_PREFIX_MATCH=',prefix)
+          print('Q8_EXACT_TOKEN_MATCH=',ids==bf)
+          for pat in (r'kvl_cache:.*',r'\[kvl-vl\] timing.*',r'kvl_generate_vl: generated=.*'):
+              mm=re.search(pat,err)
+              if mm: print(mm.group(0))
+          PY
