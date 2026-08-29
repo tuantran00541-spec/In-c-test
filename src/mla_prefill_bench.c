@@ -7,12 +7,6 @@
 #include <string.h>
 #include <time.h>
 
-/* Synthetic latency probe for the exact long-context MLA prefill core.
- *
- * Keep official per-head dimensions and MLA latent rank, but use two heads and
- * H=256 so CI can sweep into the quadratic regime without downloading weights.
- * These timings are only for before/after kernel comparisons; they are not an
- * estimate of full 27-layer Kimi prompt latency. */
 enum { H = 256, NH = 2, DN = 128, DR = 64, DV = 128, R = 512 };
 enum { QD = DN + DR, QO = NH * QD, KVO = R + DR, KVB = NH * (DN + DV), HO = NH * DV };
 
@@ -95,7 +89,7 @@ int main(int argc, char **argv) {
     printf("mla_prefill_bench dims H=%d NH=%d DN=%d DR=%d DV=%d R=%d\n",
            H, NH, DN, DR, DV, R);
 
-    if (run_case(8, 0) != 0) return 1; /* initialize runtime/thread machinery. */
+    if (run_case(8, 0) != 0) return 1;
 
     if (argc == 1) {
         const int cases[] = {256, 512, 1024, 2048};

@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* src/ops.c is source-renamed on the long-context lab branch so the old path
- * remains linked as a numerical oracle. */
 int kvl_mla_prefill_materialized_bf16(float *out, const float *x, int seq_len,
                                       const KvlMlaConfig *cfg,
                                       const KvlMlaBF16 *w);
@@ -94,15 +92,13 @@ static int run_case(int seq_len, int dv) {
 int main(void) {
     const int cases[] = {1, 7, 64, 257};
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-        const int rc = run_case(cases[i], 8); /* HO == H: official-style fast path. */
+        const int rc = run_case(cases[i], 8);
         if (rc != 0) {
             fprintf(stderr, "mla_streaming_probe FAILED seq=%d dv=8 rc=%d\n", cases[i], rc);
             return 1;
         }
     }
 
-    /* Generic shape used by stack oracles: HO=NH*DV=8 while H=16. The old
-     * materialized kernel supports this because o_proj maps HO -> H. */
     const int generic_rc = run_case(7, 4);
     if (generic_rc != 0) {
         fprintf(stderr, "mla_streaming_probe FAILED seq=7 dv=4 rc=%d\n", generic_rc);

@@ -12,14 +12,6 @@
 #include <omp.h>
 #endif
 
-/* Long-context exact prefill path.
- *
- * The legacy implementation materializes Q, K and V for every token/head. This
- * implementation keeps only the shared MLA latent+RoPE prompt state plus one
- * head's K(no-PE)+V at a time. Query vectors are projected per token/head.
- * Attention math and causal masking remain dense and exact; this reduces the
- * temporary working set but intentionally does not claim sub-quadratic compute.
- */
 static void rope_interleaved_stream(float *dst, const float *raw, int dim,
                                     int position, float theta) {
     const int half = dim / 2;
@@ -36,9 +28,6 @@ static void rope_interleaved_stream(float *dst, const float *raw, int dim,
     }
 }
 
-/* Keep FP64 accumulation like the scalar/reference attention path. AVX2 only
- * changes how independent products are formed and reduced; quality gates below
- * decide whether the changed reduction order is acceptable. */
 static double dot_f32_f64(const float *a, const float *b, int n) {
 #ifdef KVL_USE_AVX2
     __m256d acc0 = _mm256_setzero_pd();
@@ -126,10 +115,6 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
     float *head_states = NULL;
     double *value_acc_all = (double *)malloc((size_t)worker_count * DV * sizeof(double));
 
-    /* Official Kimi has HO == H, so write concatenated heads directly into the
-     * caller's output and keep the long-context fast path at the same memory cost.
-     * Generic kernels may have HO != H; only those configurations allocate a
-     * fallback [S,HO] staging matrix before the H-wide output projection. */
     if (HO != H)
         head_states = (float *)malloc((size_t)S * HO * sizeof(float));
     float *head_seq = (HO == H) ? out : head_states;
@@ -143,8 +128,6 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
         return -1;
     }
 
-    /* Shared compressed prompt representation. It is independent of head, so
-     * compute it once instead of repeating kv_a projection for each head. */
     for (int t = 0; t < S; ++t) {
         const float *xt = x + (size_t)t * H;
         float *latent = latent_states + (size_t)t * R;
@@ -156,7 +139,7 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
 
     const float scale = 1.0f / sqrtf((float)QD);
     for (int h = 0; h < NH; ++h) {
-        /* kv_b rows for one head are contiguous: [DN no-PE key, DV value]. */
+
         const uint16_t *kv_head = w->kv_b_proj + (size_t)h * KHV * R;
         for (int j = 0; j < S; ++j) {
             const float *latent = latent_states + (size_t)j * R;
@@ -210,9 +193,6 @@ int kvl_mla_prefill_bf16(float *out, const float *x, int seq_len,
         }
     }
 
-    /* Preserve one token's concatenated head vector because the official fast
-     * path aliases head_seq with out. o_proj is [H,HO], so generic HO != H is
-     * valid and matches the materialized reference implementation. */
     for (int t = 0; t < S; ++t) {
         const float *hs = head_seq + (size_t)t * HO;
         memcpy(head_tmp, hs, (size_t)HO * sizeof(float));

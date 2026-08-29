@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Run a deterministic two-turn Kimi-VL chat and report per-turn latency.
 
-This is deliberately a benchmark driver, not a new conversation-state API. The image vision
-embedding is computed once and reused, while turn 2 launches the existing generator again and
-re-prefills the complete multimodal history. That distinction is printed in the result so the
-measured second-turn latency is not mistaken for persistent-KV chat latency.
-"""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +19,6 @@ EOS_ID = 163585
 IM_END_ID = 163586
 STOP_IDS = {EOS_ID, IM_END_ID}
 
-
 @dataclass
 class TurnResult:
     ids: list[int]
@@ -34,13 +27,11 @@ class TurnResult:
     avg_next: float
     total: float
 
-
 def _exe(name: str) -> str:
     if os.name == "nt":
         release = Path("build") / "Release" / f"{name}.exe"
         return str(release if release.exists() else Path("build") / f"{name}.exe")
     return str(Path("build") / name)
-
 
 def _body_before_stop(ids: list[int]) -> list[int]:
     out: list[int] = []
@@ -49,7 +40,6 @@ def _body_before_stop(ids: list[int]) -> list[int]:
             break
         out.append(token)
     return out
-
 
 def _plan_or_die(prompt_n: int, max_new: int, cache_mib: int, ram_mib: int, label: str) -> None:
     plan = planned_text_breakdown(prompt_n, max_new, cache_mib)
@@ -65,7 +55,6 @@ def _plan_or_die(prompt_n: int, max_new: int, cache_mib: int, ram_mib: int, labe
         f"cache_mib={as_mib(plan['expert_cache']):.2f}",
         flush=True,
     )
-
 
 def _run_turn(
     *,
@@ -117,7 +106,6 @@ def _run_turn(
     avg_next = sum(intervals) / len(intervals) if intervals else 0.0
     text = decode_generated(encoding, generated, STOP_IDS)
     return TurnResult(generated, text, first, avg_next, end - start)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Two-turn Vietnamese Kimi-VL benchmark")
@@ -202,9 +190,6 @@ def main() -> int:
             show_tokens=args.show_tokens,
         )
 
-        # Preserve the model's exact generated token body in history, then close the
-        # assistant turn with the released chat-template marker. This avoids a
-        # decode/re-encode round trip before asking the follow-up.
         turn1_body = _body_before_stop(turn1.ids)
         followup_markup = (
             f"<|im_user|>user<|im_middle|>{args.prompt2}<|im_end|>"
@@ -249,7 +234,6 @@ def main() -> int:
         f"text_both_turns={turn1.total + turn2.total:.3f}s wall_total={wall_total:.3f}s"
     )
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare the validated pinned Kimi-VL-A3B Q8 runtime with a bounded source-shard set.
 
-This is the recommended user-facing pack path for low-RAM machines. It downloads the exact
-validated checkpoint revision, packs MoonViT first, then streams text checkpoint shards through
-``pack_full_text.py``. Consumed source shards are deleted by default, so the whole seven-shard
-checkpoint does not need to coexist on disk with the packed runtime.
-
-Packed routed experts use the validated symmetric per-row Q8 format. Trunk, router, shared
-experts and vision/projector weights remain BF16.
-"""
 from __future__ import annotations
 
 import argparse
@@ -30,12 +21,10 @@ FRONTEND_FILES = (
     "preprocessor_config.json",
 )
 
-
 def run(*args: object) -> None:
     cmd = [str(x) for x in args]
     print("+", " ".join(cmd), flush=True)
     subprocess.run(cmd, check=True)
-
 
 def download(repo: str, revision: str, root: Path, name: str) -> Path:
     return Path(
@@ -46,7 +35,6 @@ def download(repo: str, revision: str, root: Path, name: str) -> Path:
             local_dir=str(root),
         )
     )
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -79,8 +67,6 @@ def main() -> int:
     index_path = download(args.repo, args.revision, work, "model.safetensors.index.json")
     weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
 
-    # Vision/projector tensors are one shard in the released checkpoint, but derive the set
-    # from the index instead of hard-coding model-00001 so this fails safely on a changed map.
     vision_shards = sorted(
         {
             shard
@@ -122,7 +108,6 @@ def main() -> int:
         args.revision,
     )
 
-    # Keep tiny source metadata beside the packed runtime for provenance/debugging.
     shutil.copy2(config_path, out / "config.json")
     shutil.copy2(index_path, out / "source_model.safetensors.index.json")
     (out / "SOURCE_REVISION.txt").write_text(args.revision + "\n", encoding="ascii")
@@ -151,7 +136,6 @@ def main() -> int:
         print("  consumed source shards were deleted as packing progressed")
     print("\nNext: python tools/kvl_vl_chat.py <runtime_dir> <image> <prompt> --temperature 0")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

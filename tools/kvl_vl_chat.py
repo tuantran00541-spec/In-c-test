@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""One-command V9 image + prompt frontend for the low-RAM C runtime.
 
-The vision phase and text phase run as separate subprocesses, so MoonViT working memory is
-released before the 27-layer text decoder starts. Runtime weights stay outside the git repo.
-"""
 from __future__ import annotations
 
 import argparse
@@ -21,13 +17,11 @@ from kvl_memory_plan import MIB, as_mib, planned_text_breakdown, planned_text_by
 EOS_ID = 163585
 IM_END_ID = 163586
 
-
 def _exe(name: str) -> str:
     if os.name == "nt":
         release = Path("build") / "Release" / f"{name}.exe"
         return str(release if release.exists() else Path("build") / f"{name}.exe")
     return str(Path("build") / name)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run image chat through MoonViT C + Kimi text C")
@@ -162,7 +156,6 @@ def main() -> int:
     if args.show_tokens:
         print("[kvl-vl] generated ids:", " ".join(map(str, generated)), file=sys.stderr)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

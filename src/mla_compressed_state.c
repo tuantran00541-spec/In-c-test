@@ -120,7 +120,6 @@ int kvl_mla_decode_compressed_bf16(float *out,
         const float *qh=qtmp+(size_t)h*QD;
         rope_interleaved_v6c(qrope,qh+DN,DR,position,cfg->rope_theta);
 
-        /* Absorb W_k into the current query: q_lat = W_k^T q_nope. */
         for(int r=0;r<R;++r){
             double acc=0.0;
             for(int d=0;d<DN;++d){

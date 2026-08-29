@@ -1,9 +1,3 @@
-/* Experimental exact multi-token target verifier for Draft & Verify.
- *
- * This translation unit deliberately includes the proven text generator so the lab
- * verifier reuses exactly the same constants, store access, MoE dispatch and prompt
- * prefill.  It is not wired into production generation yet.
- */
 #define main kvl_generate_text_entry_unused
 #include "generate.c"
 #undef main
@@ -69,15 +63,6 @@ static double vector_max_abs_lab(const float *a, const float *b, size_t n) {
     return m;
 }
 
-/* Evaluate `count` already-proposed tokens with the exact target model, but traverse
- * the model layer-major.  Each trunk/router/shared tensor is loaded once per layer for
- * the whole block instead of once per (token, layer).  Causal MLA appends the block in
- * token order inside each layer, so semantics match serial forward_token().
- *
- * next_ids[t] is the target argmax after consuming token_ids[t].  Thus for a draft
- * d[0..K-1], existing prefix logits verify d[0], next_ids[0] verifies d[1], and
- * next_ids[K-1] is the verifier's bonus prediction when all drafts are accepted.
- */
 static int forward_block_exact_lab(KvlTrunkStore *ts, KvlExpertCache *cache,
                                    KvlMlaCompressedState *states,
                                    const KvlTrunkTensor *emb,

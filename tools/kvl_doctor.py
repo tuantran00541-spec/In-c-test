@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Fast structural preflight for a packed Kimi-VL runtime.
 
-The doctor intentionally does not mmap/load model tensors. It checks the packed files, index
-magic, pinned source revision (when recorded), and native image/text executables so users can
-catch incomplete downloads/builds before starting a slow CPU inference run.
-"""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +8,6 @@ from pathlib import Path
 
 PINNED_REVISION = "398eede0903cd983a2bfa0cc634e9ac1d843f375"
 
-
 def binary_path(build_dir: Path, name: str) -> Path:
     if os.name == "nt":
         release = build_dir / "Release" / f"{name}.exe"
@@ -21,11 +15,9 @@ def binary_path(build_dir: Path, name: str) -> Path:
         return release if release.is_file() else flat
     return build_dir / name
 
-
 def read_magic(path: Path) -> bytes:
     with path.open("rb") as f:
         return f.read(8)
-
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Check a packed Kimi-VL Q8 runtime before inference")
@@ -88,7 +80,6 @@ def main() -> int:
         print(f"  binary: {p}")
     print("PASS: runtime structure and native binaries look ready for inference")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

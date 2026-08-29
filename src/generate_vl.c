@@ -1,10 +1,3 @@
-/* V9 multimodal generator.
- *
- * Reuse the proven V8 decoder implementation, but initialize the prompt hidden-state matrix
- * from a mixture of BF16 token embeddings and one projected image embedding per media-pad.
- * The complete multimodal prompt then follows the same layer-major batch prefill as text-only
- * V8, so each trunk tensor is loaded once per layer rather than once per token.
- */
 #define main kvl_generate_text_entry_unused
 #include "generate.c"
 #undef main
@@ -26,9 +19,6 @@ static int read_media_f32(const char *path, float **out, int count) {
     return 0;
 }
 
-/* Released Kimi-VL uses BF16 image features and casts text embeddings to that dtype before
- * replacing media-pad positions. Keep FP32 runtime activations, but round projector output to
- * an IEEE BF16 value at exactly that multimodal boundary. */
 static float v9_round_bf16(float x) {
     uint32_t u;
     memcpy(&u, &x, sizeof u);

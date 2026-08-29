@@ -148,16 +148,6 @@ static int forward_token(KvlTrunkStore *ts, KvlExpertCache *cache,
     return 0;
 }
 
-/* V8 prompt prefill is layer-major rather than token-major. Every trunk tensor is loaded
- * once per layer for the complete prompt, causal MLA runs as a batch, and routed experts are
- * evaluated token-by-token while staying within the same layer so the LRU can reuse recurring
- * experts. The resulting compressed MLA histories are then used by the unchanged V6 decode
- * path for newly generated tokens.
- *
- * Long-context V9 reuses exactly three full [seq,H] FP32 matrices. work_a changes role from
- * input-norm output to post-attention norm, work_b changes from attention output to the
- * attention residual, and x is overwritten by the MLP only after the old layer input is no
- * longer needed. This keeps the arithmetic order unchanged while halving sequence workspace. */
 static int prefill_prompt(KvlTrunkStore *ts, KvlExpertCache *cache,
                           KvlMlaCompressedState *states,
                           const KvlTrunkTensor *emb,

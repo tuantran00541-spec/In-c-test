@@ -1,19 +1,3 @@
-/* Kimi-specific self-speculative decoding lab.
- *
- * Draft path:
- *   - starts from the exact target prefix logits (first token is therefore free/exact),
- *   - uses the experimental INT8 MLA history for subsequent draft tokens,
- *   - optionally skips only the routed-expert contribution on selected MoE layers,
- *     while retaining the shared expert.  This targets SSD expert traffic without
- *     throwing away the whole MLP sublayer.
- *
- * Verify path:
- *   - always uses the exact FP32 compressed MLA target state,
- *   - verifies the complete draft block layer-major,
- *   - rolls back and commits the target correction/bonus token exactly.
- *
- * This is a benchmark/probe only.  Production generation remains unchanged.
- */
 #define _POSIX_C_SOURCE 200809L
 #define main kvl_generate_text_entry_unused
 #include "generate.c"
@@ -238,7 +222,6 @@ static int draft_forward_q8_lab(KvlTrunkStore *ts, KvlExpertCache *cache,
     return 0;
 }
 
-/* Exact target block evaluator copied from the already-gated verifier. */
 static int exact_block_lab(KvlTrunkStore *ts, KvlExpertCache *cache,
                            KvlMlaCompressedState *states,
                            const KvlTrunkTensor *emb,

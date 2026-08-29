@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch small official tokenizer/frontend assets into an already-packed runtime directory."""
+
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,6 @@ FILES = (
     "preprocessor_config.json",
 )
 
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
@@ -32,7 +31,6 @@ def main() -> None:
         dst = out / name
         shutil.copy2(src, dst)
         print(f"runtime asset: {dst} ({dst.stat().st_size} bytes) revision={args.revision}")
-
 
 if __name__ == "__main__":
     main()
