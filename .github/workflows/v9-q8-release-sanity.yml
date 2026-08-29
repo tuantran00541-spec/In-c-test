@@ -55,5 +55,5 @@ jobs:
         run: |
           python tests/test_q8_matvec.py --build-dir build
           python -m py_compile tools/pack_experts_q8.py tools/pack_full_text.py tools/pack_full_model.py
-          $help = python tools/pack_full_model.py --help
-          if ($help -notmatch '--expert-format') { throw 'missing --expert-format' }
+          $helpText = (python tools/pack_full_model.py --help) -join "`n"
+          if ($helpText -notmatch '--expert-format') { throw 'missing --expert-format' }
