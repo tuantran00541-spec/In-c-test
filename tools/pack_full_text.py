@@ -5,6 +5,9 @@ Downloads checkpoint shards in filename order, keeps only shards still needed to
 layer that crosses a shard boundary, appends runtime trunk/expert records, then deletes
 consumed source shards. The released Kimi-VL-A3B checkpoint needs at most two adjacent
 ~5 GB source shards simultaneously.
+
+Lab-only `--expert-format q8` keeps trunk/shared/router weights BF16 while packing routed
+experts with tools/pack_experts_q8.py.
 """
 from __future__ import annotations
 import argparse, json, pathlib, subprocess, sys
@@ -17,7 +20,7 @@ def dl(repo,rev,root,name): return pathlib.Path(hf_hub_download(repo_id=repo,rev
 def run(cmd): print('+',' '.join(map(str,cmd)),flush=True);subprocess.run(list(map(str,cmd)),check=True)
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('work_dir',type=pathlib.Path);ap.add_argument('out_dir',type=pathlib.Path);ap.add_argument('--repo',default=REPO);ap.add_argument('--revision',default='main');ap.add_argument('--keep-source-shards',action='store_true');ap.add_argument('--max-layer',type=int,default=None);args=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('work_dir',type=pathlib.Path);ap.add_argument('out_dir',type=pathlib.Path);ap.add_argument('--repo',default=REPO);ap.add_argument('--revision',default='main');ap.add_argument('--keep-source-shards',action='store_true');ap.add_argument('--max-layer',type=int,default=None);ap.add_argument('--expert-format',choices=('bf16','q8'),default='bf16');args=ap.parse_args()
     args.work_dir.mkdir(parents=True,exist_ok=True);args.out_dir.mkdir(parents=True,exist_ok=True)
     dl(args.repo,args.revision,args.work_dir,'config.json');idxp=dl(args.repo,args.revision,args.work_dir,'model.safetensors.index.json')
     cfg=json.loads((args.work_dir/'config.json').read_text())['text_config'];wm=json.loads(idxp.read_text())['weight_map'];n_layers=int(cfg['num_hidden_layers']);max_layer=n_layers-1 if args.max_layer is None else min(args.max_layer,n_layers-1)
@@ -27,10 +30,11 @@ def main():
         if not names:raise SystemExit(f'no tensors for layer {L}')
         layer_req[L]={wm[n] for n in names}
     global_req={g:wm[n] for g,n in GLOBALS.items()};all_shards=sorted(set().union(*layer_req.values(),set(global_req.values())))
-    print('source shard order:',all_shards)
+    print('source shard order:',all_shards);print('expert format:',args.expert_format)
     for L in range(max_layer+1):print(f'  L{L:02d}: {sorted(layer_req[L])}')
     print('  globals:',global_req)
     here=pathlib.Path(__file__).resolve().parent;done_layers=set();done_globals=set();loaded=set()
+    expert_packer=here/('pack_experts_q8.py' if args.expert_format=='q8' else 'pack_experts.py')
     def ta():return ['--append'] if (args.out_dir/'trunk.idx').exists() else []
     def ea():return ['--append'] if (args.out_dir/'experts.idx').exists() else []
     for si,shard in enumerate(all_shards,1):
@@ -44,7 +48,7 @@ def main():
             for L in range(max_layer+1):
                 if L in done_layers or not layer_req[L].issubset(loaded):continue
                 run([sys.executable,here/'pack_trunk.py',args.work_dir,args.out_dir,'--layers',str(L),*ta()])
-                if L>=int(cfg['first_k_dense_replace']):run([sys.executable,here/'pack_experts.py',args.work_dir,args.out_dir,'--layer',str(L),*ea()])
+                if L>=int(cfg['first_k_dense_replace']):run([sys.executable,expert_packer,args.work_dir,args.out_dir,'--layer',str(L),*ea()])
                 done_layers.add(L);progress=True;print(f'completed layer {L}; {len(done_layers)}/{max_layer+1} layers packed',flush=True)
         if not args.keep_source_shards:
             still=set()
