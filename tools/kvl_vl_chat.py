@@ -37,6 +37,10 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--show-tokens", action="store_true")
+    ap.add_argument(
+        "--prompt-ids-out",
+        help="optional research/debug path to persist the exact multimodal prompt token ids",
+    )
     args = ap.parse_args()
 
     if args.cache_mib <= 0 or args.ram_mib <= 0 or args.max_new <= 0:
@@ -75,6 +79,10 @@ def main() -> int:
             raise SystemExit(
                 f"media token expansion mismatch: expected {media_tokens}, encoded {actual_media}"
             )
+        if args.prompt_ids_out:
+            research_ids = Path(args.prompt_ids_out)
+            research_ids.parent.mkdir(parents=True, exist_ok=True)
+            research_ids.write_text("\n".join(map(str, prompt_ids)) + "\n", encoding="ascii")
 
         plan = planned_text_breakdown(len(prompt_ids), args.max_new, args.cache_mib)
         planned = plan["total"]
