@@ -37,7 +37,7 @@ jobs:
           cmake --build build -j 2
           test -x build/kvl_generate_vl
           test -x build/kvl_vision
-          ./build/kvl_q8_probe
+          python tests/test_q8_matvec.py --build-dir build
       - name: Restore exact V9 acceptance images
         run: |
           base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
