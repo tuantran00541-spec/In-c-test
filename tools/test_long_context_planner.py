@@ -2,16 +2,14 @@
 """Synthetic long-context RAM-planner regression checks; allocates no model tensors."""
 from __future__ import annotations
 
-from kvl_vl_chat import MIB, planned_text_breakdown
+from kvl_memory_plan import MIB, planned_text_breakdown
 
 
 def main() -> int:
-    rows: list[tuple[int, int, float]] = []
     for context in (8192, 16384, 32768):
         for cache_mib in (512, 1024, 1536, 2048):
             plan = planned_text_breakdown(context, 32, cache_mib)
             total_mib = plan["total"] / MIB
-            rows.append((context, cache_mib, total_mib))
             print(
                 f"plan context={context} cache={cache_mib} total={total_mib:.2f} MiB "
                 f"state={plan['compressed_state']/MIB:.2f} "
