@@ -1,4 +1,4 @@
-name: V9 lab full Q8 expert image benchmark
+name: V9 Q8 merge gate EN plus VI
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
       - ".github/workflows/v9-lab-full-q8-en.yml"
 
 jobs:
-  full-q8-en:
+  q8-merge-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -31,14 +31,17 @@ jobs:
         run: |
           python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken
           python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-      - name: Build Q8-aware runtime
+      - name: Build and run Q8 kernel sanity
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
           cmake --build build -j 2
           test -x build/kvl_generate_vl
           test -x build/kvl_vision
-      - name: Restore exact English acceptance image
-        run: base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+          ./build/kvl_q8_probe
+      - name: Restore exact V9 acceptance images
+        run: |
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/user-en.jpg"
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/user-vi.jpg"
       - name: Fetch pinned frontend and initial vision shard
         run: |
           python - <<'PY'
@@ -57,15 +60,15 @@ jobs:
         run: |
           python tools/pack_vision.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime"
           python tools/pack_full_text.py "$RUNNER_TEMP/model" "$RUNNER_TEMP/q8-runtime" --revision "$REV" --expert-format q8
-          echo '===== Q8 PACK SIZES ====='
-          du -h "$RUNNER_TEMP/q8-runtime"/*.bin
           python - <<'PY'
           import pathlib, os
           p=pathlib.Path(os.environ['RUNNER_TEMP'])/'q8-runtime'/'experts.bin'
+          gib=p.stat().st_size/1024**3
           print('Q8_EXPERT_BYTES=',p.stat().st_size)
-          print('Q8_EXPERT_GIB=',p.stat().st_size/1024**3)
+          print('Q8_EXPERT_GIB=',gib)
+          assert gib < 14.0
           PY
-      - name: Generate from exact English V9 image prompt
+      - name: Generate exact English V9 acceptance case
         run: |
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" \
             "Look at this image and answer only in English. Describe the character and facial expression in one short sentence." \
@@ -73,36 +76,63 @@ jobs:
             --generate-binary ./build/kvl_generate_vl \
             --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
             --show-tokens \
-            2> >(tee "$RUNNER_TEMP/q8-stderr.txt" >&2) \
-            | tee "$RUNNER_TEMP/q8-output.txt"
-          test -s "$RUNNER_TEMP/q8-output.txt"
-          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-stderr.txt"
-          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-stderr.txt"
-          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-stderr.txt"
-          if grep -Eqi 'not (been )?provided|no image|cannot see (the )?image|image.*missing' "$RUNNER_TEMP/q8-output.txt"; then
-            echo 'Q8 output fell into missing-image semantics' >&2
+            2> >(tee "$RUNNER_TEMP/q8-en-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/q8-en-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-en-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-en-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-en-stderr.txt"
+          if grep -Eqi 'not (been )?provided|no image|cannot see (the )?image|image.*missing' "$RUNNER_TEMP/q8-en-output.txt"; then
+            echo 'Q8 EN output fell into missing-image semantics' >&2
             exit 1
           fi
-      - name: Compare Q8 generation to BF16 V9 baseline
+      - name: Assert exact English BF16 token parity
         run: |
           python - <<'PY'
           import os,re
           from pathlib import Path
-          err=(Path(os.environ['RUNNER_TEMP'])/'q8-stderr.txt').read_text(errors='replace')
-          out=(Path(os.environ['RUNNER_TEMP'])/'q8-output.txt').read_text(errors='replace').strip()
+          err=(Path(os.environ['RUNNER_TEMP'])/'q8-en-stderr.txt').read_text(errors='replace')
+          out=(Path(os.environ['RUNNER_TEMP'])/'q8-en-output.txt').read_text(errors='replace').strip()
           m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m
           ids=[int(x) for x in m.group(1).split()]
           bf=[1008,6162,924,4393,11,98717,11002,316,261,21478,528,54275,37632,11276,13,163586]
-          prefix=0
-          for a,b in zip(ids,bf):
-              if a!=b: break
-              prefix+=1
-          print('Q8_OUTPUT=',repr(out))
-          print('Q8_IDS=',ids)
-          print('BF16_BASELINE_IDS=',bf)
-          print('Q8_BF16_PREFIX_MATCH=',prefix)
-          print('Q8_EXACT_TOKEN_MATCH=',ids==bf)
-          for pat in (r'kvl_cache:.*',r'\[kvl-vl\] timing.*',r'kvl_generate_vl: generated=.*'):
+          print('EN_Q8_OUTPUT=',repr(out))
+          print('EN_Q8_IDS=',ids)
+          print('EN_Q8_EXACT_BF16_MATCH=',ids==bf)
+          assert ids==bf
+          assert out == 'The character has large, expressive eyes and a surprised or shocked facial expression.'
+          for pat in (r'kvl_cache:.*',r'\[kvl-vl\] timing.*'):
               mm=re.search(pat,err)
-              if mm: print(mm.group(0))
+              if mm: print('EN_'+mm.group(0))
+          PY
+      - name: Generate exact Vietnamese V9 acceptance case
+        run: |
+          python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-vi.jpg" \
+            "Hãy nhìn ảnh này và trả lời hoàn toàn bằng tiếng Việt. Mô tả ngắn gọn nhân vật và biểu cảm trong ảnh trong một câu." \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --cache-mib 512 --ram-mib 4096 --max-new 16 --temperature 0 --seed 1 \
+            --show-tokens \
+            2> >(tee "$RUNNER_TEMP/q8-vi-stderr.txt" >&2) \
+            | tee "$RUNNER_TEMP/q8-vi-output.txt"
+          grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-vi-stderr.txt"
+          grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-vi-stderr.txt"
+          grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-vi-stderr.txt"
+      - name: Assert Q8 preserves exact Vietnamese BF16 trajectory
+        run: |
+          python - <<'PY'
+          import os,re
+          from pathlib import Path
+          err=(Path(os.environ['RUNNER_TEMP'])/'q8-vi-stderr.txt').read_text(errors='replace')
+          out=(Path(os.environ['RUNNER_TEMP'])/'q8-vi-output.txt').read_text(errors='replace').strip()
+          m=re.search(r'generated ids:\s*([0-9 ]+)',err); assert m
+          ids=[int(x) for x in m.group(1).split()]
+          bf=[39,150340,13271,118,96,42955,437,16032,104,77,650,47766,64,124397,275,4313]
+          print('VI_Q8_OUTPUT=',repr(out))
+          print('VI_Q8_IDS=',ids)
+          print('VI_Q8_EXACT_BF16_MATCH=',ids==bf)
+          print('NOTE=This is a quantization-preservation gate, not a semantic-VI acceptance pass.')
+          assert ids==bf
+          for pat in (r'kvl_cache:.*',r'\[kvl-vl\] timing.*'):
+              mm=re.search(pat,err)
+              if mm: print('VI_'+mm.group(0))
           PY
