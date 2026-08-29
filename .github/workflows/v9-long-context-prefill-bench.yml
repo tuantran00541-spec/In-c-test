@@ -1,0 +1,40 @@
+name: V9 long-context prefill benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-long-context
+    paths:
+      - ".github/workflows/v9-long-context-prefill-bench.yml"
+      - "src/mla_prefill_bench.c"
+      - "src/mla_prefill_streaming.c"
+      - "CMakeLists.txt"
+
+jobs:
+  linux-avx2:
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AVX2 benchmark
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build --config Release -j 2 --target kvl_mla_prefill_bench
+      - name: Measure exact streaming prefill scaling
+        run: ./build/kvl_mla_prefill_bench 256 512 1024 2048
+
+  windows-msvc-avx2:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build MSVC AVX2 benchmark
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DKVL_USE_AVX2=ON
+          cmake --build build --config Release --target kvl_mla_prefill_bench
+      - name: Measure exact streaming prefill scaling
+        shell: pwsh
+        run: .\build\Release\kvl_mla_prefill_bench.exe 256 512 1024 2048
