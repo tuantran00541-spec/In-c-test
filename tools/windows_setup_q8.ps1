@@ -23,22 +23,22 @@ Set-Location $RepoRoot
 $Venv = Join-Path $RepoRoot ".venv"
 $Py = Join-Path $Venv "Scripts\python.exe"
 if (-not (Test-Path $Py)) {
-    Write-Host "[1/5] Creating Python virtual environment at $Venv"
+    Write-Host "[1/6] Creating Python virtual environment at $Venv"
     python -m venv $Venv
 }
 
-Write-Host "[2/5] Installing Python dependencies"
+Write-Host "[2/6] Installing Python dependencies"
 & $Py -m pip install --upgrade pip
 & $Py -m pip install --index-url https://download.pytorch.org/whl/cpu torch
 & $Py -m pip install -r requirements-user.txt
 
-Write-Host "[3/5] Configuring native C runtime"
+Write-Host "[3/6] Configuring native C runtime"
 cmake -S . -B build -DKVL_USE_AVX2=ON
 
-Write-Host "[4/5] Building Release binaries"
+Write-Host "[4/6] Building Release binaries"
 cmake --build build --config Release --parallel $BuildJobs
 
-Write-Host "[5/5] Downloading and packing pinned Kimi-VL Q8 runtime"
+Write-Host "[5/6] Downloading and packing pinned Kimi-VL Q8 runtime"
 $PrepareArgs = @(
     "tools/prepare_kimi_vl_q8.py",
     $WorkDir,
@@ -48,6 +48,9 @@ if ($KeepSourceShards) {
     $PrepareArgs += "--keep-source-shards"
 }
 & $Py @PrepareArgs
+
+Write-Host "[6/6] Running packed-runtime preflight"
+& $Py tools/kvl_doctor.py $RuntimeDir --build-dir build
 
 $RuntimeAbs = (Resolve-Path $RuntimeDir).Path
 Write-Host ""
