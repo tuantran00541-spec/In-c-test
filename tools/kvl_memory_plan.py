@@ -18,9 +18,9 @@ MIB = 1024 * 1024
 # Global tensors held for the complete text phase: embedding, lm_head, final RMSNorm.
 GLOBAL_BF16_BYTES = 2 * (163840 * HIDDEN * BF16_BYTES) + HIDDEN * BF16_BYTES
 
-# Current layer-major decoder owns six [prompt,H] FP32 matrices. Keep this explicit until
-# the separate buffer-reuse optimization lands.
-LAYER_MAJOR_PROMPT_BUFFERS = 6
+# Long-context prefill aliases r1->attn, n2->n1 and y->x once each source value is dead,
+# so only three [prompt,H] FP32 matrices are simultaneously allocated.
+LAYER_MAJOR_PROMPT_BUFFERS = 3
 
 # Largest simultaneously-loaded non-expert trunk block is layer-0 dense gate/up/down.
 PEAK_LAYER_BF16_BYTES = 3 * DENSE_INTERMEDIATE * HIDDEN * BF16_BYTES
