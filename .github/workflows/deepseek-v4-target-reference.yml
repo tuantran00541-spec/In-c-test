@@ -1,0 +1,24 @@
+name: DeepSeek V4 target reference gate
+
+on:
+  push:
+    branches:
+      - research/deepseek-v4-flash-0731
+    paths:
+      - tools/dsv4_reference_gate.sh
+      - tools/dsv4_strong_prompt.sh
+      - .github/workflows/deepseek-v4-target-reference.yml
+  workflow_dispatch:
+
+jobs:
+  target-reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: bash -n tools/dsv4_reference_gate.sh tools/dsv4_strong_prompt.sh
+      - name: Pinned DeepSeek target decoder tests
+        env:
+          DSV4_REF_JOBS: "2"
+        run: bash tools/dsv4_reference_gate.sh build-dsv4-reference
