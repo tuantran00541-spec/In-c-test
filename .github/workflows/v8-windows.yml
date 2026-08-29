@@ -10,6 +10,8 @@ on:
       - "src/trunk_store.c"
       - "src/expert_cache.c"
       - "src/ops.c"
+      - "src/mla_prefill_streaming.c"
+      - "src/mla_streaming_probe.c"
       - "src/mla_state.c"
       - "src/mla_compressed_state.c"
       - "src/vision.c"
