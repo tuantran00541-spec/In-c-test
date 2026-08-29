@@ -1,0 +1,174 @@
+name: Real Kimi functional pruning experiment
+
+# Expensive official-weight calibration + held-out logical-mask sweep.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - ".github/workflows/kimi-functional-pruning-real.yml"
+
+jobs:
+  real-functional-pruning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+      - name: Pack official Kimi text with Q8 routed experts
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-full"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-full" \
+            --revision "$KIMI_REV" --expert-format q8
+          du -h "$RUNNER_TEMP/packed-full"/*.bin
+          df -h "$RUNNER_TEMP"
+      - name: Collect functional calibration traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/calibration"
+          prompts=(
+            "Explain in one short sentence why leaves are usually green."
+            "What is 24 multiplied by 13? Reply with only the integer."
+            "Translate 'A small cat is sleeping.' into Vietnamese. Reply with only the translation."
+            "Trả lời bằng một câu ngắn: Vì sao nước đóng băng khi đủ lạnh?"
+            "In C, what keyword exits a loop immediately? Reply with only the keyword."
+          )
+          i=0
+          for prompt in "${prompts[@]}"; do
+            i=$((i+1))
+            echo "=== calibration $i: $prompt"
+            KVL_MOE_TRACE="$RUNNER_TEMP/calibration/p${i}.tsv" \
+              python tools/kvl_chat.py "$RUNNER_TEMP/packed-full" "$prompt" \
+                --binary ./build/kvl_generate \
+                --cache-mib 512 --ram-mib 4096 --max-new 8 --temperature 0 --seed 1 \
+                --show-tokens \
+                > "$RUNNER_TEMP/calibration/p${i}.out" \
+                2> "$RUNNER_TEMP/calibration/p${i}.err"
+            test -s "$RUNNER_TEMP/calibration/p${i}.tsv"
+          done
+      - name: Build saliency report and 62/60/58 masks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/analyze_kimi_moe_trace.py \
+            "$RUNNER_TEMP"/calibration/*.tsv \
+            --n-experts 64 --keep 62 60 58 \
+            --out-dir "$RUNNER_TEMP/functional-analysis" \
+            --coactivation-top 20
+          python - <<'PY'
+          import json, os, pathlib, statistics
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'functional-analysis'
+          r=json.loads((root/'report.json').read_text())
+          coverage=[]
+          for layer,data in sorted(r['layers'].items(), key=lambda kv:int(kv[0])):
+              seen=sum(1 for e in data['experts'] if e['selected']>0)
+              coverage.append(seen)
+              lowest=data['prune_order_low_to_high'][:6]
+              print(f'LAYER {layer}: events={data["events"]} seen={seen}/64 lowest6={lowest}')
+          print(f'COVERAGE layers={len(coverage)} min={min(coverage)} mean={statistics.mean(coverage):.2f} max={max(coverage)}')
+          for keep in (62,60,58):
+              print(f'MASK keep={keep} lines=', sum(1 for x in (root/f'mask-keep{keep}.txt').read_text().splitlines() if x and not x.startswith('#')))
+          PY
+      - name: Run held-out full vs 62/60/58 deterministic sweep
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/functional-results"
+          prompts=(
+            "What is 37 + 58? Reply with only the integer."
+            "What is the capital of France? Reply with only the city name."
+            "Translate 'Water is cold.' into Vietnamese. Reply with only the translation."
+            "Trả lời bằng đúng một từ: trái nghĩa của 'cao' là gì?"
+          )
+          for variant in full 62 60 58; do
+            echo "===== VARIANT $variant ====="
+            i=0
+            for prompt in "${prompts[@]}"; do
+              i=$((i+1))
+              echo "--- prompt $i: $prompt"
+              if [[ "$variant" == full ]]; then
+                python tools/kvl_chat.py "$RUNNER_TEMP/packed-full" "$prompt" \
+                  --binary ./build/kvl_generate \
+                  --cache-mib 512 --ram-mib 4096 --max-new 8 --temperature 0 --seed 1 \
+                  --show-tokens \
+                  > >(tee "$RUNNER_TEMP/functional-results/${variant}-p${i}.out") \
+                  2> >(tee "$RUNNER_TEMP/functional-results/${variant}-p${i}.err" >&2)
+              else
+                KVL_MOE_MASK="$RUNNER_TEMP/functional-analysis/mask-keep${variant}.txt" \
+                  python tools/kvl_chat.py "$RUNNER_TEMP/packed-full" "$prompt" \
+                    --binary ./build/kvl_generate \
+                    --cache-mib 512 --ram-mib 4096 --max-new 8 --temperature 0 --seed 1 \
+                    --show-tokens \
+                    > >(tee "$RUNNER_TEMP/functional-results/${variant}-p${i}.out") \
+                    2> >(tee "$RUNNER_TEMP/functional-results/${variant}-p${i}.err" >&2)
+              fi
+            done
+          done
+      - name: Compare tokens and simple held-out quality checks
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'functional-results'
+          def ids(v,i):
+              text=(root/f'{v}-p{i}.err').read_text()
+              m=re.search(r'\[kvl\] generated ids:\s*([^\n]+)',text)
+              if not m: raise SystemExit(f'missing generated ids {v} p{i}')
+              return [int(x) for x in m.group(1).split()]
+          def out(v,i): return (root/f'{v}-p{i}.out').read_text().strip()
+          checks=(
+              lambda s: re.search(r'\b95\b',s) is not None,
+              lambda s: 'paris' in s.lower(),
+              lambda s: 'nước' in s.lower() and 'lạnh' in s.lower(),
+              lambda s: 'thấp' in s.lower(),
+          )
+          for i in range(1,5):
+              base=ids('full',i)
+              print(f'PROMPT {i} baseline_ids={base} baseline_out={out("full",i)!r}')
+              for v in ('62','60','58'):
+                  cur=ids(v,i)
+                  lcp=0
+                  for a,b in zip(base,cur):
+                      if a!=b: break
+                      lcp+=1
+                  print(f'  {v}: exact={cur==base} lcp={lcp}/{min(len(base),len(cur))} quality={checks[i-1](out(v,i))} out={out(v,i)!r}')
+          for v in ('full','62','60','58'):
+              passed=sum(checks[i-1](out(v,i)) for i in range(1,5))
+              print(f'QUALITY_SUMMARY variant={v} passed={passed}/4')
+          if sum(checks[i-1](out('full',i)) for i in range(1,5)) < 3:
+              raise SystemExit('baseline held-out sanity unexpectedly weak')
+          print('FUNCTIONAL_PRUNING_REAL_COMPLETE')
+          PY
+      - name: Upload pruning evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-functional-pruning-evidence
+          path: |
+            ${{ runner.temp }}/calibration/*.tsv
+            ${{ runner.temp }}/calibration/*.out
+            ${{ runner.temp }}/functional-analysis/*
+            ${{ runner.temp }}/functional-results/*
+          if-no-files-found: warn

@@ -4,6 +4,9 @@
 Trace rows come from the Q8 runtime when KVL_MOE_TRACE is set:
   event layer expert router_weight output_l2 saliency
 
+Multiple trace files are accepted. Event ids are namespaced by file because each
+kvl_generate process starts its local event counter from one.
+
 The first pruning score is deliberately simple and reproducible: total
 abs(router_weight) * ||expert_output||_2 over the calibration trace. Experts
 never selected on the calibration set therefore receive score zero. Masks are
@@ -18,7 +21,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-def parse_trace(path: Path):
+def parse_trace(path: Path, source_id: int):
     rows = []
     with path.open("r", encoding="utf-8") as f:
         for lineno, raw in enumerate(f, 1):
@@ -28,10 +31,11 @@ def parse_trace(path: Path):
             parts = line.split()
             if len(parts) != 6:
                 raise ValueError(f"{path}:{lineno}: expected 6 columns, got {len(parts)}")
-            event, layer, expert = map(int, parts[:3])
+            local_event, layer, expert = map(int, parts[:3])
             router_weight, output_l2, saliency = map(float, parts[3:])
-            if event <= 0 or layer < 0 or expert < 0:
+            if local_event <= 0 or layer < 0 or expert < 0:
                 raise ValueError(f"{path}:{lineno}: invalid event/layer/expert")
+            event = (source_id << 32) | local_event
             rows.append((event, layer, expert, router_weight, output_l2, saliency))
     if not rows:
         raise ValueError(f"{path}: no trace rows")
@@ -135,7 +139,7 @@ def write_mask(path: Path, keep: int, n_experts: int, disabled):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("trace", type=Path)
+    ap.add_argument("trace", type=Path, nargs="+")
     ap.add_argument("--n-experts", type=int, default=64)
     ap.add_argument("--keep", type=int, nargs="+", default=[62, 60, 58])
     ap.add_argument("--out-dir", type=Path, required=True)
@@ -145,8 +149,11 @@ def main() -> int:
     if args.n_experts <= 0 or args.n_experts > 256:
         raise SystemExit("--n-experts must be in 1..256")
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    rows = parse_trace(args.trace)
+    rows = []
+    for source_id, path in enumerate(args.trace, 1):
+        rows.extend(parse_trace(path, source_id))
     report, masks = analyze(rows, args.n_experts, args.keep, args.coactivation_top)
+    report["trace_files"] = [str(p) for p in args.trace]
 
     report_path = args.out_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -156,7 +163,7 @@ def main() -> int:
     layers = len(report["layers"])
     print(
         "KIMI_MOE_TRACE_ANALYSIS_PASS "
-        f"rows={report['trace_rows']} layers={layers} "
+        f"rows={report['trace_rows']} files={len(args.trace)} layers={layers} "
         f"n_experts={args.n_experts} keep={','.join(map(str, args.keep))}"
     )
     return 0
