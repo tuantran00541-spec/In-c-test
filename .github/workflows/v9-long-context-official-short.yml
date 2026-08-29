@@ -82,6 +82,7 @@ jobs:
             | tee "$RUNNER_TEMP/q8-en-output.txt"
           grep -q 'prefill=exact-head-streaming' "$RUNNER_TEMP/q8-en-stderr.txt"
           grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-en-stderr.txt"
+          grep -q 'buffers=3' "$RUNNER_TEMP/q8-en-stderr.txt"
           grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-en-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-en-stderr.txt"
       - name: Assert exact English token parity
@@ -112,6 +113,7 @@ jobs:
             | tee "$RUNNER_TEMP/q8-vi-output.txt"
           grep -q 'prefill=exact-head-streaming' "$RUNNER_TEMP/q8-vi-stderr.txt"
           grep -q 'prefill=batch-layer-major-media' "$RUNNER_TEMP/q8-vi-stderr.txt"
+          grep -q 'buffers=3' "$RUNNER_TEMP/q8-vi-stderr.txt"
           grep -q 'media_boundary=bf16' "$RUNNER_TEMP/q8-vi-stderr.txt"
           grep -q 'trunk_direct_io=yes expert_direct_io=yes' "$RUNNER_TEMP/q8-vi-stderr.txt"
       - name: Assert exact Vietnamese BF16-Q8 trajectory preservation
