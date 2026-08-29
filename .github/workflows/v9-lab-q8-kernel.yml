@@ -1,0 +1,36 @@
+name: V9 lab Q8 expert kernel sanity
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/v9-speed-quality-lab
+    paths:
+      - "src/q8_ops.c"
+      - "src/q8_probe.c"
+      - "include/kvl/ops.h"
+      - "include/kvl/format.h"
+      - "CMakeLists.txt"
+      - "tests/test_q8_matvec.py"
+      - ".github/workflows/v9-lab-q8-kernel.yml"
+
+jobs:
+  q8-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install numerical dependency
+        run: python -m pip install --no-cache-dir numpy
+      - name: Build scalar
+        run: |
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar -j 2
+          python tests/test_q8_matvec.py --build-dir build-scalar
+      - name: Build AVX2
+        run: |
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 -j 2
+          python tests/test_q8_matvec.py --build-dir build-avx2
