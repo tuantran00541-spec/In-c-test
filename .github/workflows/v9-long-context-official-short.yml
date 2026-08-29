@@ -11,13 +11,16 @@ on:
       - "CMakeLists.txt"
       - "include/kvl/ops.h"
       - "include/kvl/mla_compressed_state.h"
+      - "include/kvl/mla_compressed_q8_state.h"
       - "src/ops.c"
       - "src/mla_prefill_streaming.c"
       - "src/mla_streaming_probe.c"
       - "src/mla_compressed_state.c"
+      - "src/mla_compressed_q8_state.c"
       - "src/generate.c"
       - "src/generate_vl.c"
       - "src/exact_block_verify.c"
+      - "src/self_spec_sweep.c"
       - "tools/kvl_vl_chat.py"
       - "tools/kimi_tokenizer.py"
 
@@ -50,8 +53,10 @@ jobs:
           cmake --build build -j 2
           test -x build/kvl_generate_vl
           test -x build/kvl_exact_block_verify
+          test -x build/kvl_self_spec_sweep
           test -x build/kvl_vision
           ./build/kvl_mla_streaming_probe
+          ./build/kvl_spec_q8_lab_probe
           python tests/test_q8_matvec.py --build-dir build
       - name: Restore exact V9 acceptance images
         run: |
@@ -110,6 +115,19 @@ jobs:
           grep -q 'PASS: full-model exact block verifier matches serial target' "$RUNNER_TEMP/exact-block-output.txt"
           grep -q 'logits_max=0 state_max=0' "$RUNNER_TEMP/exact-block-output.txt"
           grep -q 'FULL_BLOCK_ROLLBACK accepted=3 state_max=0' "$RUNNER_TEMP/exact-block-output.txt"
+      - name: Self-spec INT8 MLA routed-expert sweep on official weights
+        run: |
+          ./build/kvl_self_spec_sweep \
+            "$RUNNER_TEMP/q8-runtime/trunk.bin" "$RUNNER_TEMP/q8-runtime/trunk.idx" \
+            "$RUNNER_TEMP/q8-runtime/experts.bin" "$RUNNER_TEMP/q8-runtime/experts.idx" \
+            "$RUNNER_TEMP/verify-prompt.ids" $((512*1024*1024)) 4 \
+            | tee "$RUNNER_TEMP/self-spec-output.txt"
+          grep -q 'PASS: self-spec target correction/bonus commits remain exact' "$RUNNER_TEMP/self-spec-output.txt"
+          grep -q 'SELF_SPEC mask=q8_only' "$RUNNER_TEMP/self-spec-output.txt"
+          grep -q 'SELF_SPEC mask=skip4' "$RUNNER_TEMP/self-spec-output.txt"
+          grep -q 'SELF_SPEC mask=skip7' "$RUNNER_TEMP/self-spec-output.txt"
+          grep -q 'SELF_SPEC mask=skip13' "$RUNNER_TEMP/self-spec-output.txt"
+          test "$(grep -c 'seq_ok=yes commit_state_max=0' "$RUNNER_TEMP/self-spec-output.txt")" -eq 4
       - name: Generate exact English accepted case
         run: |
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" \
