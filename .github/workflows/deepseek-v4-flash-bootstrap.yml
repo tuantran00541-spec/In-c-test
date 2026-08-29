@@ -1,0 +1,60 @@
+name: DeepSeek V4 Flash bootstrap gates
+
+on:
+  push:
+    branches:
+      - research/deepseek-v4-flash-0731
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect official DeepSeek metadata
+        run: python3 tools/inspect_deepseek_v4_flash.py
+      - name: Python syntax
+        run: python3 -m py_compile tools/inspect_deepseek_v4_flash.py tools/kvl_memory_plan.py tools/kvl_chat.py
+      - name: Build scalar baseline
+        run: |
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar --config Release -j 2
+      - name: Scalar low-memory regression probes
+        run: |
+          ./build-scalar/kvl_mla_streaming_probe
+          ./build-scalar/kvl_spec_q8_lab_probe
+      - name: Build AVX2 baseline
+        run: |
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 --config Release -j 2
+      - name: AVX2 low-memory regression probes
+        run: |
+          ./build-avx2/kvl_mla_streaming_probe
+          ./build-avx2/kvl_spec_q8_lab_probe
+
+  windows-msvc:
+    runs-on: windows-latest
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect official DeepSeek metadata
+        shell: pwsh
+        run: py -3 tools/inspect_deepseek_v4_flash.py
+      - name: Python syntax
+        shell: pwsh
+        run: py -3 -m py_compile tools/inspect_deepseek_v4_flash.py tools/kvl_memory_plan.py tools/kvl_chat.py
+      - name: Build MSVC AVX2 baseline
+        shell: pwsh
+        run: |
+          cmake -S . -B build -DKVL_USE_AVX2=ON
+          cmake --build build --config Release
+      - name: MSVC low-memory regression probes
+        shell: pwsh
+        run: |
+          .\build\Release\kvl_mla_streaming_probe.exe
+          .\build\Release\kvl_spec_q8_lab_probe.exe
