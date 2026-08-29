@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "notes": "Multimodal next-token sensitivity guard. Baseline-vs-mask only; not a semantic benchmark or global vision-quality claim.",
+  "cases": [
+    {
+      "id": "vl-user-vi-description",
+      "image": "user-vi.jpg",
+      "prompt": "Hãy mô tả nhân vật và biểu cảm trong hình bằng tiếng Việt, một câu ngắn."
+    },
+    {
+      "id": "vl-user-en-description",
+      "image": "user-en.jpg",
+      "prompt": "Look at this image and answer only in English. Describe the character and facial expression in one short sentence."
+    },
+    {
+      "id": "vl-synthetic-shapes",
+      "image": "synthetic-shapes.png",
+      "prompt": "Describe the colored geometric shapes in this image in one short sentence."
+    },
+    {
+      "id": "vl-synthetic-checker",
+      "image": "synthetic-checker.png",
+      "prompt": "Describe the main visual pattern in this image in one short sentence."
+    }
+  ]
+}
