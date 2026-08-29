@@ -4,93 +4,133 @@ CPU-first low-RAM inference runtime for `moonshotai/Kimi-VL-A3B-Instruct`, using
 SSD/NVMe-backed weight stores, streamed sparse-MoE experts, compressed MLA state and a native
 C MoonViT + text decoder.
 
-**Real-weight V9 status: PASS.** The runtime now executes end-to-end image + text generation
-from the released Kimi-VL checkpoint without loading the complete ~30 GiB packed model into
-RAM. The final pinned two-image acceptance on `main` passed with BF16 media injection,
-layer-major batched multimodal prefill and direct I/O enabled for both trunk and expert stores.
+The exact V9 image + text path is real-weight validated on the pinned Kimi-VL checkpoint. The
+recommended consumer-machine format keeps trunk/router/shared/vision weights BF16 and stores
+only routed MoE experts as validated row-wise Q8, reducing the routed-expert store from about
+26.8 GiB to **13.438 GiB**.
 
-See [`spec/REAL_V9_RESULT.md`](spec/REAL_V9_RESULT.md) for the final evidence, exact pinned
-checkpoint revision, outputs, cache metrics and the documented upstream-model semantic caveat.
+> **Windows laptop users:** start with
+> [`docs/USER_GUIDE_WINDOWS.md`](docs/USER_GUIDE_WINDOWS.md). It covers prerequisites,
+> one-command setup, pinned model download/packing, preflight, text-only inference, real
+> image+text inference, RAM/cache tuning and troubleshooting.
 
-## What is complete
-
-- **V0:** safetensors routed-expert packer -> aligned `experts.bin` + `experts.idx`.
-- **V1:** hard-budget LRU/prefetch expert cache with portable direct I/O and metrics.
-- **V2:** real Kimi/DeepSeek-style router + BF16 streamed MoE.
-- **V3:** RMSNorm + Kimi-VL MLA/RoPE/causal attention + residuals + streamed MoE.
-- **V4:** separate aligned trunk store plus real multi-layer execution.
-- **V5:** complete 27-layer text tower -> final RMSNorm -> 163,840 logits in C.
-- **V6:** persistent incremental decode with compressed MLA latent+RoPE history.
-- **V7:** official-compatible tokenizer/chat template + native C generation/sampling loop.
-- **V8:** batched prompt prefill, RAM planning, AVX2 path, Windows direct-I/O support and
-  practical packing/frontend tooling.
-- **V9:** official-compatible image preprocessing, MoonViT + projector, BF16 media-token
-  merge, batched multimodal prefill and end-to-end image chat.
-
-## Packed V9 model
-
-Real released weights pack to approximately:
+## Validated model
 
 ```text
-trunk.bin       2.916 GiB
-experts.bin    26.812 GiB
-vision.bin      0.834 GiB
-
-routed expert records = 1664 = 26 x 64
+repository: moonshotai/Kimi-VL-A3B-Instruct
+revision:   398eede0903cd983a2bfa0cc634e9ac1d843f375
 ```
 
-Records are 4096-byte aligned. Trunk tensors are loaded/released as needed; routed experts use
-a hard-budget cache. With `--cache-mib 512`, the real V9 acceptance uses 31 BF16 expert slots
-(~511.5 MiB arena) rather than keeping all routed experts resident.
+Do not mix weights and tokenizer/frontend assets from unrelated revisions when reproducing the
+validated path. `tools/prepare_kimi_vl_q8.py` pins both to the revision above and records it in
+`SOURCE_REVISION.txt`.
 
-No checkpoint or packed model weight is stored in git.
+## Current packed Q8 layout
 
-## Quick start V9
+Official released weights pack to approximately:
 
-### 1. Build
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
-cmake --build build --config Release
+```text
+trunk.bin       2.916 GiB   BF16 trunk/router/shared/global weights
+experts.bin    13.438 GiB   row-wise Q8 routed experts
+vision.bin      0.834 GiB   BF16 MoonViT + projector
+--------------------------------
+weight total   ~17.188 GiB
 ```
 
-The C runtime supports Linux direct I/O and the Windows `FILE_FLAG_NO_BUFFERING` path. The
-Python frontend automatically looks under `build/Release/` for Windows executables when using
-a multi-config CMake generator.
+The model is not loaded completely into RAM. Large stores remain on SSD/NVMe; routed experts
+are streamed through a hard-budget cache. No checkpoint or packed model weight is stored in
+Git.
 
-### 2. Pack the official checkpoint
+## Fastest Windows path
 
-Download/prepare the normal complete seven-shard Hugging Face snapshot of
-`moonshotai/Kimi-VL-A3B-Instruct`, then run:
+Install Git, 64-bit Python 3.11+, CMake, and Visual Studio 2022 Build Tools with the C++ desktop
+workload. Then in PowerShell:
 
-```sh
-python tools/pack_full_model.py /path/to/Kimi-VL-A3B-Instruct /path/to/kimi-vl-v9-packed
+```powershell
+git clone https://github.com/tuantran00541-spec/In-c-test.git
+cd In-c-test
+git switch research/v9-two-turn-vi-chat
+powershell -ExecutionPolicy Bypass -File .\tools\windows_setup_q8.ps1
 ```
 
-The packer creates the text trunk, routed-expert store, MoonViT/projector store and required
-frontend/tokenizer assets. Conversion uses a bounded source-shard working set; source model
-weights are not copied into this repository.
+The setup helper:
 
-### 3. Chat with an image
+1. creates `.venv`;
+2. installs CPU-only PyTorch and user-facing Python dependencies;
+3. builds the native C runtime with AVX2;
+4. downloads the exact pinned model revision;
+5. packs MoonViT and the Q8 text runtime with a bounded source-shard working set;
+6. deletes consumed source shards by default;
+7. runs `tools/kvl_doctor.py` before declaring the runtime ready.
 
-```sh
-python tools/kvl_vl_chat.py /path/to/kimi-vl-v9-packed image.jpg \
-  "Describe this image." \
-  --cache-mib 512 \
-  --ram-mib 4096 \
-  --max-new 32 \
-  --temperature 0
+The final packed runtime defaults to:
+
+```text
+packed\kimi-vl-a3b-q8
 ```
 
-The frontend preprocesses the image, runs the native C MoonViT/projector, releases the vision
-phase working set, constructs the official-style multimodal chat sequence and then runs the
-27-layer C text decoder.
+## First real image + text run
 
-For text-only chat, `tools/kvl_chat.py` remains available.
+Keep the first diagnostic short and deterministic:
+
+```powershell
+.\.venv\Scripts\python.exe .\tools\kvl_vl_chat.py `
+  .\packed\kimi-vl-a3b-q8 `
+  "C:\path\to\image.jpg" `
+  "Look at this image and describe the character and facial expression in one short English sentence." `
+  --cache-mib 512 `
+  --ram-mib 4096 `
+  --max-new 8 `
+  --temperature 0 `
+  --seed 1 `
+  --show-tokens
+```
+
+For a 16 GiB laptop, `--cache-mib 512 --ram-mib 4096 --max-new 8` is the recommended first
+configuration. Close other loaded LLM runtimes before testing.
+
+A healthy text run should eventually report direct-I/O status such as:
+
+```text
+trunk_direct_io=yes expert_direct_io=yes
+```
+
+and `tools/kvl_vl_chat.py` prints vision time, first-token latency, average next-token latency,
+generated IDs when requested, and a conservative text working-set plan.
+
+For text-only testing:
+
+```powershell
+.\.venv\Scripts\python.exe .\tools\kvl_chat.py `
+  .\packed\kimi-vl-a3b-q8 `
+  "2 + 2 bằng bao nhiêu? Trả lời thật ngắn." `
+  --cache-mib 512 --ram-mib 4096 --max-new 8 --temperature 0 --show-tokens
+```
+
+See the Windows guide for the manual install/pack path and troubleshooting.
+
+## Low-RAM pack path
+
+If you do not use the PowerShell helper, the recommended pack command is:
+
+```powershell
+python .\tools\prepare_kimi_vl_q8.py `
+  .\checkpoints\kimi-vl-work `
+  .\packed\kimi-vl-a3b-q8
+```
+
+Unlike the old full-snapshot-first workflow, this path does not require all seven source
+safetensor shards to coexist for the entire conversion. `pack_full_text.py` completes layers as
+soon as their required shard set is available and deletes consumed shards unless
+`--keep-source-shards` is requested.
+
+Run the cheap structural preflight before inference:
+
+```powershell
+python .\tools\kvl_doctor.py .\packed\kimi-vl-a3b-q8 --build-dir .\build
+```
 
 ## V9 runtime architecture
-
-### Weight residency
 
 ```text
 trunk.bin / trunk.idx
@@ -104,7 +144,7 @@ trunk.bin / trunk.idx
   LM head
 
 experts.bin / experts.idx
-  routed expert gate/up/down matrices
+  routed expert gate/up/down matrices (Q8 in recommended user pack)
 
 vision.bin / vision.idx
   MoonViT patch embedding
@@ -113,85 +153,84 @@ vision.bin / vision.idx
   multimodal projector
 ```
 
-### Low-RAM execution
+Low-RAM execution properties:
 
 - model weights remain SSD/NVMe resident;
 - routed experts are streamed through a bounded LRU/prefetch cache;
-- MLA history stores compressed latent KV + RoPE state instead of expanded historical K/V;
-- multimodal prompt prefill is layer-major/batched rather than token-major;
+- Linux direct I/O and Windows `FILE_FLAG_NO_BUFFERING` paths are supported;
+- MLA history stores compressed latent + RoPE state rather than expanded historical K/V;
+- multimodal prompt prefill is layer-major/batched;
 - image features cross into the decoder through a BF16 media boundary;
-- vision and text run as separate phases so large vision temporaries can be released before
-  long text decode;
-- `tools/kvl_vl_chat.py` rejects a request up front when its planned text working set exceeds
-  `--ram-mib`.
+- vision and text run as separate phases so vision working memory can be released before text
+  decode;
+- the Python frontend rejects text configurations whose conservative known-working-set plan
+  exceeds `--ram-mib`.
 
-For the released text dimensions, compressed MLA historical state is based on latent rank 512
-plus RoPE component 64, or 2304 FP32 bytes per layer per historical token.
+For the released text dimensions, the exact compressed MLA target history uses latent rank 512
+plus RoPE component 64.
 
-## Final real-weight acceptance
+## Real-weight evidence
 
-The final main-branch workflow is:
+The Q8 official short gate runs the real pinned Kimi-VL weights, not a toy model. The current
+validated gate covers:
 
-```text
-.github/workflows/real-v9-user-two-images.yml
-```
+- Q8 official packing with a streamed source-shard working set;
+- exact four-token layer-major target verification with `logits_max=0` and `state_max=0`;
+- direct I/O enabled for trunk and expert stores;
+- exact English multimodal token/output parity;
+- a Vietnamese token-trajectory preservation fixture;
+- synthetic scalar/AVX2 and Windows MSVC portability gates.
 
-Pinned model revision:
-
-```text
-398eede0903cd983a2bfa0cc634e9ac1d843f375
-```
-
-Final run `33228249344` passed both real user image fixtures with:
+On the pinned English image fixture the accepted generated IDs are:
 
 ```text
-image grid                       14 x 14
-media tokens                         49
-expert cache                    512 MiB
-cache slots                          31
-prefill                 batch-layer-major-media
-media boundary                      BF16
-trunk direct I/O                     yes
-expert direct I/O                    yes
-expert read failures                   0
+1008 6162 924 4393 11 98717 11002 316 261 21478 528 54275 37632 11276 13 163586
 ```
 
-English control output:
+with output:
 
 ```text
 The character has large, expressive eyes and a surprised or shocked facial expression.
 ```
 
-The Vietnamese fixture no longer falls into the historical "image not provided" failure mode,
-but the released model itself shows prompt/language-dependent semantic inconsistency on that
-fixture. A separate released-BF16 teacher-forced diagnostic verified the C-generated
-24-token trajectory **24/24**, with `FIRST_DIVERGENCE=-1`; therefore the repository records
-that discrepancy as upstream model behavior rather than hiding it as a runtime error. Details
-are in `spec/REAL_V9_RESULT.md`.
+The Vietnamese fixture is deliberately treated as a **trajectory-preservation** gate rather
+than a semantic-quality claim. The released model can produce semantically poor Vietnamese
+behavior for that fixture even when the C runtime follows the accepted target trajectory.
 
-## Regression tests and real workflows
+Additional historical evidence lives in [`spec/REAL_V9_RESULT.md`](spec/REAL_V9_RESULT.md).
 
-Core local tests include:
+## Self-speculative research status
 
-```sh
-python tests/test_pack_roundtrip.py
-python tests/test_cache_roundtrip.py --build-dir build
-python tests/test_moe_oracle.py --build-dir build
-python tests/test_layer_oracle.py --build-dir build
-python tests/test_stack_oracle.py --build-dir build
-./build/kvl_mla_incremental_probe
-python tests/test_tokenizer_oracle.py /path/to/tokenizer-assets
-```
+This research branch also contains `kvl_self_spec_sweep`, a same-model speculative decoder lab
+using an INT8 MLA draft state and selective routed-expert skipping. The exact target verifier
+and target commit remain exact.
 
-Historical real-weight gates remain useful regression evidence:
+The latest focused real-weight sweep found that keeping routed layer 22 while skipping the other
+12 layers in the aggressive mask restores **4/4** draft acceptance and reduces draft expert
+traffic to about **2084 MiB / 252 reads**, but the measured full cycle was still **0.978x** the
+serial baseline on that runner. In other words: close, but **not a speedup**.
+
+Therefore self-speculation is intentionally **not** wired into the user-facing chat command.
+`tools/kvl_vl_chat.py` uses the exact V9 generation path so a first laptop test remains directly
+comparable with the validated baseline.
+
+## Development/regression probes
+
+Useful local probes include:
 
 ```text
-.github/workflows/real-v5.yml              full one-token logits
-.github/workflows/real-v6-mla.yml          official compressed-MLA layer probe
-.github/workflows/real-v6-full-decode.yml  full 27-layer incremental equivalence
-.github/workflows/real-v7-text.yml         official tokenizer + real text generation
-.github/workflows/real-v9-user-two-images.yml  final pinned multimodal runtime acceptance
+kvl_mla_streaming_probe
+kvl_spec_q8_lab_probe
+kvl_exact_block_verify
+kvl_self_spec_sweep            research only
 ```
 
-V9 is the completed Kimi-VL target for this repository; later architecture experiments should
-remain separate so they do not weaken the V9 real-weight baselines.
+The synthetic workflow builds scalar/AVX2 Linux and AVX2 Windows MSVC variants. The official
+short workflow additionally packs and runs the pinned real model.
+
+## Repository policy
+
+- Model/checkpoint/packed weight files stay outside Git.
+- Exact V9 real-weight baselines should not be weakened by later architecture experiments.
+- New acceleration ideas remain research-only until they preserve the target trajectory/state
+  and demonstrate an actual end-to-end win.
