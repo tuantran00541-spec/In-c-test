@@ -20,6 +20,9 @@ int kvl_mla_compressed_state_init(KvlMlaCompressedState *state,
                                   const KvlMlaConfig *cfg,
                                   int capacity);
 void kvl_mla_compressed_state_reset(KvlMlaCompressedState *state);
+/* Roll back only the logical tail. Stale entries are overwritten by subsequent appends.
+ * This is the primitive needed by exact speculative verification after a rejected suffix. */
+int kvl_mla_compressed_state_truncate(KvlMlaCompressedState *state, int new_len);
 void kvl_mla_compressed_state_free(KvlMlaCompressedState *state);
 size_t kvl_mla_compressed_state_bytes(const KvlMlaCompressedState *state);
 
@@ -49,5 +52,17 @@ int kvl_mla_decode_compressed_bf16(float *out,
                                    const KvlMlaConfig *cfg,
                                    const KvlMlaBF16 *w,
                                    KvlMlaCompressedState *state);
+
+/* Exact continuation block primitive for speculative verification. The inputs are
+ * consecutive tokens beginning at start_position==state->len. It deliberately reuses
+ * the one-token arithmetic in-order so its first implementation is an oracle-quality
+ * semantic building block; the full decoder can still hoist trunk loads layer-major. */
+int kvl_mla_decode_compressed_block_bf16(float *out,
+                                         const float *x,
+                                         int count,
+                                         int start_position,
+                                         const KvlMlaConfig *cfg,
+                                         const KvlMlaBF16 *w,
+                                         KvlMlaCompressedState *state);
 
 #endif
