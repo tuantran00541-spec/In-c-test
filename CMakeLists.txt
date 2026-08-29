@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(kimi_vl_lowram C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-option(KVL_USE_AVX2 "Use AVX2 BF16-to-FP32 GEMV backend" OFF)
+option(KVL_USE_AVX2 "Use AVX2 BF16/Q8 GEMV backends" OFF)
 
 if(MSVC)
   add_compile_options(/W4)
@@ -19,6 +19,7 @@ add_library(kvl_storage
   src/expert_cache.c
   src/trunk_store.c
   src/ops.c
+  src/q8_ops.c
   src/mla_state.c
   src/mla_compressed_state.c
   src/vision.c
@@ -65,3 +66,5 @@ add_executable(kvl_generate_vl src/generate_vl.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 add_executable(kvl_vision src/vision_probe.c)
 target_link_libraries(kvl_vision PRIVATE kvl_storage)
+add_executable(kvl_q8_probe src/q8_probe.c)
+target_link_libraries(kvl_q8_probe PRIVATE kvl_storage)
