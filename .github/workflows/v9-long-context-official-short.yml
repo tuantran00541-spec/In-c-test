@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - research/v9-long-context
+      - research/v9-two-turn-vi-chat
     paths:
       - ".github/workflows/v9-long-context-official-short.yml"
       - "CMakeLists.txt"
@@ -16,7 +17,9 @@ on:
       - "src/mla_compressed_state.c"
       - "src/generate.c"
       - "src/generate_vl.c"
+      - "src/exact_block_verify.c"
       - "tools/kvl_vl_chat.py"
+      - "tools/kimi_tokenizer.py"
 
 jobs:
   q8-short-trajectory:
@@ -46,6 +49,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
           cmake --build build -j 2
           test -x build/kvl_generate_vl
+          test -x build/kvl_exact_block_verify
           test -x build/kvl_vision
           ./build/kvl_mla_streaming_probe
           python tests/test_q8_matvec.py --build-dir build
@@ -80,6 +84,32 @@ jobs:
           print('Q8_EXPERT_GIB=',gib)
           assert gib < 14.0
           PY
+      - name: Exact four-token target block verifier on official weights
+        run: |
+          python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'tools')
+          from kimi_tokenizer import build_encoding, encode_chat
+          model=Path(os.environ['RUNNER_TEMP'])/'q8-runtime'
+          enc,_,_=build_encoding(model)
+          ids=encode_chat(
+              enc,
+              '2 + 2 bằng bao nhiêu? Trả lời bằng tiếng Việt thật ngắn gọn.',
+              'Bạn là một trợ lý hữu ích. Luôn trả lời bằng tiếng Việt.'
+          )
+          p=Path(os.environ['RUNNER_TEMP'])/'verify-prompt.ids'
+          p.write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+          print('VERIFY_PROMPT_TOKENS=',len(ids))
+          PY
+          ./build/kvl_exact_block_verify \
+            "$RUNNER_TEMP/q8-runtime/trunk.bin" "$RUNNER_TEMP/q8-runtime/trunk.idx" \
+            "$RUNNER_TEMP/q8-runtime/experts.bin" "$RUNNER_TEMP/q8-runtime/experts.idx" \
+            "$RUNNER_TEMP/verify-prompt.ids" $((512*1024*1024)) 4 \
+            | tee "$RUNNER_TEMP/exact-block-output.txt"
+          grep -q 'PASS: full-model exact block verifier matches serial target' "$RUNNER_TEMP/exact-block-output.txt"
+          grep -q 'logits_max=0 state_max=0' "$RUNNER_TEMP/exact-block-output.txt"
+          grep -q 'FULL_BLOCK_ROLLBACK accepted=3 state_max=0' "$RUNNER_TEMP/exact-block-output.txt"
       - name: Generate exact English accepted case
         run: |
           python tools/kvl_vl_chat.py "$RUNNER_TEMP/q8-runtime" "$RUNNER_TEMP/user-en.jpg" \
