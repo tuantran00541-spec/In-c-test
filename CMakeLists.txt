@@ -24,6 +24,11 @@ endif()
 set_source_files_properties(src/ops.c PROPERTIES
   COMPILE_DEFINITIONS "kvl_mla_prefill_bf16=kvl_mla_prefill_materialized_bf16")
 
+# Opt-in research logit dumping wraps only direct LM-head matvec calls in the
+# text/VL generation translation units. Library-internal BF16 matvecs remain unchanged.
+set_source_files_properties(src/generate.c src/generate_vl.c PROPERTIES
+  COMPILE_DEFINITIONS "kvl_matvec_bf16=kvl_matvec_bf16_dump")
+
 add_library(kvl_storage
   src/expert_store.c
   src/expert_cache.c
@@ -67,6 +72,8 @@ add_executable(kvl_stack_probe src/stack_probe.c)
 target_link_libraries(kvl_stack_probe PRIVATE kvl_storage)
 add_executable(kvl_logits_probe src/logits_probe.c)
 target_link_libraries(kvl_logits_probe PRIVATE kvl_storage)
+add_executable(kvl_logits_dump_probe src/logits_dump_probe.c src/logits_dump.c)
+target_link_libraries(kvl_logits_dump_probe PRIVATE kvl_storage)
 add_executable(kvl_mla_incremental_probe src/mla_incremental_probe.c)
 target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
 add_executable(kvl_mla_real_probe src/mla_real_probe.c)
@@ -85,10 +92,10 @@ target_compile_definitions(kvl_exact_block_verify PRIVATE kvl_moe_token_bf16=kvl
 add_executable(kvl_self_spec_sweep src/self_spec_sweep.c)
 target_link_libraries(kvl_self_spec_sweep PRIVATE kvl_storage)
 target_compile_definitions(kvl_self_spec_sweep PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
-add_executable(kvl_generate src/generate.c)
+add_executable(kvl_generate src/generate.c src/logits_dump.c)
 target_link_libraries(kvl_generate PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
-add_executable(kvl_generate_vl src/generate_vl.c)
+add_executable(kvl_generate_vl src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
 add_executable(kvl_vision src/vision_probe.c)

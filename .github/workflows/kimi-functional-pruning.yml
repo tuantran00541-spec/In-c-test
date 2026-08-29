@@ -5,8 +5,13 @@ on:
     branches:
       - research/kimi-vl-functional-pruning
     paths:
+      - "CMakeLists.txt"
       - "src/q8_ops.c"
+      - "src/logits_dump.c"
+      - "src/logits_dump_probe.c"
       - "tools/analyze_kimi_moe_trace.py"
+      - "tools/compare_kimi_moe_routes.py"
+      - "tools/compare_kimi_logits.py"
       - "tests/test_kimi_functional_pruning.py"
       - "tests/test_kimi_functional_suite.py"
       - "tests/data/kimi-functional-pruning-suite.json"
@@ -28,8 +33,46 @@ jobs:
       - name: Python syntax
         run: |
           python -m py_compile tools/analyze_kimi_moe_trace.py
+          python -m py_compile tools/compare_kimi_moe_routes.py
+          python -m py_compile tools/compare_kimi_logits.py
           python -m py_compile tests/test_kimi_functional_pruning.py
           python -m py_compile tests/test_kimi_functional_suite.py
+      - name: C logits dump roundtrip
+        shell: bash
+        run: |
+          set -euo pipefail
+          dump="$RUNNER_TEMP/kvl-logits-dump-probe.bin"
+          report="$RUNNER_TEMP/kvl-logits-dump-probe.json"
+          KVL_LOGITS_DUMP="$dump" ./build/kvl_logits_dump_probe
+          test -s "$dump"
+          python tools/compare_kimi_logits.py "$dump" "$dump" --topk 2 --out "$report"
+          test -s "$report"
+      - name: Synthetic route comparator
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/routes-base.tsv"
+          var="$RUNNER_TEMP/routes-var.tsv"
+          out="$RUNNER_TEMP/routes-report.json"
+          cat > "$base" <<'EOF'
+          1 1 1 0.4 1 0.4
+          1 1 2 0.3 1 0.3
+          1 1 3 0.2 1 0.2
+          2 2 4 0.5 1 0.5
+          2 2 5 0.3 1 0.3
+          2 2 6 0.2 1 0.2
+          EOF
+          cat > "$var" <<'EOF'
+          1 1 1 0.4 1 0.4
+          1 1 2 0.3 1 0.3
+          1 1 7 0.2 1 0.2
+          2 2 4 0.5 1 0.5
+          2 2 5 0.3 1 0.3
+          2 2 6 0.2 1 0.2
+          EOF
+          python tools/compare_kimi_moe_routes.py "$base" "$var" --out "$out" | tee "$RUNNER_TEMP/routes.log"
+          grep -q 'substitutions=1' "$RUNNER_TEMP/routes.log"
+          test -s "$out"
       - name: Synthetic functional-pruning analysis
         run: python tests/test_kimi_functional_pruning.py
       - name: Functional suite validation
