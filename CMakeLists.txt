@@ -14,11 +14,17 @@ if(NOT MSVC)
   find_package(OpenMP)
 endif()
 
+# Keep the old fully-materialized MLA prefill available as a lab oracle while
+# routing production callers on this branch to the exact low-memory implementation.
+set_source_files_properties(src/ops.c PROPERTIES
+  COMPILE_DEFINITIONS "kvl_mla_prefill_bf16=kvl_mla_prefill_materialized_bf16")
+
 add_library(kvl_storage
   src/expert_store.c
   src/expert_cache.c
   src/trunk_store.c
   src/ops.c
+  src/mla_prefill_streaming.c
   src/q8_ops.c
   src/mla_state.c
   src/mla_compressed_state.c
@@ -59,6 +65,8 @@ add_executable(kvl_mla_incremental_probe src/mla_incremental_probe.c)
 target_link_libraries(kvl_mla_incremental_probe PRIVATE kvl_storage)
 add_executable(kvl_mla_real_probe src/mla_real_probe.c)
 target_link_libraries(kvl_mla_real_probe PRIVATE kvl_storage)
+add_executable(kvl_mla_streaming_probe src/mla_streaming_probe.c)
+target_link_libraries(kvl_mla_streaming_probe PRIVATE kvl_storage)
 add_executable(kvl_decode_probe src/decode_probe.c)
 target_link_libraries(kvl_decode_probe PRIVATE kvl_storage)
 add_executable(kvl_generate src/generate.c)
