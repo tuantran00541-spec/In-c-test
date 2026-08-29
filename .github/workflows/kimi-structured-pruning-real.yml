@@ -1,0 +1,117 @@
+name: Real Kimi structured pruning experiment
+
+# Expensive official-weight experiment. Creating/updating this file runs it once.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-structured-pruning
+    paths:
+      - ".github/workflows/kimi-structured-pruning-real.yml"
+
+jobs:
+  real-pruning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+      - name: Build AVX2 runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+      - name: Fetch tokenizer and pack official Kimi text with Q8 routed experts
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-full"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-full" \
+            --revision "$KIMI_REV" --expert-format q8
+          du -h "$RUNNER_TEMP/packed-full"/*.bin
+          df -h "$RUNNER_TEMP"
+      - name: Build 48 and 32 unique-expert stores from router geometry
+        run: |
+          python tools/make_router_prune_map.py \
+            "$RUNNER_TEMP/packed-full/trunk.bin" "$RUNNER_TEMP/packed-full/trunk.idx" \
+            "$RUNNER_TEMP/map48.json" --keep 48
+          python tools/make_router_prune_map.py \
+            "$RUNNER_TEMP/packed-full/trunk.bin" "$RUNNER_TEMP/packed-full/trunk.idx" \
+            "$RUNNER_TEMP/map32.json" --keep 32
+          for k in 48 32; do
+            mkdir -p "$RUNNER_TEMP/packed-$k"
+            python tools/merge_expert_store.py \
+              "$RUNNER_TEMP/packed-full/experts.bin" "$RUNNER_TEMP/packed-full/experts.idx" \
+              "$RUNNER_TEMP/map$k.json" \
+              "$RUNNER_TEMP/packed-$k/experts.bin" "$RUNNER_TEMP/packed-$k/experts.idx"
+            ln -s "$RUNNER_TEMP/packed-full/trunk.bin" "$RUNNER_TEMP/packed-$k/trunk.bin"
+            ln -s "$RUNNER_TEMP/packed-full/trunk.idx" "$RUNNER_TEMP/packed-$k/trunk.idx"
+            ln -s "$RUNNER_TEMP/packed-full/tiktoken.model" "$RUNNER_TEMP/packed-$k/tiktoken.model"
+            ln -s "$RUNNER_TEMP/packed-full/tokenizer_config.json" "$RUNNER_TEMP/packed-$k/tokenizer_config.json"
+          done
+          du -h "$RUNNER_TEMP/packed-full/experts.bin" "$RUNNER_TEMP/packed-48/experts.bin" "$RUNNER_TEMP/packed-32/experts.bin"
+      - name: Run held-out deterministic prompts on full, 48 and 32 stores
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/prune-results"
+          prompts=(
+            "Reply with exactly one short word: hello"
+            "What is 17 multiplied by 19? Reply with only the integer."
+            "Translate 'The sky is blue.' into Vietnamese. Reply with only the translation."
+          )
+          for variant in full 48 32; do
+            echo "===== VARIANT $variant ====="
+            i=0
+            for prompt in "${prompts[@]}"; do
+              i=$((i+1))
+              echo "--- prompt $i: $prompt"
+              python tools/kvl_chat.py "$RUNNER_TEMP/packed-$variant" "$prompt" \
+                --binary ./build/kvl_generate \
+                --cache-mib 512 --ram-mib 4096 --max-new 8 --temperature 0 --seed 1 \
+                --show-tokens \
+                > >(tee "$RUNNER_TEMP/prune-results/${variant}-p${i}.out") \
+                2> >(tee "$RUNNER_TEMP/prune-results/${variant}-p${i}.err" >&2)
+            done
+          done
+      - name: Compare generated token sequences
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'prune-results'
+          def ids(variant,i):
+              text=(root/f'{variant}-p{i}.err').read_text()
+              m=re.search(r'\[kvl\] generated ids:\s*([^\n]+)',text)
+              if not m: raise SystemExit(f'missing generated ids {variant} p{i}')
+              return [int(x) for x in m.group(1).split()]
+          for i in range(1,4):
+              base=ids('full',i)
+              print(f'PROMPT {i} baseline={base}')
+              for variant in ('48','32'):
+                  cur=ids(variant,i)
+                  lcp=0
+                  for a,b in zip(base,cur):
+                      if a!=b: break
+                      lcp+=1
+                  print(f'  {variant}: exact={cur==base} lcp={lcp}/{min(len(base),len(cur))} ids={cur}')
+          full1=(root/'full-p1.out').read_text().strip()
+          if not re.search(r'hello', full1, re.I):
+              raise SystemExit(f'baseline sanity failed: {full1!r}')
+          full2=(root/'full-p2.out').read_text().strip()
+          if '323' not in full2:
+              raise SystemExit(f'baseline arithmetic sanity failed: {full2!r}')
+          print('REAL_PRUNING_RUN_COMPLETE')
+          PY
