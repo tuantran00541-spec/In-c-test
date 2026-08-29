@@ -21,9 +21,30 @@ EOS_ID = 163585
 IM_END_ID = 163586
 HIDDEN = 2048
 LAYERS = 27
-KV_LATENT_PLUS_ROPE = 512 + 64
-GLOBAL_BF16_BYTES = 2 * (163840 * HIDDEN * 2) + HIDDEN * 2
-FIXED_RUNTIME_SAFETY = 256 * 1024 * 1024
+HEADS = 16
+QK_NOPE = 128
+QK_ROPE = 64
+VALUE_HEAD = 128
+KV_LATENT = 512
+KV_LATENT_PLUS_ROPE = KV_LATENT + QK_ROPE
+DENSE_INTERMEDIATE = 11264
+FP32_BYTES = 4
+BF16_BYTES = 2
+MIB = 1024 * 1024
+
+# Global tensors held for the complete text phase: embedding, lm_head, final RMSNorm.
+GLOBAL_BF16_BYTES = 2 * (163840 * HIDDEN * BF16_BYTES) + HIDDEN * BF16_BYTES
+
+# The current layer-major decoder still owns six [prompt,H] FP32 matrices. This is
+# intentionally counted until the buffer-reuse follow-up lands; do not hide it in safety margin.
+LAYER_MAJOR_PROMPT_BUFFERS = 6
+
+# Largest simultaneously-loaded non-expert trunk block is layer-0 dense gate/up/down.
+PEAK_LAYER_BF16_BYTES = 3 * DENSE_INTERMEDIATE * HIDDEN * BF16_BYTES
+
+# Small allocations, allocator/alignment overhead, prompt/media arrays and headroom not otherwise
+# modeled. Vision is excluded because it runs in a separate subprocess before text inference.
+RUNTIME_MISC_SAFETY = 128 * MIB
 
 
 def _exe(name: str) -> str:
@@ -33,11 +54,50 @@ def _exe(name: str) -> str:
     return str(Path("build") / name)
 
 
-def planned_text_bytes(prompt_tokens: int, max_new: int, cache_mib: int) -> int:
+def planned_text_breakdown(prompt_tokens: int, max_new: int, cache_mib: int) -> dict[str, int]:
+    if prompt_tokens <= 0 or max_new <= 0 or cache_mib <= 0:
+        raise ValueError("prompt_tokens, max_new and cache_mib must be positive")
+
     capacity = prompt_tokens + max_new
-    compressed = LAYERS * capacity * KV_LATENT_PLUS_ROPE * 4
-    cache = cache_mib * 1024 * 1024
-    return GLOBAL_BF16_BYTES + compressed + cache + FIXED_RUNTIME_SAFETY
+    compressed_state = LAYERS * capacity * KV_LATENT_PLUS_ROPE * FP32_BYTES
+    sequence_workspace = (
+        LAYER_MAJOR_PROMPT_BUFFERS * prompt_tokens * HIDDEN * FP32_BYTES
+    )
+
+    # Exact head-wise streaming MLA prefill keeps one shared [S,R+DR] latent/RoPE set,
+    # one head's [S,DN] K(no-PE), one head's [S,DV] V and one score per prompt token.
+    streaming_mla_workspace = (
+        prompt_tokens * (KV_LATENT_PLUS_ROPE + QK_NOPE + VALUE_HEAD + 1) * FP32_BYTES
+    )
+    streaming_mla_workspace += (
+        (QK_NOPE + QK_ROPE) * FP32_BYTES
+        + (KV_LATENT + QK_ROPE) * FP32_BYTES
+        + (QK_NOPE + VALUE_HEAD) * FP32_BYTES
+        + QK_ROPE * FP32_BYTES
+        + (HEADS * VALUE_HEAD) * FP32_BYTES
+        + VALUE_HEAD * 8
+    )
+
+    cache = cache_mib * MIB
+    parts = {
+        "global_bf16": GLOBAL_BF16_BYTES,
+        "compressed_state": compressed_state,
+        "sequence_workspace": sequence_workspace,
+        "streaming_mla_workspace": streaming_mla_workspace,
+        "expert_cache": cache,
+        "peak_layer_bf16": PEAK_LAYER_BF16_BYTES,
+        "misc_safety": RUNTIME_MISC_SAFETY,
+    }
+    parts["total"] = sum(parts.values())
+    return parts
+
+
+def planned_text_bytes(prompt_tokens: int, max_new: int, cache_mib: int) -> int:
+    return planned_text_breakdown(prompt_tokens, max_new, cache_mib)["total"]
+
+
+def _mib(n: int) -> float:
+    return n / MIB
 
 
 def main() -> int:
@@ -93,17 +153,29 @@ def main() -> int:
                 f"media token expansion mismatch: expected {media_tokens}, encoded {actual_media}"
             )
 
-        planned = planned_text_bytes(len(prompt_ids), args.max_new, args.cache_mib)
-        budget = args.ram_mib * 1024 * 1024
+        plan = planned_text_breakdown(len(prompt_ids), args.max_new, args.cache_mib)
+        planned = plan["total"]
+        budget = args.ram_mib * MIB
         if planned > budget:
             raise SystemExit(
-                f"RAM plan rejected: text phase {planned / 1048576:.1f} MiB > "
-                f"budget {args.ram_mib} MiB; reduce cache/max-new/image size or raise --ram-mib"
+                f"RAM plan rejected: text phase {_mib(planned):.1f} MiB > "
+                f"budget {args.ram_mib} MiB; state={_mib(plan['compressed_state']):.1f} "
+                f"seq_ws={_mib(plan['sequence_workspace']):.1f} "
+                f"mla_ws={_mib(plan['streaming_mla_workspace']):.1f} "
+                f"cache={_mib(plan['expert_cache']):.1f}; reduce cache/max-new/context or "
+                f"raise --ram-mib"
             )
 
         print(
             f"[kvl-vl] grid={gh}x{gw} media_tokens={media_tokens} prompt_tokens={len(prompt_ids)} "
-            f"text_RAM_plan={planned/1048576:.1f}/{args.ram_mib} MiB",
+            f"text_RAM_plan={_mib(planned):.1f}/{args.ram_mib} MiB "
+            f"state={_mib(plan['compressed_state']):.1f} "
+            f"seq_ws={_mib(plan['sequence_workspace']):.1f} "
+            f"mla_ws={_mib(plan['streaming_mla_workspace']):.1f} "
+            f"cache={_mib(plan['expert_cache']):.1f} "
+            f"global={_mib(plan['global_bf16']):.1f} "
+            f"layer_peak={_mib(plan['peak_layer_bf16']):.1f} "
+            f"safety={_mib(plan['misc_safety']):.1f} prefill=exact-head-streaming",
             file=sys.stderr,
         )
 
@@ -123,7 +195,7 @@ def main() -> int:
             args.generate_binary,
             str(model / "trunk.bin"), str(model / "trunk.idx"),
             str(model / "experts.bin"), str(model / "experts.idx"),
-            str(ids_path), str(media_path), str(args.cache_mib * 1024 * 1024),
+            str(ids_path), str(media_path), str(args.cache_mib * MIB),
             str(args.max_new), str(args.temperature), str(args.seed),
         ]
 
