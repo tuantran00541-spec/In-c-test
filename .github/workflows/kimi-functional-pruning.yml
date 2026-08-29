@@ -13,8 +13,10 @@ on:
       - "tools/compare_kimi_moe_routes.py"
       - "tools/compare_kimi_logits.py"
       - "tools/run_kimi_pruning_phase_a.py"
+      - "tools/gate_kimi_pruning_phase_a.py"
       - "tests/test_kimi_functional_pruning.py"
       - "tests/test_kimi_functional_suite.py"
+      - "tests/test_kimi_phase_a_gate.py"
       - "tests/data/kimi-functional-pruning-suite.json"
       - ".github/workflows/kimi-functional-pruning.yml"
   workflow_dispatch:
@@ -37,10 +39,14 @@ jobs:
           python -m py_compile tools/compare_kimi_moe_routes.py
           python -m py_compile tools/compare_kimi_logits.py
           python -m py_compile tools/run_kimi_pruning_phase_a.py
+          python -m py_compile tools/gate_kimi_pruning_phase_a.py
           python -m py_compile tests/test_kimi_functional_pruning.py
           python -m py_compile tests/test_kimi_functional_suite.py
+          python -m py_compile tests/test_kimi_phase_a_gate.py
       - name: Phase A suite validation
         run: python tools/run_kimi_pruning_phase_a.py --validate-only
+      - name: Phase A gate synthetic test
+        run: python tests/test_kimi_phase_a_gate.py
       - name: C logits dump roundtrip
         shell: bash
         run: |
