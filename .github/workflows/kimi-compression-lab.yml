@@ -1,0 +1,29 @@
+name: Kimi compression lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-compression-lab
+    paths:
+      - "tools/kimi_compression_lab.py"
+      - "tests/test_kimi_compression_lab.py"
+      - "spec/KIMI_COMPRESSION_LAB.md"
+      - ".github/workflows/kimi-compression-lab.yml"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install lightweight dependencies
+        run: python -m pip install --no-cache-dir numpy
+      - name: Compile compression lab
+        run: |
+          python -m py_compile tools/kimi_compression_lab.py tests/test_kimi_compression_lab.py
+      - name: Run compression lab unit tests
+        run: python tests/test_kimi_compression_lab.py
