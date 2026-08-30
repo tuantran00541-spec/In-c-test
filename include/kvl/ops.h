@@ -78,7 +78,7 @@ int kvl_moe_token_bf16(KvlExpertCache *cache, int layer,
                        float *scratch);
 
 /* Lab dispatch: BF16 stores delegate to the production function above byte-for-byte;
- * Q8/Q5 stores alter only routed expert gate/up/down matrices. */
+ * KVL_DTYPE_Q8_ROW stores use row-wise Q8 only for routed expert matrices. */
 int kvl_moe_token_auto(KvlExpertCache *cache, int layer,
                        const KvlRouterConfig *router_cfg,
                        const float *x,
@@ -90,5 +90,19 @@ int kvl_moe_token_auto(KvlExpertCache *cache, int layer,
                        int *top_ids,
                        float *top_weights,
                        float *scratch);
+
+/* Q5 research dispatch kept separate from Q8 so baseline and candidate binaries
+ * can coexist in one process/workflow without changing the established Q8 path. */
+int kvl_moe_token_q5_auto(KvlExpertCache *cache, int layer,
+                          const KvlRouterConfig *router_cfg,
+                          const float *x,
+                          const float *router_weight,
+                          const float *correction_bias,
+                          int expert_intermediate_size,
+                          const KvlMlpBF16 *shared,
+                          float *out,
+                          int *top_ids,
+                          float *top_weights,
+                          float *scratch);
 
 #endif
