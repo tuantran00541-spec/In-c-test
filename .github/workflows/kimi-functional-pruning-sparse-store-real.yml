@@ -143,17 +143,27 @@ jobs:
             "$PHASE_A_MASK" \
             "$RUNNER_TEMP/sparse/experts.bin" "$RUNNER_TEMP/sparse/experts.idx" \
             --report "$RUNNER_TEMP/evidence/compaction.json"
+          test -s "$RUNNER_TEMP/sparse/experts.mask"
+          cp "$RUNNER_TEMP/sparse/experts.mask" "$RUNNER_TEMP/evidence/bound-experts.mask"
           python tools/verify_compact_expert_store.py \
             "$RUNNER_TEMP/packed/experts.bin" "$RUNNER_TEMP/packed/experts.idx" \
             "$RUNNER_TEMP/sparse/experts.bin" "$RUNNER_TEMP/sparse/experts.idx" \
             "$PHASE_A_MASK" --report "$RUNNER_TEMP/evidence/byte-verification.json"
           python - <<'PY'
-          import json, os, pathlib
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          import json, os, pathlib, sys
+          sys.path.insert(0, 'tools')
+          from compact_expert_store import read_mask
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          root = temp / 'evidence'
           c = json.loads((root / 'compaction.json').read_text())
           v = json.loads((root / 'byte-verification.json').read_text())
+          source_mask = read_mask(pathlib.Path(os.environ['PHASE_A_MASK']))
+          bound_mask = read_mask(temp / 'sparse' / 'experts.mask')
+          assert source_mask == bound_mask and len(bound_mask) == 50
           assert c['source_records'] == 1664 and c['output_records'] == 1614
           assert c['disabled_mask_entries'] == 50 and c['removed_records'] == 50
+          assert c['mask_sidecar_entries'] == 50
+          assert pathlib.Path(c['mask_sidecar']) == temp / 'sparse' / 'experts.mask'
           assert c['disabled_missing_from_source'] == 0
           assert v['source_records'] == 1664 and v['sparse_records'] == 1614
           assert v['disabled_records'] == 50 and v['records_verified'] == 1614
@@ -164,11 +174,12 @@ jobs:
           print(
               'REAL_SPARSE_BYTE_GATE_PASS '
               f"records={c['source_records']}->{c['output_records']} "
-              f"bytes={c['source_bytes']}->{c['output_bytes']} reduction={c['byte_reduction_fraction']:.9f}"
+              f"bytes={c['source_bytes']}->{c['output_bytes']} reduction={c['byte_reduction_fraction']:.9f} "
+              f"bound_mask_entries={len(bound_mask)}"
           )
           PY
 
-      - name: Exercise C sparse-store lookup for all removed IDs
+      - name: Exercise C sparse-store auto-binding for all removed IDs
         run: |
           python - <<'PY'
           import json, os, pathlib, subprocess, sys
@@ -181,29 +192,40 @@ jobs:
           meta = read_index(sparse_idx)
           assert len(disabled) == 50
           assert all(key not in meta['ids'] for key in disabled)
+          env = os.environ.copy()
+          env.pop('KVL_MOE_MASK', None)
           probe = pathlib.Path('build/kvl_probe').resolve()
+          binding_seen = 0
           for layer, expert in disabled:
               p = subprocess.run(
                   [str(probe), str(sparse_bin), str(sparse_idx), str(layer), str(expert)],
-                  text=True, capture_output=True,
+                  text=True, capture_output=True, env=env,
               )
               assert p.returncode == 1, (layer, expert, p.stdout, p.stderr)
+              assert 'sparse expert store bound mask=' in p.stderr
               assert f'expert L{layer}/E{expert} not present' in p.stderr
+              binding_seen += 1
           retained = min(meta['ids'])
           p = subprocess.run(
               [str(probe), str(sparse_bin), str(sparse_idx), str(retained[0]), str(retained[1])],
-              text=True, capture_output=True,
+              text=True, capture_output=True, env=env,
           )
           assert p.returncode == 0, (retained, p.stdout, p.stderr)
+          assert 'sparse expert store bound mask=' in p.stderr
           report = {
               'removed_ids_checked': len(disabled),
               'all_removed_absent_via_c_runtime': True,
+              'auto_mask_env_unset': True,
+              'auto_binding_messages_checked': binding_seen + 1,
               'retained_id_checked': list(retained),
               'retained_load_ok_via_c_runtime': True,
           }
           out = temp / 'evidence' / 'c-sparse-lookup.json'
           out.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
-          print(f"REAL_SPARSE_C_LOOKUP_PASS removed={len(disabled)} retained={retained}")
+          print(
+              f"REAL_SPARSE_C_AUTO_BIND_PASS removed={len(disabled)} retained={retained} "
+              f"bindings={binding_seen + 1}"
+          )
           PY
 
       - name: Prepare representative text and VL inputs under RAM cap
@@ -265,7 +287,7 @@ jobs:
             "$RUNNER_TEMP/equivalence-inputs/media.f32"
           test -s "$RUNNER_TEMP/equivalence-inputs/media.f32"
 
-      - name: Compare full-store plus mask vs sparse-store plus same mask on text
+      - name: Compare full explicit mask vs sparse auto-bound sidecar on text
         run: |
           python tools/run_kimi_expert_store_equivalence.py \
             --binary ./build/kvl_generate \
@@ -273,11 +295,11 @@ jobs:
             --full-experts-bin "$RUNNER_TEMP/packed/experts.bin" --full-experts-idx "$RUNNER_TEMP/packed/experts.idx" \
             --sparse-experts-bin "$RUNNER_TEMP/sparse/experts.bin" --sparse-experts-idx "$RUNNER_TEMP/sparse/experts.idx" \
             --prompt-ids "$RUNNER_TEMP/equivalence-inputs/text.ids" --mask "$PHASE_A_MASK" \
-            --work-dir "$RUNNER_TEMP/eq-text" \
+            --sparse-auto-mask --work-dir "$RUNNER_TEMP/eq-text" \
             --cache-mib "$CACHE_MIB" --max-new 8 --temperature 0 --seed 1
           cp "$RUNNER_TEMP/eq-text/expert-store-equivalence.json" "$RUNNER_TEMP/evidence/text-runtime-equivalence.json"
 
-      - name: Compare full-store plus mask vs sparse-store plus same mask on VL
+      - name: Compare full explicit mask vs sparse auto-bound sidecar on VL
         run: |
           python tools/run_kimi_expert_store_equivalence.py \
             --binary ./build/kvl_generate_vl \
@@ -286,7 +308,7 @@ jobs:
             --sparse-experts-bin "$RUNNER_TEMP/sparse/experts.bin" --sparse-experts-idx "$RUNNER_TEMP/sparse/experts.idx" \
             --prompt-ids "$RUNNER_TEMP/equivalence-inputs/vl.ids" \
             --media "$RUNNER_TEMP/equivalence-inputs/media.f32" --mask "$PHASE_A_MASK" \
-            --work-dir "$RUNNER_TEMP/eq-vl" \
+            --sparse-auto-mask --work-dir "$RUNNER_TEMP/eq-vl" \
             --cache-mib "$CACHE_MIB" --max-new 8 --temperature 0 --seed 1
           cp "$RUNNER_TEMP/eq-vl/expert-store-equivalence.json" "$RUNNER_TEMP/evidence/vl-runtime-equivalence.json"
 
@@ -307,25 +329,31 @@ jobs:
           text_eq = load('text-runtime-equivalence.json')
           vl_eq = load('vl-runtime-equivalence.json')
           mask = pathlib.Path(os.environ['PHASE_A_MASK'])
+          bound = evidence / 'bound-experts.mask'
           payload = {
-              'schema_version': 1,
-              'scope': 'real physical Q8 sparse expert-store layout equivalence; not a global quality or speed claim',
+              'schema_version': 2,
+              'scope': 'real physical Q8 sparse expert-store auto-bound layout equivalence; not a global quality or speed claim',
               'workflow_head_sha': os.environ['GITHUB_SHA'],
               'kvl_model_revision': os.environ['KIMI_REV'],
               'source_vl_phase_b_run_id': int(os.environ['VL_PHASE_B_RUN_ID']),
               'source_vl_phase_b_artifact_id': int(os.environ['VL_PHASE_B_ARTIFACT_ID']),
               'mask_sha256': hashlib.sha256(mask.read_bytes()).hexdigest(),
+              'bound_mask_sha256': hashlib.sha256(bound.read_bytes()).hexdigest() if bound.is_file() else None,
               'cache_mib': int(os.environ['CACHE_MIB']), 'ram_cap_mib': int(os.environ['RAM_MIB']),
               'compaction': comp, 'byte_verification': verify, 'c_sparse_lookup': lookup,
               'text_runtime_equivalence': text_eq, 'vl_runtime_equivalence': vl_eq,
           }
           payload['eligible_for_packaging_safety_work'] = bool(
-              comp and verify and lookup and text_eq and vl_eq
+              comp and verify and lookup and text_eq and vl_eq and bound.is_file()
               and comp.get('source_records') == 1664 and comp.get('output_records') == 1614
-              and comp.get('removed_records') == 50
+              and comp.get('removed_records') == 50 and comp.get('mask_sidecar_entries') == 50
               and verify.get('byte_exact') is True and verify.get('records_verified') == 1614
               and lookup.get('all_removed_absent_via_c_runtime') is True
+              and lookup.get('auto_mask_env_unset') is True
               and text_eq.get('byte_exact') is True and vl_eq.get('byte_exact') is True
+              and text_eq.get('sparse_auto_mask') is True and vl_eq.get('sparse_auto_mask') is True
+              and text_eq.get('sparse', {}).get('mask_mode') == 'sparse-sidecar-auto'
+              and vl_eq.get('sparse', {}).get('mask_mode') == 'sparse-sidecar-auto'
           )
           out = evidence / 'physical-sparse-summary.json'
           out.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
@@ -335,28 +363,32 @@ jobs:
               'sparse_bytes': comp.get('output_bytes') if comp else None,
               'byte_reduction': comp.get('byte_reduction') if comp else None,
               'byte_reduction_fraction': comp.get('byte_reduction_fraction') if comp else None,
+              'bound_mask_sha256': payload['bound_mask_sha256'],
               'text_runtime_byte_exact': text_eq.get('byte_exact') if text_eq else None,
               'vl_runtime_byte_exact': vl_eq.get('byte_exact') if vl_eq else None,
+              'text_sparse_auto_mask': text_eq.get('sparse_auto_mask') if text_eq else None,
+              'vl_sparse_auto_mask': vl_eq.get('sparse_auto_mask') if vl_eq else None,
           }, sort_keys=True))
           PY
 
-      - name: Gate physical sparse-store equivalence
+      - name: Gate physical sparse-store auto-binding equivalence
         run: |
           python - <<'PY'
           import json, os, pathlib, sys
           p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'evidence' / 'physical-sparse-summary.json'
           r = json.loads(p.read_text())
           if not r['eligible_for_packaging_safety_work']:
-              print('REAL_SPARSE_EQUIVALENCE_REJECT')
+              print('REAL_SPARSE_AUTO_BIND_EQUIVALENCE_REJECT')
               sys.exit(1)
           c = r['compaction']
           print(
-              'REAL_SPARSE_EQUIVALENCE_PASS '
+              'REAL_SPARSE_AUTO_BIND_EQUIVALENCE_PASS '
               f"records={c['source_records']}->{c['output_records']} "
               f"bytes={c['source_bytes']}->{c['output_bytes']} "
-              f"reduction_bytes={c['byte_reduction']} reduction_fraction={c['byte_reduction_fraction']:.9f}"
+              f"reduction_bytes={c['byte_reduction']} reduction_fraction={c['byte_reduction_fraction']:.9f} "
+              f"bound_mask_sha256={r['bound_mask_sha256']}"
           )
-          print('NOTE: same-mask physical-store equivalence passed for the tested text/VL cases; global quality and speed are not proven.')
+          print('NOTE: sparse sidecar auto-binding preserved the tested same-mask text/VL computation; global quality and speed are not proven.')
           PY
 
       - name: Upload sparse-store evidence only
