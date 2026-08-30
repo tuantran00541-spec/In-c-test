@@ -1,0 +1,275 @@
+name: Real Kimi-VL functional pruning guard
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - ".github/workflows/kimi-functional-pruning-vl-guard-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  vl-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      PHASE_A_RUN_ID: "33259183604"
+      PHASE_A_MASK: "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.mask"
+      PHASE_A_MANIFEST: "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.json"
+      PHASE_B_RUN_ID: "33262490311"
+      PHASE_B_MANIFEST: "tests/data/kimi-functional-pruning-phase-b-33262490311.json"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build AVX2 multimodal runtime
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_vision
+          test -x ./build/kvl_generate_vl
+          python tools/run_kimi_pruning_vl_guard.py --validate-only
+
+      - name: Verify Phase A and Phase B provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+
+          mask_path = pathlib.Path(os.environ['PHASE_A_MASK'])
+          a = json.loads(pathlib.Path(os.environ['PHASE_A_MANIFEST']).read_text())
+          b = json.loads(pathlib.Path(os.environ['PHASE_B_MANIFEST']).read_text())
+          raw = mask_path.read_bytes()
+          digest = hashlib.sha256(raw).hexdigest()
+
+          assert a['source_workflow_run_id'] == int(os.environ['PHASE_A_RUN_ID'])
+          assert a['candidate'] == 'adaptive-unseen-cap6'
+          assert a['mask_sha256'] == digest
+          assert a['mask_diagnostics']['disabled_count'] == 50
+          assert a['mask_diagnostics']['disabled_seen_count'] == 0
+
+          disabled = []
+          for line in raw.decode().splitlines():
+              line = line.split('#', 1)[0].strip()
+              if not line:
+                  continue
+              layer, expert = map(int, line.split())
+              assert 1 <= layer <= 26
+              assert 0 <= expert < 64
+              disabled.append((layer, expert))
+          assert len(disabled) == 50 and len(set(disabled)) == 50
+
+          assert b['source_workflow_run_id'] == int(os.environ['PHASE_B_RUN_ID'])
+          assert b['candidate'] == 'adaptive-unseen-cap6'
+          assert b['kvl_model_revision'] == os.environ['KIMI_REV']
+          assert b['phase_a_source_workflow_run_id'] == int(os.environ['PHASE_A_RUN_ID'])
+          assert b['mask_sha256'] == digest
+          assert b['heldout_prompts'] == 14
+          assert b['token_exact_prompts'] == 14
+          assert b['divergent_prompts'] == []
+          assert b['artifact']['id'] == 9718727274
+          assert b['artifact']['sha256'] == '145d4d5fc5ef80a6ad457767a29d5411db079655188a5ec792be5237465fdfaf'
+
+          print(
+              f"VL_GUARD_PROVENANCE_PASS phase_a={a['source_workflow_run_id']} "
+              f"phase_b={b['source_workflow_run_id']} disabled={len(disabled)} sha256={digest}"
+          )
+          PY
+
+      - name: Restore and generate VL guard images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vl-images"
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/vl-images/user-en.jpg"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from PIL import Image, ImageDraw
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'vl-images'
+
+          im = Image.new('RGB', (448, 448), 'white')
+          d = ImageDraw.Draw(im)
+          d.rectangle((40, 55, 190, 205), fill='red')
+          d.ellipse((245, 55, 395, 205), fill='blue')
+          d.polygon([(220, 245), (105, 405), (335, 405)], fill='green')
+          im.save(root / 'synthetic-shapes.png')
+
+          im = Image.new('RGB', (448, 448), 'white')
+          d = ImageDraw.Draw(im)
+          cell = 56
+          for y in range(8):
+              for x in range(8):
+                  if (x + y) % 2:
+                      d.rectangle(
+                          (x * cell, y * cell, (x + 1) * cell - 1, (y + 1) * cell - 1),
+                          fill='black',
+                      )
+          im.save(root / 'synthetic-checker.png')
+
+          for p in sorted(root.iterdir()):
+              with Image.open(p) as img:
+                  print(f"VL_IMAGE {p.name} size={img.size} mode={img.mode}")
+          PY
+
+      - name: Fetch pinned MoonViT source metadata
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+
+          repo = 'moonshotai/Kimi-VL-A3B-Instruct'
+          rev = os.environ['KIMI_REV']
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-source'
+          root.mkdir(parents=True, exist_ok=True)
+          for name in ('config.json', 'model.safetensors.index.json', 'model-00001-of-00007.safetensors'):
+              p = hf_hub_download(repo_id=repo, revision=rev, filename=name, local_dir=root)
+              print(f"VL_SOURCE {name} -> {p}")
+          PY
+
+      - name: Pack pinned MoonViT before text shards are consumed
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-vl"
+          test -s "$RUNNER_TEMP/packed-vl/vision.bin"
+          test -s "$RUNNER_TEMP/packed-vl/vision.idx"
+          du -h "$RUNNER_TEMP/packed-vl/vision.bin"
+
+      - name: Pack official Kimi text with Q8 routed experts
+        run: |
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed-vl" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed-vl" \
+            --revision "$KIMI_REV" --expert-format q8
+          test -s "$RUNNER_TEMP/packed-vl/trunk.bin"
+          test -s "$RUNNER_TEMP/packed-vl/experts.bin"
+          du -h "$RUNNER_TEMP/packed-vl"/*.bin
+          df -h "$RUNNER_TEMP"
+
+      - name: Write VL guard provenance evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/vl-guard"
+          python - <<'PY'
+          import json, os, pathlib
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'vl-guard' / 'provenance.json'
+          payload = {
+              'schema_version': 1,
+              'workflow_head_sha': os.environ['GITHUB_SHA'],
+              'kvl_model_revision': os.environ['KIMI_REV'],
+              'phase_a_run_id': int(os.environ['PHASE_A_RUN_ID']),
+              'phase_b_run_id': int(os.environ['PHASE_B_RUN_ID']),
+              'mask_path': os.environ['PHASE_A_MASK'],
+              'phase_b_manifest': os.environ['PHASE_B_MANIFEST'],
+              'cache_mib': 512,
+              'ram_mib': 4096,
+              'scope': 'next-token multimodal route/logit sensitivity screen',
+          }
+          out.write_text(json.dumps(payload, indent=2, sort_keys=True) + '\n')
+          print(out.read_text())
+          PY
+
+      - name: Run full vs adaptive multimodal sensitivity guard
+        run: |
+          python tools/run_kimi_pruning_vl_guard.py \
+            --model-dir "$RUNNER_TEMP/packed-vl" \
+            --image-root "$RUNNER_TEMP/vl-images" \
+            --vision-binary ./build/kvl_vision \
+            --generate-binary ./build/kvl_generate_vl \
+            --mask "$PHASE_A_MASK" \
+            --work-dir "$RUNNER_TEMP/vl-guard" \
+            --cache-mib 512 --ram-mib 4096
+
+      - name: Print VL guard summary
+        if: always()
+        run: |
+          if test -s "$RUNNER_TEMP/vl-guard/vl-guard-summary.json"; then
+            python - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'vl-guard' / 'vl-guard-summary.json'
+          r = json.loads(p.read_text())
+          a = r['aggregate']
+          print(
+              f"VL_GUARD_AGG exact={a['first_token_exact']}/{a['cases']} "
+              f"argmax={a['logit_argmax_agree']}/{a['cases']} "
+              f"top10_min={a['logit_min_topk_overlap']:.6f} max_js={a['logit_max_js_divergence']:.9g}"
+          )
+          print(
+              f"VL_GUARD_ROUTE direct={a['direct_masked_selections']} "
+              f"media_direct={a['media_direct_masked_selections']} "
+              f"text_direct={a['text_direct_masked_selections']} "
+              f"hit_slots={a['unique_masked_slots_hit']} media_slots={a['media_unique_masked_slots_hit']} "
+              f"text_slots={a['text_unique_masked_slots_hit']} substitutions={a['route_substitutions']} "
+              f"cascade={a['cascade_substitutions']}"
+          )
+          for row in r['cases']:
+              d = row['direct_mask_hits']
+              c = row['comparison']
+              print(
+                  f"VL_GUARD_CASE id={row['id']} exact={c['first_token_exact']} "
+                  f"media={d['media_selections']} text={d['text_selections']} "
+                  f"sub={c['route']['substitutions']} js={c['logits']['max_js_divergence']:.9g}"
+              )
+          PY
+          else
+            echo "vl-guard-summary.json not available"
+          fi
+
+      - name: Evaluate VL long-generation eligibility
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, sys
+          p = pathlib.Path(os.environ['RUNNER_TEMP']) / 'vl-guard' / 'vl-guard-summary.json'
+          r = json.loads(p.read_text())
+          a = r['aggregate']
+          failures = []
+          if a['first_token_exact'] != a['cases']:
+              failures.append(f"first_token_exact={a['first_token_exact']}/{a['cases']}")
+          if a['logit_argmax_agree'] != a['cases']:
+              failures.append(f"argmax={a['logit_argmax_agree']}/{a['cases']}")
+          if a['logit_min_topk_overlap'] < 0.8:
+              failures.append(f"top10_overlap={a['logit_min_topk_overlap']:.6g}<0.8")
+          if a['logit_max_js_divergence'] > 0.01:
+              failures.append(f"max_js={a['logit_max_js_divergence']:.6g}>0.01")
+          if failures:
+              print('VL_GUARD_PROMOTION_REJECT ' + ' '.join(failures))
+              sys.exit(1)
+          print(
+              'VL_GUARD_PROMOTION_ELIGIBLE '
+              f"exact={a['first_token_exact']}/{a['cases']} "
+              f"media_direct={a['media_direct_masked_selections']} "
+              f"max_js={a['logit_max_js_divergence']:.9g}"
+          )
+          print('NOTE: eligible only for VL long-generation A/B; physical deletion remains prohibited.')
+          PY
+
+      - name: Upload VL guard evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-functional-pruning-vl-guard-evidence
+          path: |
+            ${{ runner.temp }}/vl-guard/**
+          if-no-files-found: warn
