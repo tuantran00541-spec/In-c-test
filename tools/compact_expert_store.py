@@ -6,6 +6,11 @@ byte-for-byte into a new 4096-aligned experts.bin. Only file offsets and the
 record count change. n_layers/n_experts remain unchanged, so router ids need no
 remapping.
 
+A canonical sibling .mask sidecar is emitted next to the output index. The native
+runtime requires this sidecar for sparse Q8 stores, verifies that it exactly
+matches the physically absent routed expert ids, and auto-loads it when
+KVL_MOE_MASK is not explicitly set.
+
 This tool is intentionally Q8-store-only for the current Kimi pruning research
 lane. It never mutates the source store.
 """
@@ -30,6 +35,12 @@ def align_up(x: int, a: int = ALIGN) -> int:
     return (x + a - 1) // a * a
 
 
+def mask_sidecar_path(idx_path: pathlib.Path) -> pathlib.Path:
+    if idx_path.suffix == ".idx":
+        return idx_path.with_suffix(".mask")
+    return pathlib.Path(str(idx_path) + ".mask")
+
+
 def read_mask(path: pathlib.Path) -> set[tuple[int, int]]:
     disabled: set[tuple[int, int]] = set()
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -49,6 +60,13 @@ def read_mask(path: pathlib.Path) -> set[tuple[int, int]]:
     if not disabled:
         raise ValueError(f"{path}: no disabled experts")
     return disabled
+
+
+def write_mask_sidecar(path: pathlib.Path, disabled: set[tuple[int, int]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# KVL_MOE_MASK_V1", "# Bound to the physically absent routed expert records."]
+    lines.extend(f"{layer} {expert}" for layer, expert in sorted(disabled))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def read_index(path: pathlib.Path):
@@ -157,6 +175,9 @@ def compact_store(src_bin: pathlib.Path, src_idx: pathlib.Path, mask: pathlib.Pa
         for r in kept_records:
             f.write(REC.pack(*r))
 
+    sidecar = mask_sidecar_path(dst_idx)
+    write_mask_sidecar(sidecar, disabled)
+
     report = {
         "source_records": meta["n_records"],
         "output_records": len(kept_records),
@@ -173,6 +194,8 @@ def compact_store(src_bin: pathlib.Path, src_idx: pathlib.Path, mask: pathlib.Pa
         "n_layers": meta["n_layers"],
         "n_experts": meta["n_experts"],
         "dtype": DTYPE_Q8_ROW,
+        "mask_sidecar": str(sidecar),
+        "mask_sidecar_entries": len(disabled),
     }
     return report
 
@@ -203,7 +226,8 @@ def main() -> int:
         "KIMI_EXPERT_STORE_COMPACT_PASS "
         f"records={report['source_records']}->{report['output_records']} "
         f"bytes={report['source_bytes']}->{report['output_bytes']} "
-        f"reduction={report['byte_reduction_fraction']:.6f}"
+        f"reduction={report['byte_reduction_fraction']:.6f} "
+        f"sidecar={report['mask_sidecar']}"
     )
     return 0
 
