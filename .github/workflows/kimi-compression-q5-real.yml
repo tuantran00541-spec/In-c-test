@@ -1,0 +1,278 @@
+name: Real Kimi Q5 end-to-end gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-q5-real
+    paths:
+      - ".github/workflows/kimi-compression-q5-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  q5-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      TEXT_SUITE: "tests/data/kimi-functional-pruning-suite.json"
+      TEXT_CACHE_MIB: "1536"
+      VL_CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build native Q8 and Q5 runtimes and run kernel tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_q5
+          test -x ./build/kvl_generate_vl
+          test -x ./build/kvl_generate_vl_q5
+          test -x ./build/kvl_vision
+          test -x ./build/kvl_q5_probe
+          python -m py_compile tools/pack_experts_q5.py tools/run_kimi_store_ab.py tools/run_kimi_vl_store_ab.py
+          python tests/test_q8_matvec.py --build-dir build
+          python tests/test_q5_matvec.py --build-dir build
+          python tools/run_kimi_store_ab.py --validate-only --suite "$TEXT_SUITE"
+          mkdir -p "$RUNNER_TEMP/q5/evidence" "$RUNNER_TEMP/q5/vl-images"
+
+      - name: Restore six VL cases with known-answer smoke checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/q5/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/q5/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5/vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]: d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          for row in suite['cases']:
+              if row['id']=='vl-synthetic-shapes': row['sanity_contains']=['red','blue','green']
+              if row['id']=='vl-synthetic-checker': row['sanity_contains']=['checker']
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':16,
+               'prompt':'Describe the dominant line pattern in this image in one short sentence.',
+               'sanity_contains':['diagonal','purple']},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':4,
+               'prompt':'How many red circles are visible? Reply with only the integer.',
+               'sanity_contains':['5']},
+          ])
+          assert len(suite['cases'])==6
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5/vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          print('Q5_VL_SUITE_READY cases=6 semantic_cases=4')
+          PY
+          python tools/run_kimi_vl_store_ab.py --validate-only --suite "$RUNNER_TEMP/q5/vl-suite.json"
+
+      - name: Fetch pinned metadata and initial MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'q5/kimi-source'; root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(repo_id='moonshotai/Kimi-VL-A3B-Instruct',revision=os.environ['KIMI_REV'],filename=name,local_dir=root))
+          PY
+
+      - name: Pack pinned MoonViT and full Q8 baseline while retaining BF16 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/q5/kimi-source"
+          base="$RUNNER_TEMP/q5/packed-q8"
+          python tools/pack_vision.py "$src" "$base"
+          python tools/fetch_tokenizer.py "$base" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$base" --revision "$KIMI_REV" --expert-format q8 --keep-source-shards
+          test -s "$base/trunk.bin"
+          test -s "$base/experts.bin"
+          test -s "$base/vision.bin"
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5/packed-q8'
+          expected=14428930048
+          got=(p/'experts.bin').stat().st_size
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'Q5_BASELINE_Q8_STORE_PASS records={h[5]} bytes={got}')
+          PY
+          df -h "$RUNNER_TEMP"
+
+      - name: Build full Q5 expert store directly from pinned BF16 weights
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/q5/kimi-source"
+          base="$RUNNER_TEMP/q5/packed-q8"
+          cand="$RUNNER_TEMP/q5/packed-q5"
+          cp -al "$base" "$cand"
+          rm -f "$cand/experts.bin" "$cand/experts.idx" "$cand/experts.mask"
+          python tools/pack_experts_q5.py "$src" "$cand"
+          python - <<'PY'
+          import json, os, pathlib, struct
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5'
+          base=root/'packed-q8'; cand=root/'packed-q5'
+          q8=(base/'experts.bin').stat().st_size
+          q5=(cand/'experts.bin').stat().st_size
+          raw=(cand/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==4
+          expected=9446621184
+          assert q5==expected,(q5,expected)
+          result={
+              'schema':'kimi-q5-physical-store-v1',
+              'source_revision':os.environ['KIMI_REV'],
+              'q8_expert_bytes':q8,
+              'q5_expert_bytes':q5,
+              'removed_bytes_vs_q8':q8-q5,
+              'fraction_reduced_vs_q8':(q8-q5)/q8,
+              'q5_gib':q5/(1024**3),
+              'records':h[5],
+              'dtype':h[6],
+              'group_size':128,
+              'scale_dtype':'fp32',
+              'physical_measurement':True,
+          }
+          (root/'evidence/q5-physical-store.json').write_text(json.dumps(result,indent=2,sort_keys=True)+'\n')
+          print('Q5_PHYSICAL_STORE_PASS',json.dumps(result,sort_keys=True))
+          PY
+          find "$src" -maxdepth 1 -name 'model-*.safetensors' -delete
+          df -h "$RUNNER_TEMP"
+
+      - name: Run Q5 arithmetic semantic canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          prompt='What is 46 multiplied by 17? Reply with only the integer.'
+          python tools/kvl_chat.py "$RUNNER_TEMP/q5/packed-q8" "$prompt" \
+            --binary ./build/kvl_generate --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB" \
+            --max-new 8 --temperature 0 --seed 1 --show-tokens \
+            > "$RUNNER_TEMP/q5/evidence/canary-q8.txt" 2> "$RUNNER_TEMP/q5/evidence/canary-q8.err"
+          python tools/kvl_chat.py "$RUNNER_TEMP/q5/packed-q5" "$prompt" \
+            --binary ./build/kvl_generate_q5 --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB" \
+            --max-new 8 --temperature 0 --seed 1 --show-tokens \
+            > "$RUNNER_TEMP/q5/evidence/canary-q5.txt" 2> "$RUNNER_TEMP/q5/evidence/canary-q5.err"
+          python - <<'PY'
+          import json, os, pathlib, re
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5/evidence'
+          a=(root/'canary-q8.txt').read_text(errors='replace').strip()
+          b=(root/'canary-q5.txt').read_text(errors='replace').strip()
+          pat=re.compile(r'generated ids:\s*([^\n]*)')
+          def ids(p):
+              m=pat.search(p.read_text(errors='replace')); return [int(x) for x in m.group(1).split()] if m else []
+          ia=ids(root/'canary-q8.err'); ib=ids(root/'canary-q5.err')
+          r={'baseline_text':a,'candidate_text':b,'baseline_ids':ia,'candidate_ids':ib,
+             'token_exact':ia==ib,'baseline_contains_782':'782' in a,'candidate_contains_782':'782' in b}
+          (root/'canary-summary.json').write_text(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          print('Q5_CANARY',json.dumps(r,sort_keys=True))
+          PY
+
+      - name: Run 14-prompt Q8 versus Q5 text A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_store_ab.py \
+            --suite "$TEXT_SUITE" \
+            --baseline-model-dir "$RUNNER_TEMP/q5/packed-q8" \
+            --candidate-model-dir "$RUNNER_TEMP/q5/packed-q5" \
+            --baseline-binary ./build/kvl_generate \
+            --candidate-binary ./build/kvl_generate_q5 \
+            --work-dir "$RUNNER_TEMP/q5/text-ab" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/q5/text-ab/store-ab-summary.json" "$RUNNER_TEMP/q5/evidence/text-ab-summary.json"
+
+      - name: Run six-case Q8 versus Q5 multimodal A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_vl_store_ab.py \
+            --suite "$RUNNER_TEMP/q5/vl-suite.json" \
+            --baseline-model-dir "$RUNNER_TEMP/q5/packed-q8" \
+            --candidate-model-dir "$RUNNER_TEMP/q5/packed-q5" \
+            --image-root "$RUNNER_TEMP/q5/vl-images" \
+            --vision-binary ./build/kvl_vision \
+            --baseline-generate-binary ./build/kvl_generate_vl \
+            --candidate-generate-binary ./build/kvl_generate_vl_q5 \
+            --work-dir "$RUNNER_TEMP/q5/vl-ab" \
+            --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/q5/vl-ab/vl-store-ab-summary.json" "$RUNNER_TEMP/q5/evidence/vl-ab-summary.json"
+
+      - name: Summarize Q5 promotion evidence without hiding quality regressions
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q5/evidence'
+          out={'schema':'kimi-q5-end-to-end-summary-v1','source_revision':os.environ['KIMI_REV']}
+          def load(name):
+              p=root/name
+              return json.loads(p.read_text()) if p.is_file() else None
+          physical=load('q5-physical-store.json'); canary=load('canary-summary.json')
+          text=load('text-ab-summary.json'); vl=load('vl-ab-summary.json')
+          out['physical']=physical; out['canary']=canary
+          if text:
+              a=text['aggregate']; rows=text['per_prompt']
+              first=sum(bool(r['baseline']['generated_ids']) and bool(r['candidate']['generated_ids']) and r['baseline']['generated_ids'][0]==r['candidate']['generated_ids'][0] for r in rows)
+              out['text']={**a,'first_token_exact_prompts':first}
+              out['text_divergent_outputs']=[{'id':r['id'],'baseline':r['baseline']['text'],'candidate':r['candidate']['text'],'first_divergence_position':r['comparison']['first_divergence_position']} for r in rows if not r['comparison']['token_exact']]
+          if vl:
+              a=vl['aggregate']; rows=vl['cases']
+              first=sum(bool(r['baseline']['generated_ids']) and bool(r['candidate']['generated_ids']) and r['baseline']['generated_ids'][0]==r['candidate']['generated_ids'][0] for r in rows)
+              out['vl']={**a,'first_token_exact_cases':first}
+              out['vl_divergent_outputs']=[{'id':r['id'],'baseline':r['baseline']['text'],'candidate':r['candidate']['text'],'first_divergence_position':r['comparison']['first_divergence_position']} for r in rows if not r['comparison']['token_exact']]
+          semantic_text=None if not text else text['aggregate']['sanity_preserved_when_baseline_passed']==text['aggregate']['baseline_sanity_pass']
+          semantic_vl=None if not vl else vl['aggregate']['sanity_preserved_when_baseline_passed']==vl['aggregate']['baseline_sanity_pass']
+          out['semantic_smoke_preserved']=(semantic_text is True and semantic_vl is True and bool(canary and canary.get('candidate_contains_782')))
+          out['claim_boundary']='Physical Q5 expert-store size and deterministic text/VL regression evidence only. No global quality or speed claim; promotion requires artifact inspection.'
+          (root/'q5-end-to-end-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print(json.dumps(out,indent=2,sort_keys=True))
+          PY
+
+      - name: Upload Q5 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-compression-q5-real-evidence
+          path: ${{ runner.temp }}/q5/evidence
+          if-no-files-found: warn
