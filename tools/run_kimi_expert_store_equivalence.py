@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Compare full and compacted Kimi Q8 expert stores under the same logical mask.
+"""Compare full and compacted Kimi Q8 expert stores under one logical mask.
 
-The two runs use the same trunk, prompt ids, mask, cache, generation parameters
-and executable. Only experts.bin/experts.idx change. Generated TOKEN stdout,
-routed-expert trace and raw logits dump must be byte-identical. This isolates
-expert-store layout equivalence from pruning quality: both sides already use the
-same pruning mask.
+The full-store run always receives --mask explicitly. By default the sparse-store
+run receives the same explicit mask too. With --sparse-auto-mask, KVL_MOE_MASK is
+removed from the sparse process environment so the native runtime must discover,
+validate and bind the sparse index's sibling .mask sidecar itself.
+
+Generated TOKEN stdout, routed-expert trace and raw logits dump must be
+byte-identical. This isolates expert-store layout/binding equivalence from pruning
+quality: both sides execute the same logical disabled-expert set.
 
 Use --media with kvl_generate_vl; omit it with kvl_generate.
 """
@@ -57,7 +60,7 @@ def run_variant(
     experts_idx: pathlib.Path,
     prompt_ids: pathlib.Path,
     media: pathlib.Path | None,
-    mask: pathlib.Path,
+    mask: pathlib.Path | None,
     work: pathlib.Path,
     cache_mib: int,
     max_new: int,
@@ -82,7 +85,12 @@ def run_variant(
     ])
 
     env = os.environ.copy()
-    env["KVL_MOE_MASK"] = str(mask)
+    if mask is None:
+        env.pop("KVL_MOE_MASK", None)
+        mask_mode = "sparse-sidecar-auto"
+    else:
+        env["KVL_MOE_MASK"] = str(mask)
+        mask_mode = "explicit"
     env["KVL_MOE_TRACE"] = str(trace)
     env["KVL_LOGITS_DUMP"] = str(logits)
     env["KVL_LOGITS_DUMP_LIMIT"] = "0"
@@ -98,6 +106,7 @@ def run_variant(
             raise RuntimeError(f"{name}: missing/empty evidence file {path}")
     return {
         "name": name,
+        "mask_mode": mask_mode,
         "experts_bin": str(experts_bin),
         "experts_idx": str(experts_idx),
         "stdout": str(stdout),
@@ -139,6 +148,10 @@ def main() -> int:
     ap.add_argument("--prompt-ids", type=pathlib.Path, required=True)
     ap.add_argument("--media", type=pathlib.Path)
     ap.add_argument("--mask", type=pathlib.Path, required=True)
+    ap.add_argument(
+        "--sparse-auto-mask", action="store_true",
+        help="omit KVL_MOE_MASK for sparse runtime and require its bound .mask sidecar",
+    )
     ap.add_argument("--work-dir", type=pathlib.Path, required=True)
     ap.add_argument("--cache-mib", type=int, default=512)
     ap.add_argument("--max-new", type=int, default=8)
@@ -160,6 +173,15 @@ def main() -> int:
     if missing:
         raise SystemExit("missing required files: " + ", ".join(missing))
 
+    if args.sparse_auto_mask:
+        sidecar = (
+            args.sparse_experts_idx.with_suffix(".mask")
+            if args.sparse_experts_idx.suffix == ".idx"
+            else pathlib.Path(str(args.sparse_experts_idx) + ".mask")
+        )
+        if not sidecar.is_file():
+            raise SystemExit(f"missing sparse bound mask sidecar: {sidecar}")
+
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=True)
     common = dict(
@@ -167,27 +189,33 @@ def main() -> int:
         trunk_bin=args.trunk_bin.resolve(), trunk_idx=args.trunk_idx.resolve(),
         prompt_ids=args.prompt_ids.resolve(),
         media=args.media.resolve() if args.media else None,
-        mask=args.mask.resolve(), work=work,
-        cache_mib=args.cache_mib, max_new=args.max_new,
+        work=work, cache_mib=args.cache_mib, max_new=args.max_new,
         temperature=args.temperature, seed=args.seed,
     )
     full = run_variant(
         "full-store-mask", experts_bin=args.full_experts_bin.resolve(),
-        experts_idx=args.full_experts_idx.resolve(), **common,
+        experts_idx=args.full_experts_idx.resolve(), mask=args.mask.resolve(), **common,
     )
     sparse = run_variant(
-        "sparse-store-mask", experts_bin=args.sparse_experts_bin.resolve(),
-        experts_idx=args.sparse_experts_idx.resolve(), **common,
+        "sparse-store-auto-mask" if args.sparse_auto_mask else "sparse-store-mask",
+        experts_bin=args.sparse_experts_bin.resolve(),
+        experts_idx=args.sparse_experts_idx.resolve(),
+        mask=None if args.sparse_auto_mask else args.mask.resolve(), **common,
     )
     checks = compare_outputs(full, sparse)
     report = {
-        "schema_version": 1,
-        "scope": "same-mask runtime expert-store layout equivalence; not a pruning-quality claim",
+        "schema_version": 2,
+        "scope": (
+            "full explicit-mask vs sparse bound-sidecar runtime equivalence; not a pruning-quality claim"
+            if args.sparse_auto_mask else
+            "same-mask runtime expert-store layout equivalence; not a pruning-quality claim"
+        ),
         "mode": "vl" if args.media else "text",
         "cache_mib": args.cache_mib,
         "max_new": args.max_new,
         "temperature": args.temperature,
         "seed": args.seed,
+        "sparse_auto_mask": args.sparse_auto_mask,
         "full": full,
         "sparse": sparse,
         "checks": checks,
@@ -207,7 +235,7 @@ def main() -> int:
         return 1
     print(
         f"KIMI_EXPERT_STORE_RUNTIME_EQ_PASS mode={report['mode']} "
-        f"max_new={args.max_new} report={out}"
+        f"max_new={args.max_new} sparse_mask={sparse['mask_mode']} report={out}"
     )
     return 0
 
