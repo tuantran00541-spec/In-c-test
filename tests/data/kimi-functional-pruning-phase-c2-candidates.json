@@ -1,0 +1,105 @@
+{
+  "base_candidate": {
+    "disabled_count": 50,
+    "mask_path": "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.mask",
+    "mask_sha256": "13ddf32e65c0dad8848fdf4ae299f12b7151a3bcc09145e89a4328c2b241ff6b",
+    "name": "adaptive-unseen-cap6"
+  },
+  "candidates": [
+    {
+      "added_over_base": 4,
+      "disabled_count": 54,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c2-mm54.mask",
+      "mask_sha256": "2b3395df1816db8a35d4703b5e37d9ca72f147856e6fb88cb7c6fb038c962ee3",
+      "name": "mm54",
+      "projected_reduction_fraction": 0.03245192307692308,
+      "projected_removed_bytes": 468246528,
+      "projected_sparse_expert_store_bytes": 13960683520
+    },
+    {
+      "added_over_base": 6,
+      "disabled_count": 56,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c2-mm56.mask",
+      "mask_sha256": "75f84a23d748a218b0ea03a3f28939b7d83bd6899ab70266f16b7a89b2fc8dff",
+      "name": "mm56",
+      "projected_reduction_fraction": 0.03365384615384615,
+      "projected_removed_bytes": 485588992,
+      "projected_sparse_expert_store_bytes": 13943341056
+    },
+    {
+      "added_over_base": 8,
+      "disabled_count": 58,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c2-mm58.mask",
+      "mask_sha256": "a6fa2bae37a58d45cfbb7ef329e6dfe26adc187e3b8c53ab1d03dec9430be2fa",
+      "name": "mm58",
+      "projected_reduction_fraction": 0.03485576923076923,
+      "projected_removed_bytes": 502931456,
+      "projected_sparse_expert_store_bytes": 13925998592
+    },
+    {
+      "added_over_base": 10,
+      "disabled_count": 60,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c2-mm60.mask",
+      "mask_sha256": "78168f93419ef8ed7b73c89a5d6c3b1eb3500c0907bee9fb11236768a7c9da1d",
+      "name": "mm60",
+      "projected_reduction_fraction": 0.036057692307692304,
+      "projected_removed_bytes": 520273920,
+      "projected_sparse_expert_store_bytes": 13908656128
+    },
+    {
+      "added_over_base": 12,
+      "disabled_count": 62,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c2-mm62.mask",
+      "mask_sha256": "7723fdc6ed70456f5bd983e571153e557074fb046166fbb5a9a33aaf4f67f6e0",
+      "name": "mm62",
+      "projected_reduction_fraction": 0.037259615384615384,
+      "projected_removed_bytes": 537616384,
+      "projected_sparse_expert_store_bytes": 13891313664
+    }
+  ],
+  "parent_run": {
+    "artifact_id": 9728333437,
+    "artifact_sha256": "9135f8d5ca40854ea827881286ad79fbbc45d80775e04289449b08c1f011b489",
+    "result": "mm64 passed text+VL next-token screen but text long-generation was 13/14 exact; eval-vi-en-01 first divergence position was 3 (zero-based, fourth generated token)",
+    "run_id": 33292975649
+  },
+  "phase": "C2",
+  "physical_projection": {
+    "bytes_per_expert_record": 8671232,
+    "full_q8_expert_store_bytes": 14428930048,
+    "projection_only": true
+  },
+  "ranking": {
+    "description": "the 14 mm64 additions sorted by the same Phase-C multimodal-aware score, weakest first; score reconstructed from Phase-A text calibration and VL-guard full traces",
+    "hard_constraints": [
+      "all 50 base-mask slots remain disabled",
+      "no new removals in layers 23-26",
+      "at most 6 disabled slots per layer including base",
+      "mm54 < mm56 < mm58 < mm60 < mm62 < prior mm64"
+    ],
+    "ranked_extras": [
+      {"expert": 30, "layer": 6, "rank": 1, "score": 0.06530410214840283},
+      {"expert": 37, "layer": 11, "rank": 2, "score": 0.13099091037014526},
+      {"expert": 23, "layer": 9, "rank": 3, "score": 0.18801530611984218},
+      {"expert": 20, "layer": 6, "rank": 4, "score": 0.2661921311994532},
+      {"expert": 58, "layer": 3, "rank": 5, "score": 0.5002822132912563},
+      {"expert": 38, "layer": 5, "rank": 6, "score": 0.5481665985604154},
+      {"expert": 43, "layer": 11, "rank": 7, "score": 0.6001501422772086},
+      {"expert": 32, "layer": 8, "rank": 8, "score": 0.7508552889899233},
+      {"expert": 47, "layer": 6, "rank": 9, "score": 0.9727553062842992},
+      {"expert": 39, "layer": 14, "rank": 10, "score": 0.9855264159877101},
+      {"expert": 17, "layer": 9, "rank": 11, "score": 1.0004120850522082},
+      {"expert": 45, "layer": 11, "rank": 12, "score": 1.0036913900204394},
+      {"expert": 42, "layer": 8, "rank": 13, "score": 1.0341049940357256},
+      {"expert": 28, "layer": 6, "rank": 14, "score": 1.0715625593082443}
+    ],
+    "score": "1000*max(per-layer text saliency fraction, per-layer media saliency fraction)+0.3*(text calibration file support/16)+0.5*(media case support/4)+late-layer penalty"
+  },
+  "schema_version": 1,
+  "scope": "conservative nested backoff after Phase-C mm64 long-generation rejection; sentinel is diagnostic only, final promotion still requires full text/VL and physical sparse-store gates",
+  "sentinel": {
+    "id": "eval-vi-en-01",
+    "max_new": 4,
+    "reason": "prior mm64 divergence was at zero-based generated-token position 3, so four deterministic greedy tokens catch that known regression before expensive full long-generation"
+  }
+}
