@@ -4,8 +4,8 @@
 This guard complements the text-only Phase A/B experiments. For each image+text
 case it runs the full Q8 expert store and one logical expert mask with max_new=1,
 collecting routed-expert traces and the first next-token logit distribution.
-It reports direct baseline selections of masked experts, route cascades, token
-agreement, and logit drift.
+It reports direct baseline selections of masked experts, splits those selections
+by media-vs-text prompt token, route cascades, token agreement, and logit drift.
 
 Passing this screen is not a global multimodal quality claim and does not by
 itself authorize physical expert deletion.
@@ -34,6 +34,7 @@ VL_TIMING_RE = re.compile(
     r"\[kvl-vl\] timing vision=([0-9.]+)s first_text_token=([0-9.]+)s "
     r"avg_next=([0-9.]+)s text_total=([0-9.]+)s generated=(\d+)"
 )
+MEDIA_PAD_ID = 163605
 
 
 def validate_suite(path: Path) -> dict:
@@ -76,6 +77,24 @@ def read_mask(path: Path) -> set[tuple[int, int]]:
     return out
 
 
+def read_prompt_ids(path: Path) -> list[int]:
+    ids = []
+    for lineno, raw in enumerate(path.read_text(encoding="ascii").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            token = int(line)
+        except ValueError as e:
+            raise ValueError(f"{path}:{lineno}: invalid token id {line!r}") from e
+        if token < 0:
+            raise ValueError(f"{path}:{lineno}: negative token id")
+        ids.append(token)
+    if not ids:
+        raise ValueError(f"{path}: empty prompt ids")
+    return ids
+
+
 def parse_generated(stderr: str) -> list[int]:
     m = VL_GENERATED_RE.search(stderr)
     if not m:
@@ -85,7 +104,7 @@ def parse_generated(stderr: str) -> list[int]:
 
 
 def parse_vl_runtime(stderr: str) -> dict:
-    out = parse_runtime(stderr)  # Reuse cache-report parser; VL timing has a different line.
+    out = parse_runtime(stderr)
     m = VL_TIMING_RE.search(stderr)
     if m:
         out["vl_timing"] = {
@@ -98,10 +117,35 @@ def parse_vl_runtime(stderr: str) -> dict:
     return out
 
 
-def direct_mask_hits(trace: Path, mask: set[tuple[int, int]]) -> dict:
+def _event_modality(event: int, layer: int, prompt_ids: list[int]) -> tuple[str, int]:
+    """Map max_new=1 layer-major VL prefill trace events back to prompt tokens."""
+    if event <= 0 or layer <= 0:
+        raise ValueError(f"invalid VL trace event/layer event={event} layer={layer}")
+    n = len(prompt_ids)
+    zero = event - 1
+    expected_layer = zero // n + 1
+    position = zero % n
+    if expected_layer != layer:
+        raise ValueError(
+            f"VL trace ordering mismatch event={event} layer={layer} "
+            f"expected_layer={expected_layer} prompt_tokens={n}"
+        )
+    modality = "media" if prompt_ids[position] == MEDIA_PAD_ID else "text"
+    return modality, position
+
+
+def direct_mask_hits(
+    trace: Path,
+    mask: set[tuple[int, int]],
+    prompt_ids: list[int] | None = None,
+) -> dict:
     counts: dict[tuple[int, int], int] = {}
     saliency: dict[tuple[int, int], float] = {}
-    total = 0
+    media_counts: dict[tuple[int, int], int] = {}
+    text_counts: dict[tuple[int, int], int] = {}
+    media_saliency: dict[tuple[int, int], float] = {}
+    text_saliency: dict[tuple[int, int], float] = {}
+    total = media_total = text_total = 0
     for lineno, raw in enumerate(trace.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -109,7 +153,7 @@ def direct_mask_hits(trace: Path, mask: set[tuple[int, int]]) -> dict:
         parts = line.split()
         if len(parts) != 6:
             raise ValueError(f"{trace}:{lineno}: expected six columns")
-        _, layer, expert = map(int, parts[:3])
+        event, layer, expert = map(int, parts[:3])
         key = (layer, expert)
         if key not in mask:
             continue
@@ -117,24 +161,51 @@ def direct_mask_hits(trace: Path, mask: set[tuple[int, int]]) -> dict:
         counts[key] = counts.get(key, 0) + 1
         saliency[key] = saliency.get(key, 0.0) + s
         total += 1
+        if prompt_ids is not None:
+            modality, _ = _event_modality(event, layer, prompt_ids)
+            if modality == "media":
+                media_counts[key] = media_counts.get(key, 0) + 1
+                media_saliency[key] = media_saliency.get(key, 0.0) + s
+                media_total += 1
+            else:
+                text_counts[key] = text_counts.get(key, 0) + 1
+                text_saliency[key] = text_saliency.get(key, 0.0) + s
+                text_total += 1
+    if prompt_ids is not None and media_total + text_total != total:
+        raise RuntimeError("modality accounting does not sum to direct masked selections")
     return {
         "selections": total,
         "unique_slots": len(counts),
+        "media_selections": media_total if prompt_ids is not None else None,
+        "text_selections": text_total if prompt_ids is not None else None,
+        "media_unique_slots": len(media_counts) if prompt_ids is not None else None,
+        "text_unique_slots": len(text_counts) if prompt_ids is not None else None,
         "slots": [
-            {"layer": l, "expert": e, "count": counts[(l, e)], "saliency": saliency[(l, e)]}
+            {
+                "layer": l,
+                "expert": e,
+                "count": counts[(l, e)],
+                "saliency": saliency[(l, e)],
+                "media_count": media_counts.get((l, e), 0) if prompt_ids is not None else None,
+                "text_count": text_counts.get((l, e), 0) if prompt_ids is not None else None,
+                "media_saliency": media_saliency.get((l, e), 0.0) if prompt_ids is not None else None,
+                "text_saliency": text_saliency.get((l, e), 0.0) if prompt_ids is not None else None,
+            }
             for l, e in sorted(counts)
         ],
     }
 
 
 def vl_cmd(model: Path, image: Path, prompt: str, vision_binary: Path,
-           generate_binary: Path, cache_mib: int, ram_mib: int) -> list[str]:
+           generate_binary: Path, cache_mib: int, ram_mib: int,
+           prompt_ids_out: Path) -> list[str]:
     return [
         sys.executable, str(VL_CHAT), str(model), str(image), prompt,
         "--vision-binary", str(vision_binary),
         "--generate-binary", str(generate_binary),
         "--cache-mib", str(cache_mib), "--ram-mib", str(ram_mib),
         "--max-new", "1", "--temperature", "0", "--seed", "1", "--show-tokens",
+        "--prompt-ids-out", str(prompt_ids_out),
     ]
 
 
@@ -148,6 +219,7 @@ def run_one(item: dict, variant: str, mask: Path | None, model: Path,
         raise RuntimeError(f"missing VL image: {image}")
     trace = root / "route.tsv"
     logits = root / "logits.bin"
+    prompt_ids_path = root / "prompt.ids"
     env = os.environ.copy()
     env["KVL_MOE_TRACE"] = str(trace)
     env["KVL_LOGITS_DUMP"] = str(logits)
@@ -157,18 +229,23 @@ def run_one(item: dict, variant: str, mask: Path | None, model: Path,
     else:
         env["KVL_MOE_MASK"] = str(mask)
     proc = run_checked(
-        vl_cmd(model, image, item["prompt"], vision_binary, generate_binary, cache_mib, ram_mib),
+        vl_cmd(model, image, item["prompt"], vision_binary, generate_binary,
+               cache_mib, ram_mib, prompt_ids_path),
         env=env, stdout_path=root / "output.txt", stderr_path=root / "stderr.txt",
     )
     if not trace.is_file() or trace.stat().st_size == 0:
         raise RuntimeError(f"empty VL route trace: {trace}")
     if not logits.is_file() or logits.stat().st_size == 0:
         raise RuntimeError(f"empty VL logits dump: {logits}")
+    prompt_ids = read_prompt_ids(prompt_ids_path)
     result = {
         "variant": variant,
         "generated_ids": parse_generated(proc.stderr),
         "trace": str(trace),
         "logits": str(logits),
+        "prompt_ids": str(prompt_ids_path),
+        "prompt_tokens": len(prompt_ids),
+        "media_tokens": sum(int(t == MEDIA_PAD_ID) for t in prompt_ids),
         "text": proc.stdout.strip(),
     }
     result.update(parse_vl_runtime(proc.stderr))
@@ -233,14 +310,25 @@ def main() -> int:
 
     rows = []
     all_hit_slots: set[tuple[int, int]] = set()
+    media_hit_slots: set[tuple[int, int]] = set()
+    text_hit_slots: set[tuple[int, int]] = set()
     for index, item in enumerate(data["cases"], 1):
         base = run_one(item, "full", None, model, image_root, vision_binary,
                        generate_binary, work, args.cache_mib, args.ram_mib)
         cand = run_one(item, "candidate", mask_path, model, image_root, vision_binary,
                        generate_binary, work, args.cache_mib, args.ram_mib)
-        direct = direct_mask_hits(Path(base["trace"]), mask)
+        base_prompt_ids = read_prompt_ids(Path(base["prompt_ids"]))
+        cand_prompt_ids = read_prompt_ids(Path(cand["prompt_ids"]))
+        if cand_prompt_ids != base_prompt_ids:
+            raise RuntimeError(f"{item['id']}: full/candidate prompt ids differ")
+        direct = direct_mask_hits(Path(base["trace"]), mask, base_prompt_ids)
         for s in direct["slots"]:
-            all_hit_slots.add((s["layer"], s["expert"]))
+            key = (s["layer"], s["expert"])
+            all_hit_slots.add(key)
+            if s["media_count"]:
+                media_hit_slots.add(key)
+            if s["text_count"]:
+                text_hit_slots.add(key)
         comp = compare_case(item["id"], base, cand, work)
         substitutions = int(comp["route"]["substitutions"])
         cascade = substitutions - int(direct["selections"])
@@ -256,6 +344,7 @@ def main() -> int:
         print(
             f"VL_GUARD {index}/{len(data['cases'])} id={item['id']} "
             f"token_exact={comp['first_token_exact']} direct={direct['selections']} "
+            f"media={direct['media_selections']} text={direct['text_selections']} "
             f"route_sub={substitutions} cascade={cascade} "
             f"argmax={comp['logits']['argmax_agree_records']}/{comp['logits']['records']} "
             f"js={comp['logits']['max_js_divergence']:.9g}",
@@ -264,10 +353,12 @@ def main() -> int:
 
     comparisons = [r["comparison"] for r in rows]
     direct_total = sum(r["direct_mask_hits"]["selections"] for r in rows)
+    media_direct_total = sum(r["direct_mask_hits"]["media_selections"] for r in rows)
+    text_direct_total = sum(r["direct_mask_hits"]["text_selections"] for r in rows)
     substitutions_total = sum(r["comparison"]["route"]["substitutions"] for r in rows)
     summary = {
-        "schema_version": 1,
-        "scope": "next-token multimodal sensitivity guard; not a global multimodal quality claim",
+        "schema_version": 2,
+        "scope": "next-token multimodal sensitivity guard with media-vs-text route attribution; not a global multimodal quality claim",
         "mask": str(mask_path),
         "mask_entries": len(mask),
         "cases": rows,
@@ -278,7 +369,11 @@ def main() -> int:
             "logit_max_js_divergence": max(c["logits"]["max_js_divergence"] for c in comparisons),
             "logit_min_topk_overlap": min(c["logits"]["min_topk_overlap_fraction"] for c in comparisons),
             "direct_masked_selections": direct_total,
+            "media_direct_masked_selections": media_direct_total,
+            "text_direct_masked_selections": text_direct_total,
             "unique_masked_slots_hit": len(all_hit_slots),
+            "media_unique_masked_slots_hit": len(media_hit_slots),
+            "text_unique_masked_slots_hit": len(text_hit_slots),
             "route_substitutions": substitutions_total,
             "cascade_substitutions": substitutions_total - direct_total,
         },
@@ -291,6 +386,7 @@ def main() -> int:
         f"exact={a['first_token_exact']}/{a['cases']} "
         f"argmax={a['logit_argmax_agree']}/{a['cases']} "
         f"hit_slots={a['unique_masked_slots_hit']} direct={a['direct_masked_selections']} "
+        f"media={a['media_direct_masked_selections']} text={a['text_direct_masked_selections']} "
         f"substitutions={a['route_substitutions']} max_js={a['logit_max_js_divergence']:.9g} "
         f"summary={out}"
     )
