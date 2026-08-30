@@ -19,6 +19,7 @@ on:
       - "tools/run_kimi_pruning_phase_b.py"
       - "tools/run_kimi_pruning_vl_guard.py"
       - "tools/run_kimi_pruning_vl_phase_b.py"
+      - "tools/run_kimi_pruning_multi_screen.py"
       - "tools/compact_expert_store.py"
       - "tools/verify_compact_expert_store.py"
       - "tools/run_kimi_expert_store_equivalence.py"
@@ -28,6 +29,7 @@ on:
       - "tests/test_kimi_phase_b.py"
       - "tests/test_kimi_vl_pruning_guard.py"
       - "tests/test_kimi_vl_phase_b.py"
+      - "tests/test_kimi_pruning_multi_screen.py"
       - "tests/test_compact_expert_store.py"
       - "tests/test_verify_compact_expert_store.py"
       - "tests/test_sparse_expert_store_runtime.py"
@@ -35,6 +37,7 @@ on:
       - "tests/test_kimi_mask_novelty.py"
       - "tests/data/kimi-functional-pruning-suite.json"
       - "tests/data/kimi-functional-pruning-vl-suite.json"
+      - "tests/data/kimi-functional-pruning-phase-c-*.mask"
       - ".github/workflows/kimi-functional-pruning.yml"
   workflow_dispatch:
 
@@ -62,6 +65,7 @@ jobs:
           python -m py_compile tools/run_kimi_pruning_phase_b.py
           python -m py_compile tools/run_kimi_pruning_vl_guard.py
           python -m py_compile tools/run_kimi_pruning_vl_phase_b.py
+          python -m py_compile tools/run_kimi_pruning_multi_screen.py
           python -m py_compile tools/compact_expert_store.py
           python -m py_compile tools/verify_compact_expert_store.py
           python -m py_compile tools/run_kimi_expert_store_equivalence.py
@@ -71,6 +75,7 @@ jobs:
           python -m py_compile tests/test_kimi_phase_b.py
           python -m py_compile tests/test_kimi_vl_pruning_guard.py
           python -m py_compile tests/test_kimi_vl_phase_b.py
+          python -m py_compile tests/test_kimi_pruning_multi_screen.py
           python -m py_compile tests/test_compact_expert_store.py
           python -m py_compile tests/test_verify_compact_expert_store.py
           python -m py_compile tests/test_sparse_expert_store_runtime.py
@@ -92,6 +97,14 @@ jobs:
         run: python tools/run_kimi_pruning_vl_phase_b.py --validate-only
       - name: VL Phase B synthetic test
         run: python tests/test_kimi_vl_phase_b.py
+      - name: Phase C multi-screen validation
+        run: |
+          python tools/run_kimi_pruning_multi_screen.py --validate-only \
+            --candidate mm64=tests/data/kimi-functional-pruning-phase-c-mm64.mask \
+            --candidate mm80=tests/data/kimi-functional-pruning-phase-c-mm80.mask \
+            --candidate mm96=tests/data/kimi-functional-pruning-phase-c-mm96.mask
+      - name: Phase C multi-screen synthetic test
+        run: python tests/test_kimi_pruning_multi_screen.py
       - name: Expert-store compaction synthetic test
         run: python tests/test_compact_expert_store.py
       - name: Expert-store byte verification synthetic test
