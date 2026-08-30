@@ -98,6 +98,17 @@ target_compile_definitions(kvl_generate PRIVATE kvl_moe_token_bf16=kvl_moe_token
 add_executable(kvl_generate_vl src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
+
+# Research-only generators: exact same generation path, but the MoE call is
+# wrapped after computation to emit compact routed-token activation evidence
+# when KVL_MOE_ACT_TRACE is set. Production generators above are unchanged.
+add_executable(kvl_generate_trace src/generate.c src/logits_dump.c src/moe_activation_trace.c)
+target_link_libraries(kvl_generate_trace PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_trace PRIVATE kvl_moe_token_bf16=kvl_moe_token_trace_auto)
+add_executable(kvl_generate_vl_trace src/generate_vl.c src/logits_dump.c src/moe_activation_trace.c)
+target_link_libraries(kvl_generate_vl_trace PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_vl_trace PRIVATE kvl_moe_token_bf16=kvl_moe_token_trace_auto)
+
 add_executable(kvl_vision src/vision_probe.c)
 target_link_libraries(kvl_vision PRIVATE kvl_storage)
 add_executable(kvl_q8_probe src/q8_probe.c)
