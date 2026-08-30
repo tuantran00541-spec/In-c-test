@@ -1,0 +1,35 @@
+{
+  "schema": "kimi-compression-q0-pilot-v1",
+  "source_revision": "398eede0903cd983a2bfa0cc634e9ac1d843f375",
+  "source_ranking": "tests/data/kimi-functional-pruning-phase-c2-candidates.json",
+  "purpose": "Measure RTN Q8/Q6/Q5/Q4 sensitivity on the 14 Phase-C2 boundary extras before implementing a native low-bit format.",
+  "bits": [8, 6, 5, 4],
+  "group_size": 128,
+  "capacity_per_kind": 4,
+  "calibration": {
+    "text": "the 16 calibration prompts from tests/data/kimi-functional-pruning-suite.json",
+    "vl": "the six-case Phase-C2 VL suite (four preserved cases plus diagonal/count synthetic cases)",
+    "note": "VL traces contain all text+media-token MoE inputs in multimodal context; they are labeled vl rather than claiming every traced activation is a media token."
+  },
+  "experts": [
+    {"rank": 1, "layer": 6, "expert": 30, "c2_score": 0.06530410214840283, "boundary_role": "mm54/mm56 survivor"},
+    {"rank": 2, "layer": 11, "expert": 37, "c2_score": 0.13099091037014526, "boundary_role": "mm54/mm56 survivor"},
+    {"rank": 3, "layer": 9, "expert": 23, "c2_score": 0.18801530611984218, "boundary_role": "mm54 survivor"},
+    {"rank": 4, "layer": 6, "expert": 20, "c2_score": 0.2661921311994532, "boundary_role": "mm54 survivor"},
+    {"rank": 5, "layer": 3, "expert": 58, "c2_score": 0.5002822132912563, "boundary_role": "mm56 survivor"},
+    {"rank": 6, "layer": 5, "expert": 38, "c2_score": 0.5481665985604154, "boundary_role": "mm56 survivor"},
+    {"rank": 7, "layer": 11, "expert": 43, "c2_score": 0.6001501422772086, "boundary_role": "first mm58 addition; mm58 crossed sentinel boundary"},
+    {"rank": 8, "layer": 8, "expert": 32, "c2_score": 0.7508552889899233, "boundary_role": "second mm58 addition; mm58 crossed sentinel boundary"},
+    {"rank": 9, "layer": 6, "expert": 47, "c2_score": 0.9727553062842992, "boundary_role": "stronger rejected-side control"},
+    {"rank": 10, "layer": 14, "expert": 39, "c2_score": 0.9855264159877101, "boundary_role": "stronger rejected-side control"},
+    {"rank": 11, "layer": 9, "expert": 17, "c2_score": 1.0004120850522082, "boundary_role": "stronger rejected-side control"},
+    {"rank": 12, "layer": 11, "expert": 45, "c2_score": 1.0036913900204394, "boundary_role": "stronger rejected-side control"},
+    {"rank": 13, "layer": 8, "expert": 42, "c2_score": 1.0341049940357256, "boundary_role": "stronger rejected-side control"},
+    {"rank": 14, "layer": 6, "expert": 28, "c2_score": 1.0715625593082443, "boundary_role": "stronger rejected-side control"}
+  ],
+  "claims": {
+    "projection_only": true,
+    "native_low_bit_format_implemented": false,
+    "end_to_end_low_bit_quality_tested": false
+  }
+}
