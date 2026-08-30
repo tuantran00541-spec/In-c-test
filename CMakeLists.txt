@@ -36,6 +36,7 @@ add_library(kvl_storage
   src/ops.c
   src/mla_prefill_streaming.c
   src/q8_ops.c
+  src/q5_ops.c
   src/mla_state.c
   src/mla_compressed_state.c
   src/mla_compressed_q8_state.c
@@ -99,6 +100,15 @@ add_executable(kvl_generate_vl src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
 
+# Separate Q5 research binaries keep the established Q8 dispatch untouched so a
+# real-weight A/B can use the same trunk/vision/tokenizer with different expert stores.
+add_executable(kvl_generate_q5 src/generate.c src/logits_dump.c)
+target_link_libraries(kvl_generate_q5 PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_q5 PRIVATE kvl_moe_token_bf16=kvl_moe_token_q5_auto)
+add_executable(kvl_generate_vl_q5 src/generate_vl.c src/logits_dump.c)
+target_link_libraries(kvl_generate_vl_q5 PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_vl_q5 PRIVATE kvl_moe_token_bf16=kvl_moe_token_q5_auto)
+
 # Research-only generators: exact same generation path, but the MoE call is
 # wrapped after computation to emit compact routed-token activation evidence
 # when KVL_MOE_ACT_TRACE is set. Production generators above are unchanged.
@@ -113,3 +123,5 @@ add_executable(kvl_vision src/vision_probe.c)
 target_link_libraries(kvl_vision PRIVATE kvl_storage)
 add_executable(kvl_q8_probe src/q8_probe.c)
 target_link_libraries(kvl_q8_probe PRIVATE kvl_storage)
+add_executable(kvl_q5_probe src/q5_probe.c)
+target_link_libraries(kvl_q5_probe PRIVATE kvl_storage)
