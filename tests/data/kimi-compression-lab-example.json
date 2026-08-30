@@ -1,0 +1,9 @@
+{
+  "schema": "kimi-expert-quant-sensitivity-v1",
+  "metadata": {"layer": 1, "expert": 0},
+  "projection_only": true,
+  "candidates": [
+    {"bits": 8, "projected_total_bytes_f16_scales": 100, "relative_l2": 0.0},
+    {"bits": 4, "projected_total_bytes_f16_scales": 55, "relative_l2": 0.1}
+  ]
+}
