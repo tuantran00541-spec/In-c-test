@@ -1,0 +1,63 @@
+{
+  "base_candidate": {
+    "disabled_count": 50,
+    "mask_sha256": "13ddf32e65c0dad8848fdf4ae299f12b7151a3bcc09145e89a4328c2b241ff6b",
+    "name": "adaptive-unseen-cap6",
+    "phase_a_artifact_id": 9717382899,
+    "phase_a_artifact_sha256": "a47483f37c51979df001a6adfe88d788d3618c6fa71981960b6de598045c0fd4",
+    "phase_a_run_id": 33259183604,
+    "vl_guard_artifact_id": 9724746706,
+    "vl_guard_artifact_sha256": "cd99c05f5f08f4a1c7b16c734c0b8e728a998b25960344b5ebf4ef5d2cbfce21",
+    "vl_guard_run_id": 33286213813
+  },
+  "candidates": [
+    {
+      "name": "mm64",
+      "disabled_count": 64,
+      "added_over_base": 14,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c-mm64.mask",
+      "mask_sha256": "7781c4944bec1ffa125b2feb62a854dea54d56a9d6e730f899ad46a2fefcd0f5",
+      "projected_reduction_fraction": 0.038461538461538464,
+      "projected_removed_bytes": 554958848,
+      "projected_sparse_expert_store_bytes": 13873971200
+    },
+    {
+      "name": "mm80",
+      "disabled_count": 80,
+      "added_over_base": 30,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c-mm80.mask",
+      "mask_sha256": "725b0aadf865c952a5e35bab9e850d6188375cc5d3a91e763d6854458797debf",
+      "projected_reduction_fraction": 0.04807692307692308,
+      "projected_removed_bytes": 693698560,
+      "projected_sparse_expert_store_bytes": 13735231488
+    },
+    {
+      "name": "mm96",
+      "disabled_count": 96,
+      "added_over_base": 46,
+      "mask_path": "tests/data/kimi-functional-pruning-phase-c-mm96.mask",
+      "mask_sha256": "b1098ea9a9865903c337950b91188db97b5d92e4b7fa72ab2069ca9d98058baa",
+      "projected_reduction_fraction": 0.057692307692307696,
+      "projected_removed_bytes": 832438272,
+      "projected_sparse_expert_store_bytes": 13596491776
+    }
+  ],
+  "phase": "C",
+  "physical_projection": {
+    "bytes_per_expert_record": 8671232,
+    "full_q8_expert_store_bytes": 14428930048,
+    "projection_only": true
+  },
+  "ranking": {
+    "description": "rank additional slots by conservative combined evidence from Phase-A text calibration full traces and VL-guard full traces",
+    "hard_constraints": [
+      "all 50 base-mask slots remain disabled",
+      "no new removals in layers 23-26",
+      "at most 6 disabled slots per layer including the base mask",
+      "candidate masks are nested: mm64 subset mm80 subset mm96"
+    ],
+    "score": "1000*max(per-layer text saliency fraction, per-layer media saliency fraction)+0.3*(text calibration file support/16)+0.5*(media case support/4)+late-layer penalty"
+  },
+  "schema_version": 1,
+  "scope": "multimodal-aware logical expert-mask candidates; require fresh text+VL regression before any physical promotion"
+}
