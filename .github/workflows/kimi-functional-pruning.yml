@@ -21,6 +21,7 @@ on:
       - "tools/run_kimi_pruning_vl_phase_b.py"
       - "tools/compact_expert_store.py"
       - "tools/verify_compact_expert_store.py"
+      - "tools/run_kimi_expert_store_equivalence.py"
       - "tests/test_kimi_functional_pruning.py"
       - "tests/test_kimi_functional_suite.py"
       - "tests/test_kimi_phase_a_gate.py"
@@ -30,6 +31,7 @@ on:
       - "tests/test_compact_expert_store.py"
       - "tests/test_verify_compact_expert_store.py"
       - "tests/test_sparse_expert_store_runtime.py"
+      - "tests/test_kimi_expert_store_equivalence.py"
       - "tests/test_kimi_mask_novelty.py"
       - "tests/data/kimi-functional-pruning-suite.json"
       - "tests/data/kimi-functional-pruning-vl-suite.json"
@@ -62,6 +64,7 @@ jobs:
           python -m py_compile tools/run_kimi_pruning_vl_phase_b.py
           python -m py_compile tools/compact_expert_store.py
           python -m py_compile tools/verify_compact_expert_store.py
+          python -m py_compile tools/run_kimi_expert_store_equivalence.py
           python -m py_compile tests/test_kimi_functional_pruning.py
           python -m py_compile tests/test_kimi_functional_suite.py
           python -m py_compile tests/test_kimi_phase_a_gate.py
@@ -71,6 +74,7 @@ jobs:
           python -m py_compile tests/test_compact_expert_store.py
           python -m py_compile tests/test_verify_compact_expert_store.py
           python -m py_compile tests/test_sparse_expert_store_runtime.py
+          python -m py_compile tests/test_kimi_expert_store_equivalence.py
           python -m py_compile tests/test_kimi_mask_novelty.py
       - name: Phase A suite validation
         run: python tools/run_kimi_pruning_phase_a.py --validate-only
@@ -94,6 +98,8 @@ jobs:
         run: python tests/test_verify_compact_expert_store.py
       - name: Sparse expert-store C runtime test
         run: python tests/test_sparse_expert_store_runtime.py
+      - name: Expert-store runtime equivalence synthetic test
+        run: python tests/test_kimi_expert_store_equivalence.py
       - name: Mask novelty synthetic test
         run: python tests/test_kimi_mask_novelty.py
       - name: C logits dump roundtrip
