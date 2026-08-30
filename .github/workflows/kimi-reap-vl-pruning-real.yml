@@ -1,0 +1,383 @@
+name: Real Kimi REAP-VL pruning gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-reap-vl-pruning-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reap-vl-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      TEXT_SUITE: "tests/data/kimi-functional-pruning-suite.json"
+      OLD_MM56: "tests/data/kimi-functional-pruning-phase-c2-mm56.mask"
+      TEXT_CACHE_MIB: "1536"
+      VL_CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Q8 oracle and validate REAP-VL tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_vl
+          test -x ./build/kvl_vision
+          python -m py_compile tools/analyze_kimi_reap_vl.py
+          python tests/test_kimi_reap_vl.py
+          python tests/test_q8_matvec.py --build-dir build
+          mkdir -p "$RUNNER_TEMP/reap/evidence" "$RUNNER_TEMP/reap/vl-images"
+
+      - name: Restore six VL calibration and regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/reap/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/reap/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]: d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          for row in suite['cases']:
+              if row['id']=='vl-synthetic-shapes': row['sanity_contains']=['red','blue','green']
+              if row['id']=='vl-synthetic-checker': row['sanity_contains']=['checker']
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':16,
+               'prompt':'Describe the dominant line pattern in this image in one short sentence.',
+               'sanity_contains':['diagonal','purple']},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':4,
+               'prompt':'How many red circles are visible? Reply with only the integer.',
+               'sanity_contains':['5']},
+          ])
+          assert len(suite['cases'])==6
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          print('REAP_VL_SUITE_READY cases=6')
+          PY
+          python tools/run_kimi_pruning_vl_guard.py --validate-only --suite "$RUNNER_TEMP/reap/vl-suite.json"
+          python tools/run_kimi_pruning_vl_phase_b.py --validate-only --suite "$RUNNER_TEMP/reap/vl-suite.json"
+
+      - name: Fetch pinned metadata and initial MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'reap/kimi-source'; root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(repo_id='moonshotai/Kimi-VL-A3B-Instruct',revision=os.environ['KIMI_REV'],filename=name,local_dir=root))
+          PY
+
+      - name: Pack pinned full Q8 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/reap/kimi-source"
+          packed="$RUNNER_TEMP/reap/packed-q8"
+          python tools/pack_vision.py "$src" "$packed"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin" && test -s "$packed/vision.bin"
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/packed-q8'
+          expected=14428930048
+          got=(p/'experts.bin').stat().st_size
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'REAP_Q8_ORACLE_PASS records={h[5]} bytes={got}')
+          PY
+          df -h "$RUNNER_TEMP"
+
+      - name: Collect 16-prompt text REAP calibration traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/text-cal'; root.mkdir(parents=True,exist_ok=True)
+          suite=json.loads(pathlib.Path(os.environ['TEXT_SUITE']).read_text())
+          items=suite['calibration']; assert len(items)==16
+          for i,item in enumerate(items,1):
+              trace=root/f'{i:02d}-{item["id"]}.tsv'
+              env=os.environ.copy(); env['KVL_MOE_TRACE']=str(trace)
+              cmd=[sys.executable,'tools/kvl_chat.py',str(pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/packed-q8'),item['prompt'],
+                   '--binary','./build/kvl_generate','--cache-mib',os.environ['TEXT_CACHE_MIB'],'--ram-mib',os.environ['RAM_MIB'],
+                   '--max-new','1','--temperature','0','--seed','1','--show-tokens']
+              with (root/f'{i:02d}.out').open('w') as out, (root/f'{i:02d}.err').open('w') as err:
+                  subprocess.run(cmd,env=env,stdout=out,stderr=err,check=True,text=True)
+              assert trace.is_file() and trace.stat().st_size>0
+              print(f'REAP_TEXT_CAL {i}/{len(items)} id={item["id"]} bytes={trace.stat().st_size}',flush=True)
+          PY
+
+      - name: Collect six-case VL media versus text REAP calibration traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap'
+          suite=json.loads((base/'vl-suite.json').read_text())
+          root=base/'vl-cal'; root.mkdir(parents=True,exist_ok=True)
+          for i,item in enumerate(suite['cases'],1):
+              case=root/item['id']; case.mkdir(parents=True,exist_ok=True)
+              trace=case/'route.tsv'; ids=case/'prompt.ids'
+              env=os.environ.copy(); env['KVL_MOE_TRACE']=str(trace)
+              cmd=[sys.executable,'tools/kvl_vl_chat.py',str(base/'packed-q8'),str(base/'vl-images'/item['image']),item['prompt'],
+                   '--vision-binary','./build/kvl_vision','--generate-binary','./build/kvl_generate_vl',
+                   '--cache-mib',os.environ['VL_CACHE_MIB'],'--ram-mib',os.environ['RAM_MIB'],
+                   '--max-new','1','--temperature','0','--seed','1','--show-tokens','--prompt-ids-out',str(ids)]
+              with (case/'output.txt').open('w') as out, (case/'stderr.txt').open('w') as err:
+                  subprocess.run(cmd,env=env,stdout=out,stderr=err,check=True,text=True)
+              assert trace.is_file() and trace.stat().st_size>0 and ids.is_file() and ids.stat().st_size>0
+              print(f'REAP_VL_CAL {i}/{len(suite["cases"])} id={item["id"]} trace_bytes={trace.stat().st_size}',flush=True)
+          PY
+
+      - name: Build modality-aware nested REAP-VL masks
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for f in "$RUNNER_TEMP"/reap/text-cal/*.tsv; do args+=(--trace "text=$f"); done
+          for d in "$RUNNER_TEMP"/reap/vl-cal/*; do args+=(--vl-trace "$d/route.tsv=$d/prompt.ids"); done
+          python tools/analyze_kimi_reap_vl.py \
+            "${args[@]}" --n-experts 64 --n-groups 8 \
+            --target 56 80 104 128 152 \
+            --max-disabled-per-layer 6 --max-disabled-per-group 1 \
+            --out-dir "$RUNNER_TEMP/reap/analysis"
+          cp "$RUNNER_TEMP/reap/analysis/report.json" "$RUNNER_TEMP/reap/evidence/reap-vl-report.json"
+          cp "$RUNNER_TEMP/reap/analysis/ranking.tsv" "$RUNNER_TEMP/reap/evidence/reap-vl-ranking.tsv"
+          cp "$RUNNER_TEMP"/reap/analysis/mask-reap*.txt "$RUNNER_TEMP/reap/evidence/"
+          cp "$OLD_MM56" "$RUNNER_TEMP/reap/evidence/old-mm56.mask"
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap'
+          def mask(p):
+              out=set()
+              for raw in pathlib.Path(p).read_text().splitlines():
+                  line=raw.split('#',1)[0].strip()
+                  if line: out.add(tuple(map(int,line.split())))
+              return out
+          old=mask(os.environ['OLD_MM56']); new=mask(root/'analysis/mask-reap56.txt')
+          comp={'old_mm56_slots':len(old),'reap56_slots':len(new),'overlap':len(old&new),
+                'reap56_new_vs_mm56':sorted(map(list,new-old)),'mm56_only':sorted(map(list,old-new))}
+          (root/'evidence/reap56-vs-mm56.json').write_text(json.dumps(comp,indent=2,sort_keys=True)+'\n')
+          r=json.loads((root/'analysis/report.json').read_text())
+          for target in ('56','80','104','128','152'):
+              t=r['targets'][target]
+              print('REAP_TARGET',target,'zero=',t['zero_score_slots'],'by_kind=',json.dumps(t['by_kind'],sort_keys=True))
+          print('REAP56_VS_MM56 overlap',len(old&new),'of56')
+          PY
+          python tools/run_kimi_pruning_sentinel_screen.py --validate-only \
+            --candidate reap56="$RUNNER_TEMP/reap/analysis/mask-reap56.txt" \
+            --candidate reap80="$RUNNER_TEMP/reap/analysis/mask-reap80.txt" \
+            --candidate reap104="$RUNNER_TEMP/reap/analysis/mask-reap104.txt" \
+            --candidate reap128="$RUNNER_TEMP/reap/analysis/mask-reap128.txt" \
+            --candidate reap152="$RUNNER_TEMP/reap/analysis/mask-reap152.txt"
+
+      - name: Screen REAP candidates with four-token held-out sentinel
+        id: sentinel
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$RUNNER_TEMP/reap/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate reap56="$RUNNER_TEMP/reap/analysis/mask-reap56.txt" \
+            --candidate reap80="$RUNNER_TEMP/reap/analysis/mask-reap80.txt" \
+            --candidate reap104="$RUNNER_TEMP/reap/analysis/mask-reap104.txt" \
+            --candidate reap128="$RUNNER_TEMP/reap/analysis/mask-reap128.txt" \
+            --candidate reap152="$RUNNER_TEMP/reap/analysis/mask-reap152.txt" \
+            --work-dir "$RUNNER_TEMP/reap/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Resolve strongest sentinel-exact REAP mask
+        id: select
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap'
+          p=root/'sentinel/sentinel-summary.json'
+          out=pathlib.Path(os.environ['GITHUB_OUTPUT'])
+          if not p.is_file():
+              out.open('a').write('has_selected=false\n')
+              print('REAP_SENTINEL_NO_SUMMARY')
+              raise SystemExit(0)
+          r=json.loads(p.read_text())
+          (root/'evidence/sentinel-summary.json').write_text(json.dumps(r,indent=2,sort_keys=True)+'\n')
+          sel=r.get('selected')
+          if not sel:
+              out.open('a').write('has_selected=false\n')
+              print('REAP_SENTINEL_SELECTED none')
+              raise SystemExit(0)
+          src=pathlib.Path(sel['mask']); dst=root/'evidence/selected-reap.mask'; dst.write_bytes(src.read_bytes())
+          (root/'evidence/selected-reap-name.txt').write_text(sel['name']+'\n')
+          with out.open('a') as f:
+              f.write('has_selected=true\n')
+              f.write(f'selected_name={sel["name"]}\n')
+              f.write(f'selected_mask={src}\n')
+          print(f'REAP_SENTINEL_SELECTED name={sel["name"]} disabled={sel["disabled_count"]}')
+          PY
+
+      - name: Run full 14-prompt text long-generation gate on selected REAP mask
+        if: steps.select.outputs.has_selected == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_phase_b.py \
+            --model-dir "$RUNNER_TEMP/reap/packed-q8" --binary ./build/kvl_generate \
+            --mask "${{ steps.select.outputs.selected_mask }}" --candidate "${{ steps.select.outputs.selected_name }}" \
+            --work-dir "$RUNNER_TEMP/reap/text-long" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/reap/text-long/phase-b-summary.json" "$RUNNER_TEMP/reap/evidence/text-long-summary.json"
+
+      - name: Evaluate text long-generation gate
+        id: text_gate
+        if: steps.select.outputs.has_selected == 'true'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/evidence'
+          a=json.loads((root/'text-long-summary.json').read_text())['aggregate']
+          ok=a['token_exact_prompts']==a['prompts'] and not a['divergent_prompts']
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a') as f: f.write(f'pass={str(ok).lower()}\n')
+          print(f'REAP_TEXT_LONG_GATE exact={a["token_exact_prompts"]}/{a["prompts"]} ok={ok}')
+          PY
+
+      - name: Run six-case VL route and logit guard
+        if: steps.select.outputs.has_selected == 'true' && steps.text_gate.outputs.pass == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_vl_guard.py \
+            --model-dir "$RUNNER_TEMP/reap/packed-q8" --image-root "$RUNNER_TEMP/reap/vl-images" \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --suite "$RUNNER_TEMP/reap/vl-suite.json" --mask "${{ steps.select.outputs.selected_mask }}" \
+            --work-dir "$RUNNER_TEMP/reap/vl-guard" \
+            --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/reap/vl-guard/vl-guard-summary.json" "$RUNNER_TEMP/reap/evidence/vl-guard-summary.json"
+
+      - name: Evaluate VL next-token guard
+        id: vl_gate
+        if: steps.select.outputs.has_selected == 'true' && steps.text_gate.outputs.pass == 'true'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/evidence'
+          a=json.loads((root/'vl-guard-summary.json').read_text())['aggregate']
+          ok=(a['first_token_exact']==a['cases'] and a['logit_argmax_agree']==a['cases'] and
+              a['logit_min_topk_overlap']>=0.8 and a['logit_max_js_divergence']<=0.01)
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a') as f: f.write(f'pass={str(ok).lower()}\n')
+          print(f'REAP_VL_GUARD exact={a["first_token_exact"]}/{a["cases"]} max_js={a["logit_max_js_divergence"]:.9g} ok={ok}')
+          PY
+
+      - name: Run six-case VL long-generation gate
+        if: steps.select.outputs.has_selected == 'true' && steps.text_gate.outputs.pass == 'true' && steps.vl_gate.outputs.pass == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_vl_phase_b.py \
+            --model-dir "$RUNNER_TEMP/reap/packed-q8" --image-root "$RUNNER_TEMP/reap/vl-images" \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --suite "$RUNNER_TEMP/reap/vl-suite.json" --mask "${{ steps.select.outputs.selected_mask }}" \
+            --work-dir "$RUNNER_TEMP/reap/vl-long" \
+            --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/reap/vl-long/vl-phase-b-summary.json" "$RUNNER_TEMP/reap/evidence/vl-long-summary.json"
+
+      - name: Summarize REAP-VL pruning evidence
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap/evidence'
+          def load(name):
+              p=root/name
+              return json.loads(p.read_text()) if p.is_file() else None
+          report=load('reap-vl-report.json'); sentinel=load('sentinel-summary.json')
+          text=load('text-long-summary.json'); guard=load('vl-guard-summary.json'); vl=load('vl-long-summary.json')
+          selected=(root/'selected-reap-name.txt').read_text().strip() if (root/'selected-reap-name.txt').is_file() else None
+          text_pass=bool(text and text['aggregate']['token_exact_prompts']==text['aggregate']['prompts'] and not text['aggregate']['divergent_prompts'])
+          guard_pass=bool(guard and guard['aggregate']['first_token_exact']==guard['aggregate']['cases'] and
+                          guard['aggregate']['logit_argmax_agree']==guard['aggregate']['cases'] and
+                          guard['aggregate']['logit_min_topk_overlap']>=0.8 and guard['aggregate']['logit_max_js_divergence']<=0.01)
+          vl_pass=bool(vl and vl['aggregate']['token_exact_cases']==vl['aggregate']['cases'] and not vl['aggregate']['divergent_cases'])
+          out={
+              'schema':'kimi-reap-vl-real-v1',
+              'source_revision':os.environ['KIMI_REV'],
+              'oracle_expert_format':'Q8 rowwise',
+              'selected_candidate':selected,
+              'sentinel':None if sentinel is None else {'selected':sentinel.get('selected'),'candidates':sentinel.get('candidates')},
+              'text_long':None if text is None else text['aggregate'],
+              'vl_guard':None if guard is None else guard['aggregate'],
+              'vl_long':None if vl is None else vl['aggregate'],
+              'reap_targets':None if report is None else report['targets'],
+              'reap56_vs_mm56':load('reap56-vs-mm56.json'),
+              'promotion_candidate_on_tested_scope':bool(selected and text_pass and guard_pass and vl_pass),
+              'physical_compaction_tested':False,
+              'q5_combination_tested':False,
+              'claim_boundary':'This run isolates logical REAP-VL expert pruning on the pinned Q8 oracle. Passing means deterministic agreement on the tested text/VL gates only; it is not a global quality claim, physical storage proof, or Q5+pruning result.'
+          }
+          (root/'reap-vl-end-to-end-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('REAP_VL_FINAL',json.dumps(out,sort_keys=True))
+          PY
+
+      - name: Upload REAP-VL evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-reap-vl-pruning-evidence
+          path: |
+            ${{ runner.temp }}/reap/evidence/*
+          if-no-files-found: warn
