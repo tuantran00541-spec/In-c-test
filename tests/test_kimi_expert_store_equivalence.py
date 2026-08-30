@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -22,7 +23,12 @@ with tempfile.TemporaryDirectory() as td_raw:
     mock = td / "mock_runtime.py"
     mock.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, pathlib\n"
+        "import os, pathlib, sys\n"
+        "is_sparse = any(pathlib.Path(x).name == 'sparse.idx' for x in sys.argv)\n"
+        "if is_sparse and os.environ.get('KVL_MOE_MASK'):\n"
+        "    raise SystemExit('sparse auto-mask run unexpectedly received KVL_MOE_MASK')\n"
+        "if not is_sparse and not os.environ.get('KVL_MOE_MASK'):\n"
+        "    raise SystemExit('full run missing explicit KVL_MOE_MASK')\n"
         "print('TOKEN 101')\n"
         "print('TOKEN 202')\n"
         "pathlib.Path(os.environ['KVL_MOE_TRACE']).write_bytes(b'route-same\\n')\n"
@@ -39,6 +45,7 @@ with tempfile.TemporaryDirectory() as td_raw:
         p = td / name
         p.write_bytes((name + "\n").encode())
         files[name] = p
+    (td / "sparse.mask").write_text("# KVL_MOE_MASK_V1\n1 1\n", encoding="utf-8")
 
     work = td / "work"
     cmd = [
@@ -52,14 +59,22 @@ with tempfile.TemporaryDirectory() as td_raw:
         "--sparse-experts-idx", str(files["sparse.idx"]),
         "--prompt-ids", str(files["prompt.ids"]),
         "--mask", str(files["mask.txt"]),
+        "--sparse-auto-mask",
         "--work-dir", str(work),
         "--cache-mib", "1", "--max-new", "2", "--temperature", "0", "--seed", "1",
     ]
     proc = subprocess.run(cmd, text=True, capture_output=True)
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert "KIMI_EXPERT_STORE_RUNTIME_EQ_PASS" in proc.stdout
+    assert "sparse_mask=sparse-sidecar-auto" in proc.stdout
     report = work / "expert-store-equivalence.json"
     assert report.is_file()
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert data["sparse_auto_mask"] is True
+    assert data["full"]["mask_mode"] == "explicit"
+    assert data["sparse"]["mask_mode"] == "sparse-sidecar-auto"
+    assert data["byte_exact"] is True
 
     # Unit-level mismatch localization: differing payloads must expose byte offset 3.
     a = td / "a.bin"
