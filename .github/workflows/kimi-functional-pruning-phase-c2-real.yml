@@ -1,0 +1,285 @@
+name: Real Kimi functional pruning phase C2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-functional-pruning
+    paths:
+      - ".github/workflows/kimi-functional-pruning-phase-c2-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  phase-c2-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      CANDIDATE_MANIFEST: "tests/data/kimi-functional-pruning-phase-c2-candidates.json"
+      MM54: "tests/data/kimi-functional-pruning-phase-c2-mm54.mask"
+      MM56: "tests/data/kimi-functional-pruning-phase-c2-mm56.mask"
+      MM58: "tests/data/kimi-functional-pruning-phase-c2-mm58.mask"
+      MM60: "tests/data/kimi-functional-pruning-phase-c2-mm60.mask"
+      MM62: "tests/data/kimi-functional-pruning-phase-c2-mm62.mask"
+      TEXT_CACHE_MIB: "1536"
+      VL_CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build runtime and validate C2 tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_vl
+          test -x ./build/kvl_vision
+          python -m py_compile tools/run_kimi_pruning_sentinel_screen.py
+          python tests/test_kimi_pruning_sentinel_screen.py
+          python tools/run_kimi_pruning_sentinel_screen.py --validate-only \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate mm54="$MM54" --candidate mm56="$MM56" --candidate mm58="$MM58" \
+            --candidate mm60="$MM60" --candidate mm62="$MM62"
+          mkdir -p "$RUNNER_TEMP/phase-c2/evidence"
+
+      - name: Validate C2 provenance and exact nested masks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import collections, hashlib, json, os, pathlib
+          manifest=json.loads(pathlib.Path(os.environ['CANDIDATE_MANIFEST']).read_text())
+          assert manifest['phase']=='C2' and manifest['schema_version']==1
+          assert manifest['parent_run']['run_id']==33292975649
+          assert manifest['sentinel']['id']=='eval-vi-en-01' and manifest['sentinel']['max_new']==4
+          base_path=pathlib.Path(manifest['base_candidate']['mask_path'])
+          def read_mask(p):
+              out=set()
+              for raw in pathlib.Path(p).read_text().splitlines():
+                  line=raw.split('#',1)[0].strip()
+                  if not line: continue
+                  k=tuple(map(int,line.split())); assert k not in out
+                  out.add(k)
+              return out
+          base=read_mask(base_path); assert len(base)==50
+          expected={x['name']:x for x in manifest['candidates']}
+          envs={'mm54':'MM54','mm56':'MM56','mm58':'MM58','mm60':'MM60','mm62':'MM62'}
+          prev=base
+          for name in ('mm54','mm56','mm58','mm60','mm62'):
+              row=expected[name]; p=pathlib.Path(os.environ[envs[name]])
+              m=read_mask(p)
+              assert len(m)==row['disabled_count']
+              assert hashlib.sha256(p.read_bytes()).hexdigest()==row['mask_sha256']
+              assert prev < m and base <= m
+              extras=m-base
+              assert all(layer <= 22 for layer,_ in extras)
+              assert max(collections.Counter(layer for layer,_ in m).values()) <= 6
+              prev=m
+          mm64=read_mask('tests/data/kimi-functional-pruning-phase-c-mm64.mask')
+          assert prev < mm64 and len(mm64)==64
+          print('PHASE_C2_PROVENANCE_PASS nested=54,56,58,60,62,<64 late_new=0 max_per_layer<=6')
+          PY
+          cp "$CANDIDATE_MANIFEST" "$RUNNER_TEMP/phase-c2/evidence/candidate-manifest.json"
+          cp "$MM54" "$MM56" "$MM58" "$MM60" "$MM62" "$RUNNER_TEMP/phase-c2/evidence/"
+
+      - name: Restore and generate six VL regression images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/vl-images"
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]: d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          suite['notes'] += ' Phase-C2 retains the two fresh Phase-C synthetic regression cases.'
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':16,'prompt':'Describe the dominant line pattern in this image in one short sentence.'},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':4,'prompt':'How many red circles are visible? Reply with only the integer.'},
+          ])
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'phase-c2-vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          assert len(suite['cases'])==6
+          print('PHASE_C2_VL_SUITE_READY cases=6')
+          PY
+
+      - name: Fetch pinned Kimi source metadata and MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'kimi-source'; root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(repo_id='moonshotai/Kimi-VL-A3B-Instruct',revision=os.environ['KIMI_REV'],filename=name,local_dir=root))
+          PY
+
+      - name: Pack pinned MoonViT and full Q8 text
+        run: |
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$RUNNER_TEMP/kimi-source" "$RUNNER_TEMP/packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$RUNNER_TEMP/packed/vision.bin"
+          test -s "$RUNNER_TEMP/packed/trunk.bin"
+          test -s "$RUNNER_TEMP/packed/experts.bin"
+          df -h "$RUNNER_TEMP"
+
+      - name: Run four-token sentinel across mm54 to mm62
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$RUNNER_TEMP/packed" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate mm54="$MM54" --candidate mm56="$MM56" --candidate mm58="$MM58" \
+            --candidate mm60="$MM60" --candidate mm62="$MM62" \
+            --work-dir "$RUNNER_TEMP/phase-c2/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/phase-c2/sentinel/sentinel-summary.json" "$RUNNER_TEMP/phase-c2/evidence/sentinel-summary.json"
+
+      - name: Find strongest sentinel-pass candidate that clears full text and VL gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY' > "$RUNNER_TEMP/phase-c2/sentinel-passing.tsv"
+          import json, os, pathlib
+          r=json.loads((pathlib.Path(os.environ['RUNNER_TEMP'])/'phase-c2/evidence/sentinel-summary.json').read_text())
+          for c in sorted((x for x in r['candidates'] if x['token_exact']), key=lambda x:x['disabled_count'], reverse=True):
+              print(c['name']+'\t'+c['mask'])
+          PY
+          : > "$RUNNER_TEMP/phase-c2/attempts.tsv"
+          selected=""
+          while IFS=$'\t' read -r name mask; do
+            test -n "$name" || continue
+            echo "PHASE_C2_ATTEMPT $name" | tee -a "$RUNNER_TEMP/phase-c2/attempts.tsv"
+            python tools/run_kimi_pruning_phase_b.py \
+              --model-dir "$RUNNER_TEMP/packed" --binary ./build/kvl_generate \
+              --mask "$mask" --candidate "$name" --work-dir "$RUNNER_TEMP/phase-c2/long/$name/text" \
+              --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+            if ! python - "$RUNNER_TEMP/phase-c2/long/$name/text/phase-b-summary.json" <<'PY'
+          import json,sys
+          a=json.load(open(sys.argv[1]))['aggregate']; ok=a['token_exact_prompts']==a['prompts'] and not a['divergent_prompts']
+          print(f"PHASE_C2_TEXT_LONG_GATE exact={a['token_exact_prompts']}/{a['prompts']} ok={ok}")
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              echo "PHASE_C2_TEXT_REJECT $name" | tee -a "$RUNNER_TEMP/phase-c2/attempts.tsv"; continue
+            fi
+            python tools/run_kimi_pruning_vl_guard.py \
+              --model-dir "$RUNNER_TEMP/packed" --image-root "$RUNNER_TEMP/vl-images" \
+              --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+              --suite "$RUNNER_TEMP/phase-c2-vl-suite.json" --mask "$mask" \
+              --work-dir "$RUNNER_TEMP/phase-c2/long/$name/vl-guard" \
+              --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+            if ! python - "$RUNNER_TEMP/phase-c2/long/$name/vl-guard/vl-guard-summary.json" <<'PY'
+          import json,sys
+          a=json.load(open(sys.argv[1]))['aggregate']
+          ok=(a['first_token_exact']==a['cases'] and a['logit_argmax_agree']==a['cases'] and a['logit_min_topk_overlap']>=0.8 and a['logit_max_js_divergence']<=0.01)
+          print(f"PHASE_C2_VL_GUARD_GATE exact={a['first_token_exact']}/{a['cases']} js={a['logit_max_js_divergence']:.9g} ok={ok}")
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              echo "PHASE_C2_VL_GUARD_REJECT $name" | tee -a "$RUNNER_TEMP/phase-c2/attempts.tsv"; continue
+            fi
+            python tools/run_kimi_pruning_vl_phase_b.py \
+              --model-dir "$RUNNER_TEMP/packed" --image-root "$RUNNER_TEMP/vl-images" \
+              --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+              --suite "$RUNNER_TEMP/phase-c2-vl-suite.json" --mask "$mask" \
+              --work-dir "$RUNNER_TEMP/phase-c2/long/$name/vl" \
+              --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+            if ! python - "$RUNNER_TEMP/phase-c2/long/$name/vl/vl-phase-b-summary.json" <<'PY'
+          import json,sys
+          a=json.load(open(sys.argv[1]))['aggregate']; ok=a['token_exact_cases']==a['cases'] and not a['divergent_cases']
+          print(f"PHASE_C2_VL_LONG_GATE exact={a['token_exact_cases']}/{a['cases']} ok={ok}")
+          raise SystemExit(0 if ok else 1)
+          PY
+            then
+              echo "PHASE_C2_VL_LONG_REJECT $name" | tee -a "$RUNNER_TEMP/phase-c2/attempts.tsv"; continue
+            fi
+            selected="$name"
+            cp "$mask" "$RUNNER_TEMP/phase-c2/evidence/final-selected.mask"
+            printf '%s\n' "$name" > "$RUNNER_TEMP/phase-c2/evidence/final-selected-name.txt"
+            cp "$RUNNER_TEMP/phase-c2/long/$name/text/phase-b-summary.json" "$RUNNER_TEMP/phase-c2/evidence/selected-text-long.json"
+            cp "$RUNNER_TEMP/phase-c2/long/$name/vl-guard/vl-guard-summary.json" "$RUNNER_TEMP/phase-c2/evidence/selected-vl-guard.json"
+            cp "$RUNNER_TEMP/phase-c2/long/$name/vl/vl-phase-b-summary.json" "$RUNNER_TEMP/phase-c2/evidence/selected-vl-long.json"
+            echo "PHASE_C2_SELECTED $name" | tee -a "$RUNNER_TEMP/phase-c2/attempts.tsv"
+            break
+          done < "$RUNNER_TEMP/phase-c2/sentinel-passing.tsv"
+          cp "$RUNNER_TEMP/phase-c2/attempts.tsv" "$RUNNER_TEMP/phase-c2/evidence/attempts.tsv"
+          test -n "$selected" || { echo 'No C2 candidate passed full text+VL gates'; exit 1; }
+
+      - name: Write quality-gate summary and projections
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'phase-c2/evidence'
+          manifest=json.loads((root/'candidate-manifest.json').read_text())
+          name=(root/'final-selected-name.txt').read_text().strip()
+          row=next(x for x in manifest['candidates'] if x['name']==name)
+          t=json.loads((root/'selected-text-long.json').read_text())['aggregate']
+          vg=json.loads((root/'selected-vl-guard.json').read_text())['aggregate']
+          vl=json.loads((root/'selected-vl-long.json').read_text())['aggregate']
+          summary={
+            'schema_version':1,'phase':'C2','selected':name,'disabled_count':row['disabled_count'],
+            'text_long_exact':t['token_exact_prompts'],'text_long_prompts':t['prompts'],
+            'vl_guard_first_token_exact':vg['first_token_exact'],'vl_guard_cases':vg['cases'],
+            'vl_long_exact':vl['token_exact_cases'],'vl_long_cases':vl['cases'],
+            'projected_removed_bytes':row['projected_removed_bytes'],
+            'projected_sparse_expert_store_bytes':row['projected_sparse_expert_store_bytes'],
+            'additional_projected_bytes_vs_validated_base50':row['projected_removed_bytes']-433561600,
+            'physical_compaction_measured':False,
+            'claim_boundary':'quality regression gates only; physical sparse-store deletion/equivalence is a separate required promotion gate; no speedup claim',
+          }
+          (root/'phase-c2-quality-summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print('PHASE_C2_QUALITY_PASS',json.dumps(summary,sort_keys=True))
+          PY
+
+      - name: Upload C2 evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-functional-pruning-phase-c2-evidence
+          path: ${{ runner.temp }}/phase-c2/evidence
+          if-no-files-found: error
+          retention-days: 90
