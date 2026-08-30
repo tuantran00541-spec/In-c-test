@@ -1,0 +1,31 @@
+name: Qwen3.8 dense compression lab
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/qwen38-27b-compression-lab
+    paths:
+      - "tools/qwen38_dense_compression_plan.py"
+      - "tests/test_qwen38_dense_compression_plan.py"
+      - "spec/QWEN38_27B_COMPRESSION_LAB.md"
+      - ".github/workflows/qwen38-dense-compression-lab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  metadata-only:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile planner
+        run: python -m py_compile tools/qwen38_dense_compression_plan.py tests/test_qwen38_dense_compression_plan.py
+      - name: Run unit tests
+        run: python tests/test_qwen38_dense_compression_plan.py
+      - name: Print projection-only dense MLP plan
+        run: python tools/qwen38_dense_compression_plan.py --group-size 128 --bits 8,6,5,4,3,2
