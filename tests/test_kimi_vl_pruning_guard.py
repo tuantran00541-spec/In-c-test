@@ -35,18 +35,30 @@ with tempfile.TemporaryDirectory() as td:
     m = mod.read_mask(mask)
     assert m == {(1, 7), (2, 9)}
 
+    prompt_ids_path = td / "prompt.ids"
+    prompt_ids_path.write_text(f"10\n{mod.MEDIA_PAD_ID}\n", encoding="ascii")
+    prompt_ids = mod.read_prompt_ids(prompt_ids_path)
+    assert prompt_ids == [10, mod.MEDIA_PAD_ID]
+
     trace = td / "route.tsv"
     trace.write_text(
         "# event layer expert router_weight output_l2 saliency\n"
         "1 1 7 0.2 3.0 0.6\n"
-        "1 1 4 0.3 2.0 0.6\n"
-        "2 2 9 0.1 5.0 0.5\n",
+        "2 1 4 0.3 2.0 0.6\n"
+        "3 2 9 0.1 5.0 0.5\n"
+        "4 2 9 0.2 2.0 0.4\n",
         encoding="utf-8",
     )
-    hit = mod.direct_mask_hits(trace, m)
-    assert hit["selections"] == 2
+    hit = mod.direct_mask_hits(trace, m, prompt_ids)
+    assert hit["selections"] == 3
     assert hit["unique_slots"] == 2
-    assert abs(sum(x["saliency"] for x in hit["slots"]) - 1.1) < 1e-9
+    assert hit["text_selections"] == 2
+    assert hit["media_selections"] == 1
+    assert hit["text_unique_slots"] == 2
+    assert hit["media_unique_slots"] == 1
+    assert abs(sum(x["saliency"] for x in hit["slots"]) - 1.5) < 1e-9
+    assert mod._event_modality(2, 1, prompt_ids) == ("media", 1)
+    assert mod._event_modality(3, 2, prompt_ids) == ("text", 0)
 
     stderr = (
         "[kvl-vl] generated ids: 12 34\n"
