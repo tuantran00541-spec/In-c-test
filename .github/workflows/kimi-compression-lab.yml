@@ -13,16 +13,19 @@ on:
       - "tools/kimi_moe_act_reservoir.py"
       - "tools/kimi_measure_bf16_expert.py"
       - "tools/kimi_mixed_bit_plan.py"
+      - "tools/run_kimi_compression_q0_measure.py"
       - "tools/README_COMPRESSION_LAB.txt"
       - "tests/test_kimi_compression_lab.py"
       - "tests/test_kimi_expert_reservoir.py"
       - "tests/test_kimi_moe_act_reservoir.py"
       - "tests/test_kimi_measure_bf16_expert.py"
       - "tests/test_kimi_mixed_bit_plan.py"
+      - "tests/test_kimi_compression_q0_measure.py"
       - "tests/test_kimi_compression_schema.py"
       - "tests/test_kimi_compression_quickstart.py"
       - "tests/data/kimi-compression-lab-schema.json"
       - "tests/data/kimi-compression-lab-example.json"
+      - "tests/data/kimi-compression-q0-pilot.json"
       - "spec/KIMI_COMPRESSION_LAB.md"
       - ".github/workflows/kimi-compression-lab.yml"
 
@@ -45,11 +48,13 @@ jobs:
             tools/kimi_moe_act_reservoir.py \
             tools/kimi_measure_bf16_expert.py \
             tools/kimi_mixed_bit_plan.py \
+            tools/run_kimi_compression_q0_measure.py \
             tests/test_kimi_compression_lab.py \
             tests/test_kimi_expert_reservoir.py \
             tests/test_kimi_moe_act_reservoir.py \
             tests/test_kimi_measure_bf16_expert.py \
             tests/test_kimi_mixed_bit_plan.py \
+            tests/test_kimi_compression_q0_measure.py \
             tests/test_kimi_compression_schema.py \
             tests/test_kimi_compression_quickstart.py
       - name: Run compression lab unit tests
@@ -59,6 +64,7 @@ jobs:
           python tests/test_kimi_moe_act_reservoir.py
           python tests/test_kimi_measure_bf16_expert.py
           python tests/test_kimi_mixed_bit_plan.py
+          python tests/test_kimi_compression_q0_measure.py
           python tests/test_kimi_compression_schema.py
           python tests/test_kimi_compression_quickstart.py
       - name: Build traced generators without model weights
