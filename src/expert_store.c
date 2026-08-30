@@ -90,6 +90,184 @@ static int kvl_aligned_alloc(void **out, size_t align, size_t n) {
 void kvl_expert_free_buffer(void *p) { free(p); }
 #endif
 
+static char *mask_sidecar_path(const char *idx_path) {
+    if (!idx_path) return NULL;
+    const size_t n = strlen(idx_path);
+    const int replace_idx = n >= 4 && strcmp(idx_path + n - 4, ".idx") == 0;
+    const size_t base = replace_idx ? n - 4 : n;
+    char *out = (char *)malloc(base + 6);
+    if (!out) return NULL;
+    memcpy(out, idx_path, base);
+    memcpy(out + base, ".mask", 6);
+    return out;
+}
+
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int read_mask_file(const char *path, const KvlExpertIndexHeader *hdr,
+                          unsigned char *disabled, size_t map_n, size_t *out_count) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "kvl: cannot open expert mask %s\n", path);
+        return -1;
+    }
+    memset(disabled, 0, map_n);
+    size_t count = 0;
+    char line[512];
+    int lineno = 0;
+    while (fgets(line, sizeof line, f)) {
+        ++lineno;
+        if (!strchr(line, '\n') && !feof(f)) {
+            fprintf(stderr, "kvl: expert mask line too long %s:%d\n", path, lineno);
+            fclose(f);
+            return -1;
+        }
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+        if (!*p) continue;
+        int layer = -1, expert = -1;
+        char extra = '\0';
+        const int parsed = sscanf(p, "%d %d %c", &layer, &expert, &extra);
+        if (parsed != 2 || layer < 0 || expert < 0 ||
+            layer >= (int)hdr->n_layers || expert >= (int)hdr->n_experts) {
+            fprintf(stderr, "kvl: bad expert mask line %s:%d\n", path, lineno);
+            fclose(f);
+            return -1;
+        }
+        const size_t at = (size_t)layer * hdr->n_experts + (size_t)expert;
+        if (disabled[at]) {
+            fprintf(stderr, "kvl: duplicate expert mask entry %s:%d L%d/E%d\n",
+                    path, lineno, layer, expert);
+            fclose(f);
+            return -1;
+        }
+        disabled[at] = 1;
+        ++count;
+    }
+    if (ferror(f)) { fclose(f); return -1; }
+    fclose(f);
+    *out_count = count;
+    return 0;
+}
+
+static int bind_sparse_q8_mask(KvlExpertStore *s, const char *idx_path) {
+    if (!s || s->hdr.dtype != KVL_DTYPE_Q8_ROW) return 0;
+    const size_t map_n = (size_t)s->hdr.n_layers * s->hdr.n_experts;
+    const uint32_t first_moe_layer = s->hdr.n_layers > 1 ? 1u : 0u;
+    size_t routed_slots = 0, routed_present = 0;
+    for (uint32_t layer = first_moe_layer; layer < s->hdr.n_layers; ++layer) {
+        for (uint32_t expert = 0; expert < s->hdr.n_experts; ++expert) {
+            ++routed_slots;
+            if (s->record_of[(size_t)layer * s->hdr.n_experts + expert] >= 0)
+                ++routed_present;
+        }
+    }
+    const int sparse = routed_present < routed_slots;
+    char *sidecar = mask_sidecar_path(idx_path);
+    if (!sidecar) return -1;
+    const int sidecar_exists = file_exists(sidecar);
+
+    if (!sparse) {
+        if (sidecar_exists) {
+            fprintf(stderr,
+                    "kvl: refusing mask sidecar for a full Q8 expert store: %s\n",
+                    sidecar);
+            free(sidecar);
+            return -1;
+        }
+        free(sidecar);
+        return 0;
+    }
+
+    if (!sidecar_exists) {
+        fprintf(stderr,
+                "kvl: sparse Q8 expert store requires bound mask sidecar %s "
+                "(%zu/%zu routed records present)\n",
+                sidecar, routed_present, routed_slots);
+        free(sidecar);
+        return -1;
+    }
+
+    unsigned char *bound = (unsigned char *)calloc(map_n, 1);
+    unsigned char *requested = (unsigned char *)calloc(map_n, 1);
+    if (!bound || !requested) {
+        free(bound); free(requested); free(sidecar);
+        return -1;
+    }
+    size_t bound_count = 0;
+    if (read_mask_file(sidecar, &s->hdr, bound, map_n, &bound_count) != 0) {
+        free(bound); free(requested); free(sidecar);
+        return -1;
+    }
+
+    const size_t missing = routed_slots - routed_present;
+    int mismatch = bound_count != missing;
+    for (uint32_t layer = first_moe_layer; !mismatch && layer < s->hdr.n_layers; ++layer) {
+        for (uint32_t expert = 0; expert < s->hdr.n_experts; ++expert) {
+            const size_t at = (size_t)layer * s->hdr.n_experts + expert;
+            const int absent = s->record_of[at] < 0;
+            if ((bound[at] != 0) != absent) {
+                fprintf(stderr,
+                        "kvl: sparse expert mask/store mismatch L%u/E%u mask=%d present=%d\n",
+                        layer, expert, bound[at] ? 1 : 0, absent ? 0 : 1);
+                mismatch = 1;
+                break;
+            }
+        }
+    }
+    for (uint32_t layer = 0; !mismatch && layer < first_moe_layer; ++layer) {
+        for (uint32_t expert = 0; expert < s->hdr.n_experts; ++expert) {
+            if (bound[(size_t)layer * s->hdr.n_experts + expert]) {
+                fprintf(stderr,
+                        "kvl: sparse expert mask contains non-MoE entry L%u/E%u\n",
+                        layer, expert);
+                mismatch = 1;
+                break;
+            }
+        }
+    }
+    if (mismatch) {
+        free(bound); free(requested); free(sidecar);
+        return -1;
+    }
+
+    const char *env_mask = getenv("KVL_MOE_MASK");
+    if (env_mask && env_mask[0]) {
+        size_t requested_count = 0;
+        if (read_mask_file(env_mask, &s->hdr, requested, map_n, &requested_count) != 0 ||
+            requested_count != bound_count || memcmp(requested, bound, map_n) != 0) {
+            fprintf(stderr,
+                    "kvl: KVL_MOE_MASK does not match sparse-store sidecar %s\n",
+                    sidecar);
+            free(bound); free(requested); free(sidecar);
+            return -1;
+        }
+    } else {
+#ifdef _WIN32
+        if (_putenv_s("KVL_MOE_MASK", sidecar) != 0) {
+#else
+        if (setenv("KVL_MOE_MASK", sidecar, 1) != 0) {
+#endif
+            fprintf(stderr, "kvl: failed to bind sparse expert mask %s\n", sidecar);
+            free(bound); free(requested); free(sidecar);
+            return -1;
+        }
+    }
+
+    fprintf(stderr,
+            "kvl: sparse expert store bound mask=%s disabled=%zu routed_records=%zu/%zu\n",
+            sidecar, bound_count, routed_present, routed_slots);
+    free(bound); free(requested); free(sidecar);
+    return 0;
+}
+
 static int read_index(KvlExpertStore *s, const char *idx_path) {
     FILE *f = fopen(idx_path, "rb");
     if (!f) return -1;
@@ -112,7 +290,9 @@ static int read_index(KvlExpertStore *s, const char *idx_path) {
     for (uint32_t i = 0; i < s->hdr.n_records; ++i) {
         KvlExpertRecord *r = &s->records[i];
         if (r->layer >= s->hdr.n_layers || r->expert >= s->hdr.n_experts) return -1;
-        s->record_of[(size_t)r->layer * s->hdr.n_experts + r->expert] = (int32_t)i;
+        const size_t at = (size_t)r->layer * s->hdr.n_experts + r->expert;
+        if (s->record_of[at] >= 0) return -1;
+        s->record_of[at] = (int32_t)i;
     }
     return 0;
 }
@@ -121,6 +301,7 @@ int kvl_expert_store_open(KvlExpertStore *s, const char *bin_path, const char *i
                           int prefer_direct_io) {
     memset(s, 0, sizeof *s); s->fd = -1;
     if (read_index(s, idx_path) != 0) { kvl_expert_store_close(s); return -1; }
+    if (bind_sparse_q8_mask(s, idx_path) != 0) { kvl_expert_store_close(s); return -1; }
     s->fd = kvl_open_data(bin_path, prefer_direct_io);
     if (s->fd >= 0) {
         s->direct_io = prefer_direct_io ? 1 : 0;
