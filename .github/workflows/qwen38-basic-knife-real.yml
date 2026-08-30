@@ -1,0 +1,84 @@
+name: Real Qwen3.8 basic knife
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/qwen38-27b-compression-lab
+    paths:
+      - "tools/qwen38_basic_knife.py"
+      - "tests/test_qwen38_basic_knife.py"
+      - ".github/workflows/qwen38-basic-knife-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  layer0-prune-q6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OMP_NUM_THREADS: "2"
+      MKL_NUM_THREADS: "2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight real-weight dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Validate knife math before downloading model shards
+        run: |
+          python -m py_compile tools/qwen38_basic_knife.py tests/test_qwen38_basic_knife.py
+          python tests/test_qwen38_basic_knife.py
+
+      - name: Run one real BF16 layer through prune-only Q6-only and prune-plus-Q6
+        run: |
+          mkdir -p "$RUNNER_TEMP/qwen38-knife/evidence"
+          python tools/qwen38_basic_knife.py \
+            --work-dir "$RUNNER_TEMP/qwen38-source" \
+            --layer 0 --prune-channels 896 --bits 6 --group-size 128 \
+            --samples 4 --seed 1234 \
+            --output "$RUNNER_TEMP/qwen38-knife/evidence/layer0-basic-knife.json"
+
+      - name: Print compact result
+        if: always()
+        run: |
+          if test -s "$RUNNER_TEMP/qwen38-knife/evidence/layer0-basic-knife.json"; then
+            python - <<'PY'
+          import json, os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'qwen38-knife/evidence/layer0-basic-knife.json'
+          r=json.loads(p.read_text())
+          print(f"QWEN38_KNIFE layer={r['layer']} prune={r['pruned_channels']}/{r['intermediate_before']} removed_params={r['removed_mlp_params']}")
+          for k,v in r['metrics'].items():
+              print(f"QWEN38_KNIFE_METRIC variant={k} rel_l2={v['relative_l2']:.9g} cosine={v['cosine']:.9g} rmse={v['rmse']:.9g} max_abs={v['max_abs']:.9g}")
+          s=r['storage_projection']
+          print(f"QWEN38_KNIFE_PROJECT full_bf16={s['full_layer_mlp_bf16_bytes']} prune_q6={s['pruned_q6_with_fp16_scales_bytes']} reduction={s['reduction_vs_full_bf16']:.6%}")
+          PY
+          else
+            echo "No result JSON available"
+          fi
+
+      - name: Remove source model shards
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/qwen38-source"
+
+      - name: Upload metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen38-layer0-basic-knife-evidence
+          path: ${{ runner.temp }}/qwen38-knife/evidence/**
+          if-no-files-found: warn
