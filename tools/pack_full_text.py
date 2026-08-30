@@ -7,7 +7,8 @@ consumed source shards. The released Kimi-VL-A3B checkpoint needs at most two ad
 ~5 GB source shards simultaneously.
 
 Lab-only `--expert-format q8` keeps trunk/shared/router weights BF16 while packing routed
-experts with tools/pack_experts_q8.py.
+experts with tools/pack_experts_q8.py. `--expert-format q5` does the same but uses the
+experimental symmetric signed-Q5/group-128/FP32-scale expert format.
 """
 from __future__ import annotations
 import argparse, json, pathlib, subprocess, sys
@@ -20,7 +21,7 @@ def dl(repo,rev,root,name): return pathlib.Path(hf_hub_download(repo_id=repo,rev
 def run(cmd): print('+',' '.join(map(str,cmd)),flush=True);subprocess.run(list(map(str,cmd)),check=True)
 
 def main():
-    ap=argparse.ArgumentParser();ap.add_argument('work_dir',type=pathlib.Path);ap.add_argument('out_dir',type=pathlib.Path);ap.add_argument('--repo',default=REPO);ap.add_argument('--revision',default='main');ap.add_argument('--keep-source-shards',action='store_true');ap.add_argument('--max-layer',type=int,default=None);ap.add_argument('--expert-format',choices=('bf16','q8'),default='bf16');args=ap.parse_args()
+    ap=argparse.ArgumentParser();ap.add_argument('work_dir',type=pathlib.Path);ap.add_argument('out_dir',type=pathlib.Path);ap.add_argument('--repo',default=REPO);ap.add_argument('--revision',default='main');ap.add_argument('--keep-source-shards',action='store_true');ap.add_argument('--max-layer',type=int,default=None);ap.add_argument('--expert-format',choices=('bf16','q8','q5'),default='bf16');args=ap.parse_args()
     args.work_dir.mkdir(parents=True,exist_ok=True);args.out_dir.mkdir(parents=True,exist_ok=True)
     dl(args.repo,args.revision,args.work_dir,'config.json');idxp=dl(args.repo,args.revision,args.work_dir,'model.safetensors.index.json')
     cfg=json.loads((args.work_dir/'config.json').read_text())['text_config'];wm=json.loads(idxp.read_text())['weight_map'];n_layers=int(cfg['num_hidden_layers']);max_layer=n_layers-1 if args.max_layer is None else min(args.max_layer,n_layers-1)
@@ -34,7 +35,9 @@ def main():
     for L in range(max_layer+1):print(f'  L{L:02d}: {sorted(layer_req[L])}')
     print('  globals:',global_req)
     here=pathlib.Path(__file__).resolve().parent;done_layers=set();done_globals=set();loaded=set()
-    expert_packer=here/('pack_experts_q8.py' if args.expert_format=='q8' else 'pack_experts.py')
+    if args.expert_format=='q8': expert_packer=here/'pack_experts_q8.py'
+    elif args.expert_format=='q5': expert_packer=here/'pack_experts_q5.py'
+    else: expert_packer=here/'pack_experts.py'
     def ta():return ['--append'] if (args.out_dir/'trunk.idx').exists() else []
     def ea():return ['--append'] if (args.out_dir/'experts.idx').exists() else []
     for si,shard in enumerate(all_shards,1):
