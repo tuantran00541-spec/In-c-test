@@ -18,12 +18,14 @@ on:
       - "tools/gate_kimi_pruning_phase_a.py"
       - "tools/run_kimi_pruning_phase_b.py"
       - "tools/run_kimi_pruning_vl_guard.py"
+      - "tools/run_kimi_pruning_vl_phase_b.py"
       - "tools/compact_expert_store.py"
       - "tests/test_kimi_functional_pruning.py"
       - "tests/test_kimi_functional_suite.py"
       - "tests/test_kimi_phase_a_gate.py"
       - "tests/test_kimi_phase_b.py"
       - "tests/test_kimi_vl_pruning_guard.py"
+      - "tests/test_kimi_vl_phase_b.py"
       - "tests/test_compact_expert_store.py"
       - "tests/test_kimi_mask_novelty.py"
       - "tests/data/kimi-functional-pruning-suite.json"
@@ -54,12 +56,14 @@ jobs:
           python -m py_compile tools/gate_kimi_pruning_phase_a.py
           python -m py_compile tools/run_kimi_pruning_phase_b.py
           python -m py_compile tools/run_kimi_pruning_vl_guard.py
+          python -m py_compile tools/run_kimi_pruning_vl_phase_b.py
           python -m py_compile tools/compact_expert_store.py
           python -m py_compile tests/test_kimi_functional_pruning.py
           python -m py_compile tests/test_kimi_functional_suite.py
           python -m py_compile tests/test_kimi_phase_a_gate.py
           python -m py_compile tests/test_kimi_phase_b.py
           python -m py_compile tests/test_kimi_vl_pruning_guard.py
+          python -m py_compile tests/test_kimi_vl_phase_b.py
           python -m py_compile tests/test_compact_expert_store.py
           python -m py_compile tests/test_kimi_mask_novelty.py
       - name: Phase A suite validation
@@ -74,6 +78,10 @@ jobs:
         run: python tools/run_kimi_pruning_vl_guard.py --validate-only
       - name: VL guard synthetic test
         run: python tests/test_kimi_vl_pruning_guard.py
+      - name: VL Phase B suite validation
+        run: python tools/run_kimi_pruning_vl_phase_b.py --validate-only
+      - name: VL Phase B synthetic test
+        run: python tests/test_kimi_vl_phase_b.py
       - name: Expert-store compaction synthetic test
         run: python tests/test_compact_expert_store.py
       - name: Mask novelty synthetic test
