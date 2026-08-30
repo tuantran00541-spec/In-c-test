@@ -8,10 +8,12 @@ on:
     paths:
       - "tools/kimi_compression_lab.py"
       - "tools/kimi_expert_reservoir.py"
+      - "tools/kimi_measure_bf16_expert.py"
       - "tools/kimi_mixed_bit_plan.py"
       - "tools/README_COMPRESSION_LAB.txt"
       - "tests/test_kimi_compression_lab.py"
       - "tests/test_kimi_expert_reservoir.py"
+      - "tests/test_kimi_measure_bf16_expert.py"
       - "tests/test_kimi_mixed_bit_plan.py"
       - "tests/test_kimi_compression_schema.py"
       - "tests/test_kimi_compression_quickstart.py"
@@ -36,9 +38,11 @@ jobs:
           python -m py_compile \
             tools/kimi_compression_lab.py \
             tools/kimi_expert_reservoir.py \
+            tools/kimi_measure_bf16_expert.py \
             tools/kimi_mixed_bit_plan.py \
             tests/test_kimi_compression_lab.py \
             tests/test_kimi_expert_reservoir.py \
+            tests/test_kimi_measure_bf16_expert.py \
             tests/test_kimi_mixed_bit_plan.py \
             tests/test_kimi_compression_schema.py \
             tests/test_kimi_compression_quickstart.py
@@ -46,6 +50,7 @@ jobs:
         run: |
           python tests/test_kimi_compression_lab.py
           python tests/test_kimi_expert_reservoir.py
+          python tests/test_kimi_measure_bf16_expert.py
           python tests/test_kimi_mixed_bit_plan.py
           python tests/test_kimi_compression_schema.py
           python tests/test_kimi_compression_quickstart.py
