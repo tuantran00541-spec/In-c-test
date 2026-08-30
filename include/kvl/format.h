@@ -9,6 +9,9 @@
 #define KVL_DTYPE_BF16 1u
 #define KVL_DTYPE_MXFP4 2u
 #define KVL_DTYPE_Q8_ROW 3u
+/* Experimental routed-expert format: signed symmetric 5-bit weights,
+ * group size 128 along the input dimension, with FP32 scale per group. */
+#define KVL_DTYPE_Q5_G128 4u
 
 #pragma pack(push, 1)
 typedef struct {
