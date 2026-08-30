@@ -1,0 +1,10 @@
+{
+  "schemas": [
+    "kimi-expert-activation-reservoir-v1",
+    "kimi-expert-quant-sensitivity-v1",
+    "kimi-mixed-bit-plan-v1"
+  ],
+  "pinned_revision": "398eede0903cd983a2bfa0cc634e9ac1d843f375",
+  "projection_is_not_physical_measurement": true,
+  "native_low_bit_format_implemented": false
+}
