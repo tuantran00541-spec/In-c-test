@@ -1,0 +1,321 @@
+name: Real Kimi compression Q0 pilot
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-compression-lab
+    paths:
+      - ".github/workflows/kimi-compression-q0-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  q0-real:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      PILOT: "tests/data/kimi-compression-q0-pilot.json"
+      TEXT_SUITE: "tests/data/kimi-functional-pruning-suite.json"
+      CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build traced runtime and validate Q0 tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_trace
+          test -x ./build/kvl_generate_vl_trace
+          test -x ./build/kvl_vision
+          python -m py_compile \
+            tools/kimi_moe_act_reservoir.py \
+            tools/kimi_measure_bf16_expert.py \
+            tools/run_kimi_compression_q0_measure.py
+          python tests/test_kimi_moe_act_reservoir.py
+          python tests/test_kimi_measure_bf16_expert.py
+          python tests/test_kimi_compression_q0_measure.py
+          mkdir -p "$RUNNER_TEMP/q0/evidence" "$RUNNER_TEMP/q0/traces/text" "$RUNNER_TEMP/q0/traces/vl"
+          cp "$PILOT" "$RUNNER_TEMP/q0/evidence/pilot-manifest.json"
+
+      - name: Validate exact C2 boundary provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib
+          pilot=json.loads(pathlib.Path(os.environ['PILOT']).read_text())
+          c2=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-phase-c2-candidates.json').read_text())
+          assert pilot['source_revision']==os.environ['KIMI_REV']
+          ranked=c2['ranking']['ranked_extras']
+          got=[(int(x['rank']),int(x['layer']),int(x['expert']),float(x['c2_score'])) for x in pilot['experts']]
+          exp=[(int(x['rank']),int(x['layer']),int(x['expert']),float(x['score'])) for x in ranked]
+          assert got==exp, (got,exp)
+          assert [(x['layer'],x['expert']) for x in pilot['experts'][6:8]]==[(11,43),(8,32)]
+          assert pilot['bits']==[8,6,5,4] and pilot['group_size']==128
+          print('Q0_PROVENANCE_PASS experts=14 boundary=mm56_to_mm58 bits=8,6,5,4 group=128')
+          PY
+
+      - name: Restore six VL calibration images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/q0/vl-images"
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/q0/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/q0/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0/vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]: d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':1,'prompt':'Describe the dominant line pattern in this image in one short sentence.'},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':1,'prompt':'How many red circles are visible? Reply with only the integer.'},
+          ])
+          for row in suite['cases']: row['max_new']=1
+          assert len(suite['cases'])==6
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0/vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          print('Q0_VL_SUITE_READY cases=6')
+          PY
+
+      - name: Fetch pinned metadata and initial MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'q0/kimi-source'; root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(repo_id='moonshotai/Kimi-VL-A3B-Instruct',revision=os.environ['KIMI_REV'],filename=name,local_dir=root))
+          PY
+
+      - name: Pack pinned MoonViT and full Q8 text runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/pack_vision.py "$RUNNER_TEMP/q0/kimi-source" "$RUNNER_TEMP/q0/packed"
+          python tools/fetch_tokenizer.py "$RUNNER_TEMP/q0/packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$RUNNER_TEMP/q0/kimi-source" "$RUNNER_TEMP/q0/packed" \
+            --revision "$KIMI_REV" --expert-format q8
+          test -s "$RUNNER_TEMP/q0/packed/trunk.bin"
+          test -s "$RUNNER_TEMP/q0/packed/experts.bin"
+          test -s "$RUNNER_TEMP/q0/packed/vision.bin"
+          df -h "$RUNNER_TEMP"
+
+      - name: Verify traced text generator preserves sampled token
+        shell: bash
+        run: |
+          set -euo pipefail
+          prompt='Explain in one short sentence why leaves are usually green.'
+          python tools/kvl_chat.py "$RUNNER_TEMP/q0/packed" "$prompt" \
+            --binary ./build/kvl_generate --cache-mib "$CACHE_MIB" --ram-mib "$RAM_MIB" \
+            --max-new 1 --temperature 0 --seed 1 --show-tokens \
+            > "$RUNNER_TEMP/q0/ref.out" 2> "$RUNNER_TEMP/q0/ref.err"
+          KVL_MOE_ACT_TRACE="$RUNNER_TEMP/q0/trace-parity.act" \
+            python tools/kvl_chat.py "$RUNNER_TEMP/q0/packed" "$prompt" \
+            --binary ./build/kvl_generate_trace --cache-mib "$CACHE_MIB" --ram-mib "$RAM_MIB" \
+            --max-new 1 --temperature 0 --seed 1 --show-tokens \
+            > "$RUNNER_TEMP/q0/trace.out" 2> "$RUNNER_TEMP/q0/trace.err"
+          python - <<'PY'
+          import os,re,pathlib,sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0'
+          pat=re.compile(r'generated ids:\s*([^\n]*)')
+          def ids(p):
+              m=pat.search(p.read_text(errors='replace')); assert m
+              return [int(x) for x in m.group(1).split()]
+          a=ids(root/'ref.err'); b=ids(root/'trace.err')
+          assert a==b and len(a)==1, (a,b)
+          sys.path.insert(0,'tools')
+          from kimi_moe_act_reservoir import iter_trace
+          h,records=iter_trace(root/'trace-parity.act'); n=sum(1 for _ in records)
+          assert (h.hidden,h.top_k)==(2048,6) and n>0
+          print(f'Q0_TRACE_PARITY_PASS generated={a} records={n} hidden={h.hidden} top_k={h.top_k}')
+          PY
+          rm -f "$RUNNER_TEMP/q0/trace-parity.act" "$RUNNER_TEMP/q0/ref.out" "$RUNNER_TEMP/q0/ref.err" "$RUNNER_TEMP/q0/trace.out" "$RUNNER_TEMP/q0/trace.err"
+
+      - name: Collect Phase-A text activation traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0'
+          suite=json.loads(pathlib.Path(os.environ['TEXT_SUITE']).read_text())
+          assert len(suite['calibration'])==16
+          for i,row in enumerate(suite['calibration'],1):
+              trace=root/'traces/text'/f"{i:02d}-{row['id']}.act"
+              out=root/'traces/text'/f"{i:02d}-{row['id']}.out"
+              err=root/'traces/text'/f"{i:02d}-{row['id']}.err"
+              env=os.environ.copy(); env['KVL_MOE_ACT_TRACE']=str(trace); env.pop('KVL_MOE_MASK',None)
+              cmd=[sys.executable,'tools/kvl_chat.py',str(root/'packed'),row['prompt'],
+                   '--binary','./build/kvl_generate_trace','--cache-mib',os.environ['CACHE_MIB'],
+                   '--ram-mib',os.environ['RAM_MIB'],'--max-new','1','--temperature','0','--seed','1','--show-tokens']
+              p=subprocess.run(cmd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              out.write_text(p.stdout,encoding='utf-8'); err.write_text(p.stderr,encoding='utf-8')
+              if p.returncode!=0: raise SystemExit(f"text trace failed {row['id']} rc={p.returncode}\n{p.stderr[-3000:]}")
+              if not trace.is_file() or trace.stat().st_size<=24: raise SystemExit(f"empty text activation trace {row['id']}")
+              print(f"Q0_TEXT_TRACE {i}/16 id={row['id']} bytes={trace.stat().st_size}",flush=True)
+          PY
+
+      - name: Collect six VL activation traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0'
+          suite=json.loads((root/'vl-suite.json').read_text())
+          assert len(suite['cases'])==6
+          for i,row in enumerate(suite['cases'],1):
+              trace=root/'traces/vl'/f"{i:02d}-{row['id']}.act"
+              out=root/'traces/vl'/f"{i:02d}-{row['id']}.out"
+              err=root/'traces/vl'/f"{i:02d}-{row['id']}.err"
+              env=os.environ.copy(); env['KVL_MOE_ACT_TRACE']=str(trace); env.pop('KVL_MOE_MASK',None)
+              cmd=[sys.executable,'tools/kvl_vl_chat.py',str(root/'packed'),str(root/'vl-images'/row['image']),row['prompt'],
+                   '--vision-binary','./build/kvl_vision','--generate-binary','./build/kvl_generate_vl_trace',
+                   '--cache-mib',os.environ['CACHE_MIB'],'--ram-mib',os.environ['RAM_MIB'],
+                   '--max-new','1','--temperature','0','--seed','1','--show-tokens']
+              p=subprocess.run(cmd,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              out.write_text(p.stdout,encoding='utf-8'); err.write_text(p.stderr,encoding='utf-8')
+              if p.returncode!=0: raise SystemExit(f"VL trace failed {row['id']} rc={p.returncode}\n{p.stderr[-3000:]}")
+              if not trace.is_file() or trace.stat().st_size<=24: raise SystemExit(f"empty VL activation trace {row['id']}")
+              print(f"Q0_VL_TRACE {i}/6 id={row['id']} bytes={trace.stat().st_size}",flush=True)
+          PY
+          du -sh "$RUNNER_TEMP/q0/traces"
+
+      - name: Build text-VL balanced per-expert reservoirs
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for f in "$RUNNER_TEMP"/q0/traces/text/*.act; do args+=(--trace "text=$f"); done
+          for f in "$RUNNER_TEMP"/q0/traces/vl/*.act; do args+=(--trace "vl=$f"); done
+          python tools/kimi_moe_act_reservoir.py "$RUNNER_TEMP/q0/reservoirs" \
+            "${args[@]}" --capacity-per-kind 4 --seed 1 \
+            | tee "$RUNNER_TEMP/q0/reservoir-build.txt"
+          cp "$RUNNER_TEMP/q0/reservoirs/manifest.json" "$RUNNER_TEMP/q0/evidence/reservoir-manifest.json"
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0'
+          p=json.loads(pathlib.Path(os.environ['PILOT']).read_text())
+          r=json.loads((root/'reservoirs/manifest.json').read_text())
+          have={(int(x['layer']),int(x['expert'])):x for x in r['experts']}
+          missing=[]
+          for x in p['experts']:
+              key=(int(x['layer']),int(x['expert']))
+              if key not in have: missing.append(key); continue
+              row=have[key]
+              print(f"Q0_PILOT_COVERAGE L{key[0]:02d}E{key[1]:02d} kept={row['kept']} per_kind={row['per_kind']}")
+          assert not missing, f'pilot experts missing from calibration: {missing}'
+          assert r['hidden']==2048 and r['top_k']==6
+          print(f"Q0_RESERVOIR_PASS experts={r['expert_count']} pilot=14 missing=0")
+          PY
+          du -sh "$RUNNER_TEMP/q0/reservoirs"
+
+      - name: Drop runtime and raw traces before BF16 pilot measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/q0/packed" "$RUNNER_TEMP/q0/traces" "$RUNNER_TEMP/q0/vl-images"
+          rm -f "$RUNNER_TEMP/q0/reservoir-build.txt"
+          df -h "$RUNNER_TEMP"
+
+      - name: Measure 14 pinned BF16 boundary experts at Q8 Q6 Q5 Q4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_compression_q0_measure.py \
+            "$RUNNER_TEMP/q0/kimi-source" \
+            "$RUNNER_TEMP/q0/reservoirs" \
+            "$PILOT" \
+            "$RUNNER_TEMP/q0/evidence/sensitivity" \
+            --revision "$KIMI_REV" --cleanup-downloaded
+          test -s "$RUNNER_TEMP/q0/evidence/sensitivity/q0-summary.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Print Q0 sensitivity ranking
+        if: always()
+        shell: bash
+        run: |
+          if test -s "$RUNNER_TEMP/q0/evidence/sensitivity/q0-summary.json"; then
+            python - <<'PY'
+          import json, os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0/evidence/sensitivity/q0-summary.json'
+          r=json.loads(p.read_text())
+          print(f"Q0_SUMMARY experts={r['expert_count']} bits={r['bits']} group={r['group_size']} projection_only={r['projection_only']}")
+          for b in ('4','5','6','8'):
+              rows=sorted(r['experts'],key=lambda x:x['candidates'][b]['relative_l2'])
+              print(f"Q0_BIT q{b} least_sensitive=" + ','.join(
+                  f"L{x['layer']:02d}E{x['expert']:02d}:{x['candidates'][b]['relative_l2']:.6g}" for x in rows[:5]
+              ))
+              print(f"Q0_BIT q{b} most_sensitive=" + ','.join(
+                  f"L{x['layer']:02d}E{x['expert']:02d}:{x['candidates'][b]['relative_l2']:.6g}" for x in rows[-5:]
+              ))
+          # Compact TSV is convenient to inspect from the artifact without raw activations.
+          tsv=pathlib.Path(os.environ['RUNNER_TEMP'])/'q0/evidence/q0-ranking.tsv'
+          with tsv.open('w',encoding='utf-8') as f:
+              f.write('rank\tlayer\texpert\tc2_score\ttokens\tq8_rel_l2\tq6_rel_l2\tq5_rel_l2\tq4_rel_l2\tq4_cosine\n')
+              for x in sorted(r['experts'],key=lambda y:y['rank']):
+                  c=x['candidates']
+                  f.write(f"{x['rank']}\t{x['layer']}\t{x['expert']}\t{x['c2_score']}\t{x['tokens']}\t{c['8']['relative_l2']}\t{c['6']['relative_l2']}\t{c['5']['relative_l2']}\t{c['4']['relative_l2']}\t{c['4']['output_cosine']}\n")
+          PY
+          else
+            echo 'q0-summary.json not available'
+          fi
+
+      - name: Remove any remaining source shards before artifact upload
+        if: always()
+        shell: bash
+        run: |
+          find "$RUNNER_TEMP/q0/kimi-source" -maxdepth 1 -name 'model-*.safetensors' -type f -delete 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/q0/reservoirs" "$RUNNER_TEMP/q0/kimi-source"
+          find "$RUNNER_TEMP/q0/evidence" -type f -maxdepth 3 -printf '%P %s bytes\n' 2>/dev/null || true
+
+      - name: Upload Q0 metrics only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-compression-q0-pilot-evidence
+          path: |
+            ${{ runner.temp }}/q0/evidence/**
+          if-no-files-found: warn
