@@ -46,6 +46,12 @@ with tempfile.TemporaryDirectory() as td:
     assert report["source_records"] == 4
     assert report["output_records"] == 3
     assert report["removed_records"] == 1
+    assert report["mask_sidecar_entries"] == 1
+    sidecar = mod.mask_sidecar_path(dst_idx)
+    assert report["mask_sidecar"] == str(sidecar)
+    assert mod.read_mask(sidecar) == {(1, 1)}
+    assert sidecar.read_text(encoding="utf-8").startswith("# KVL_MOE_MASK_V1\n")
+
     out = mod.read_index(dst_idx)
     assert out["ids"] == {(1, 0), (2, 0), (2, 1)}
     assert out["n_layers"] == 3 and out["n_experts"] == 2
