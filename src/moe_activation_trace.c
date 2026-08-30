@@ -53,6 +53,9 @@ static int act_trace_open(int hidden, int top_k) {
         fprintf(stderr, "kvl: cannot open KVL_MOE_ACT_TRACE=%s\n", path);
         return -1;
     }
+    /* A larger stdio buffer keeps calibration tracing from turning one ~8 KiB
+     * record into one write syscall. Process exit still flushes the final tail. */
+    (void)setvbuf(f, NULL, _IOFBF, 1u << 20);
     static const char magic[8] = {'K','V','L','A','C','T','0','1'};
     if (fwrite(magic, 1, sizeof magic, f) != sizeof magic ||
         write_u32(f, 1u) != 0 ||
@@ -86,7 +89,10 @@ static int act_trace_record(int layer, const float *x, int hidden,
     if (fwrite(top_weights, sizeof(float), (size_t)top_k, g_act_trace) != (size_t)top_k ||
         fwrite(x, sizeof(float), (size_t)hidden, g_act_trace) != (size_t)hidden)
         return -1;
-    return fflush(g_act_trace) == 0 ? 1 : -1;
+    /* Flush periodically so a failed research run leaves useful bounded-tail
+     * evidence, without paying fflush cost for every token/layer record. */
+    if ((event & UINT64_C(255)) == 0 && fflush(g_act_trace) != 0) return -1;
+    return 1;
 }
 
 int kvl_moe_token_trace_auto(KvlExpertCache *cache, int layer,
