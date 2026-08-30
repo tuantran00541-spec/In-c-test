@@ -13,6 +13,7 @@ on:
       - "tools/analyze_kimi_mask_novelty.py"
       - "tools/compare_kimi_moe_routes.py"
       - "tools/compare_kimi_logits.py"
+      - "tools/kvl_vl_chat.py"
       - "tools/run_kimi_pruning_phase_a.py"
       - "tools/gate_kimi_pruning_phase_a.py"
       - "tools/run_kimi_pruning_phase_b.py"
@@ -48,6 +49,7 @@ jobs:
           python -m py_compile tools/analyze_kimi_mask_novelty.py
           python -m py_compile tools/compare_kimi_moe_routes.py
           python -m py_compile tools/compare_kimi_logits.py
+          python -m py_compile tools/kvl_vl_chat.py
           python -m py_compile tools/run_kimi_pruning_phase_a.py
           python -m py_compile tools/gate_kimi_pruning_phase_a.py
           python -m py_compile tools/run_kimi_pruning_phase_b.py
