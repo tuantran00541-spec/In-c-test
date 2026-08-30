@@ -29,6 +29,7 @@ on:
       - "tests/test_kimi_vl_phase_b.py"
       - "tests/test_compact_expert_store.py"
       - "tests/test_verify_compact_expert_store.py"
+      - "tests/test_sparse_expert_store_runtime.py"
       - "tests/test_kimi_mask_novelty.py"
       - "tests/data/kimi-functional-pruning-suite.json"
       - "tests/data/kimi-functional-pruning-vl-suite.json"
@@ -69,6 +70,7 @@ jobs:
           python -m py_compile tests/test_kimi_vl_phase_b.py
           python -m py_compile tests/test_compact_expert_store.py
           python -m py_compile tests/test_verify_compact_expert_store.py
+          python -m py_compile tests/test_sparse_expert_store_runtime.py
           python -m py_compile tests/test_kimi_mask_novelty.py
       - name: Phase A suite validation
         run: python tools/run_kimi_pruning_phase_a.py --validate-only
@@ -90,6 +92,8 @@ jobs:
         run: python tests/test_compact_expert_store.py
       - name: Expert-store byte verification synthetic test
         run: python tests/test_verify_compact_expert_store.py
+      - name: Sparse expert-store C runtime test
+        run: python tests/test_sparse_expert_store_runtime.py
       - name: Mask novelty synthetic test
         run: python tests/test_kimi_mask_novelty.py
       - name: C logits dump roundtrip
