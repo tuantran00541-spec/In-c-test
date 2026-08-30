@@ -1,0 +1,181 @@
+name: Real Kimi REAP-VL sentinel bisect
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-reap-vl-bisect-real.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reap-bisect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      SOURCE_ARTIFACT_ID: "9734903239"
+      TEXT_CACHE_MIB: "1536"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+
+      - name: Build Q8 oracle runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          python tests/test_q8_matvec.py --build-dir build
+
+      - name: Restore prior REAP evidence and generate fine nested masks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/reap-bisect/source" "$RUNNER_TEMP/reap-bisect/masks" "$RUNNER_TEMP/reap-bisect/evidence"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" > "$RUNNER_TEMP/reap-bisect/source.zip"
+          unzip -q "$RUNNER_TEMP/reap-bisect/source.zip" -d "$RUNNER_TEMP/reap-bisect/source"
+          test -s "$RUNNER_TEMP/reap-bisect/source/reap-vl-report.json"
+          test -s "$RUNNER_TEMP/reap-bisect/source/old-mm56.mask"
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect'
+          report=json.loads((root/'source/reap-vl-report.json').read_text())
+          order=report['prune_order']
+          counts=[1,2,3,4,5,6,7,8,12,16,24,32,40,48,56]
+          assert len(order)>=max(counts)
+          for n in counts:
+              p=root/f'masks/reap{n}.mask'
+              with p.open('w') as f:
+                  f.write('# KVL_MOE_MASK_V1\n')
+                  f.write(f'# First {n} slots from run 33319374959 modality-aware REAP-VL prune order.\n')
+                  for row in order[:n]:
+                      f.write(f"{row['layer']} {row['expert']} # reap_score={row['final_score']:.12g}\n")
+          print('REAP_BISECT_MASKS_READY counts='+','.join(map(str,counts)))
+          PY
+          cp "$RUNNER_TEMP/reap-bisect/source/reap-vl-report.json" "$RUNNER_TEMP/reap-bisect/evidence/"
+          cp "$RUNNER_TEMP/reap-bisect/source/old-mm56.mask" "$RUNNER_TEMP/reap-bisect/evidence/"
+
+      - name: Pack pinned full Q8 text oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/reap-bisect/kimi-source"
+          packed="$RUNNER_TEMP/reap-bisect/packed-q8"
+          mkdir -p "$src"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin"
+          python - <<'PY'
+          import os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect/packed-q8/experts.bin'
+          got=p.stat().st_size; expected=14428930048
+          assert got==expected,(got,expected)
+          print(f'REAP_BISECT_Q8_ORACLE_PASS bytes={got}')
+          PY
+
+      - name: Bisect first 56 REAP slots on four-token sentinel
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-bisect"
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$root/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate reap1="$root/masks/reap1.mask" \
+            --candidate reap2="$root/masks/reap2.mask" \
+            --candidate reap3="$root/masks/reap3.mask" \
+            --candidate reap4="$root/masks/reap4.mask" \
+            --candidate reap5="$root/masks/reap5.mask" \
+            --candidate reap6="$root/masks/reap6.mask" \
+            --candidate reap7="$root/masks/reap7.mask" \
+            --candidate reap8="$root/masks/reap8.mask" \
+            --candidate reap12="$root/masks/reap12.mask" \
+            --candidate reap16="$root/masks/reap16.mask" \
+            --candidate reap24="$root/masks/reap24.mask" \
+            --candidate reap32="$root/masks/reap32.mask" \
+            --candidate reap40="$root/masks/reap40.mask" \
+            --candidate reap48="$root/masks/reap48.mask" \
+            --candidate reap56="$root/masks/reap56.mask" \
+            --work-dir "$root/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Run old mm56 sentinel control
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-bisect"
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$root/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate oldmm56="$root/source/old-mm56.mask" \
+            --work-dir "$root/old-mm56-sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Summarize breakpoint
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect'
+          def load(p):
+              return json.loads(p.read_text()) if p.is_file() else None
+          s=load(root/'sentinel/sentinel-summary.json')
+          old=load(root/'old-mm56-sentinel/sentinel-summary.json')
+          rows=[] if not s else s['candidates']
+          exact=[r for r in rows if r['token_exact']]
+          first_fail=next((r for r in rows if not r['token_exact']),None)
+          strongest=max(exact,key=lambda x:x['disabled_count']) if exact else None
+          out={
+              'schema':'kimi-reap-vl-sentinel-bisect-v1',
+              'source_run_id':33319374959,
+              'source_artifact_id':int(os.environ['SOURCE_ARTIFACT_ID']),
+              'baseline_generated_ids':None if not s else s['baseline_generated_ids'],
+              'candidates':rows,
+              'strongest_exact':strongest,
+              'first_failing_nested_candidate':first_fail,
+              'old_mm56_control':None if not old else old['candidates'][0],
+              'scope':'Single held-out four-token sentinel only; this locates a nested REAP breakpoint and is not a full quality gate.'
+          }
+          p=root/'evidence/bisect-summary.json'; p.write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('REAP_BISECT_FINAL',json.dumps(out,sort_keys=True))
+          PY
+          cp "$RUNNER_TEMP/reap-bisect"/masks/*.mask "$RUNNER_TEMP/reap-bisect/evidence/" || true
+          cp "$RUNNER_TEMP/reap-bisect/sentinel/sentinel-summary.json" "$RUNNER_TEMP/reap-bisect/evidence/fine-sentinel-summary.json" 2>/dev/null || true
+          cp "$RUNNER_TEMP/reap-bisect/old-mm56-sentinel/sentinel-summary.json" "$RUNNER_TEMP/reap-bisect/evidence/old-mm56-sentinel-summary.json" 2>/dev/null || true
+
+      - name: Upload bisect evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-reap-vl-sentinel-bisect-evidence
+          path: ${{ runner.temp }}/reap-bisect/evidence/*
+          if-no-files-found: warn
