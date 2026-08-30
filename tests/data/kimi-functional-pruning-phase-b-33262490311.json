@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "scope": "longer-generation deterministic text-only A/B regression; not a global quality claim",
+  "candidate": "adaptive-unseen-cap6",
+  "source_workflow_run_id": 33262490311,
+  "source_job_id": 99126714456,
+  "source_head_sha": "268f8c06f758d42b24bf65ea0b90c51a03d31210",
+  "kvl_model_revision": "398eede0903cd983a2bfa0cc634e9ac1d843f375",
+  "phase_a_source_workflow_run_id": 33259183604,
+  "mask_path": "tests/data/kimi-functional-pruning-phase-a-33259183604-adaptive-unseen-cap6.mask",
+  "mask_sha256": "13ddf32e65c0dad8848fdf4ae299f12b7151a3bcc09145e89a4328c2b241ff6b",
+  "heldout_prompts": 14,
+  "token_exact_prompts": 14,
+  "divergent_prompts": [],
+  "sanity_checked_prompts": 4,
+  "baseline_sanity_pass": 3,
+  "candidate_sanity_pass": 3,
+  "cache_mib": 1536,
+  "ram_mib": 4096,
+  "full_cache_read_ops_total": 37772,
+  "candidate_cache_read_ops_total": 37732,
+  "full_cache_bytes_read_mib_total": 312356.72,
+  "candidate_cache_bytes_read_mib_total": 312025.94,
+  "full_total_seconds": 2313.564,
+  "candidate_total_seconds": 2397.276,
+  "artifact": {
+    "id": 9718727274,
+    "name": "kimi-functional-pruning-phase-b-evidence",
+    "size_bytes": 34383,
+    "sha256": "145d4d5fc5ef80a6ad457767a29d5411db079655188a5ec792be5237465fdfaf"
+  },
+  "promotion": "eligible for multimodal/VL sensitivity screening only; not eligible for physical deletion without VL evidence"
+}
