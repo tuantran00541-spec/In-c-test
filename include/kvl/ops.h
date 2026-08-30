@@ -47,6 +47,11 @@ void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
  * followed by row-major signed int8 weights [out,in]. */
 void kvl_matvec_q8_rowwise(float *y, const float *x, const void *blob,
                            int in, int out);
+/* Experimental Q5 expert-only format: each matrix blob is FP32 scales for
+ * contiguous input groups of 128, then a row-major packed 5-bit signed stream.
+ * Values use symmetric RTN range [-15,15]. */
+void kvl_matvec_q5_g128(float *y, const float *x, const void *blob,
+                        int in, int out);
 void kvl_silu_mul(float *y, const float *gate, const float *up, int n);
 void kvl_rmsnorm_bf16(float *y, const float *x, const uint16_t *weight,
                       int n, float eps);
@@ -73,7 +78,7 @@ int kvl_moe_token_bf16(KvlExpertCache *cache, int layer,
                        float *scratch);
 
 /* Lab dispatch: BF16 stores delegate to the production function above byte-for-byte;
- * KVL_DTYPE_Q8_ROW stores use row-wise Q8 only for routed expert gate/up/down matrices. */
+ * Q8/Q5 stores alter only routed expert gate/up/down matrices. */
 int kvl_moe_token_auto(KvlExpertCache *cache, int layer,
                        const KvlRouterConfig *router_cfg,
                        const float *x,
