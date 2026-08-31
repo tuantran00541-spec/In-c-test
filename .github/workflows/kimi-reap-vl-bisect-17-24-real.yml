@@ -1,0 +1,166 @@
+name: Real Kimi REAP-VL sentinel bisect 17-24
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-reap-vl-bisect-17-24-real.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  reap-bisect-17-24:
+    runs-on: ubuntu-latest
+    timeout-minutes: 140
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      SOURCE_ARTIFACT_ID: "9734903239"
+      TEXT_CACHE_MIB: "1536"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Q8 oracle runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          python tests/test_q8_matvec.py --build-dir build
+
+      - name: Restore REAP ranking and generate masks 16 through 24
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-bisect-17-24"
+          mkdir -p "$root/source" "$root/masks" "$root/evidence"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" > "$root/source.zip"
+          unzip -q "$root/source.zip" -d "$root/source"
+          test -s "$root/source/reap-vl-report.json"
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect-17-24'
+          report=json.loads((root/'source/reap-vl-report.json').read_text())
+          order=report['prune_order']
+          counts=list(range(16,25))
+          assert len(order)>=24
+          for n in counts:
+              p=root/f'masks/reap{n}.mask'
+              with p.open('w') as f:
+                  f.write('# KVL_MOE_MASK_V1\n')
+                  f.write(f'# First {n} slots from run 33319374959 modality-aware REAP-VL prune order.\n')
+                  for row in order[:n]:
+                      f.write(f"{row['layer']} {row['expert']} # reap_score={row['final_score']:.12g}\n")
+          for i,row in enumerate(order[15:24],16):
+              print(f'REAP_SLOT_{i}=L{row["layer"]}E{row["expert"]} score={row["final_score"]:.12g}')
+          PY
+          cp "$root/source/reap-vl-report.json" "$root/evidence/"
+
+      - name: Pack pinned full Q8 text oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-bisect-17-24"
+          src="$root/kimi-source"
+          packed="$root/packed-q8"
+          mkdir -p "$src"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin"
+          python - <<'PY'
+          import os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect-17-24/packed-q8/experts.bin'
+          got=p.stat().st_size; expected=14428930048
+          assert got==expected,(got,expected)
+          print(f'REAP_FINE_Q8_ORACLE_PASS bytes={got}')
+          PY
+
+      - name: Pinpoint first failing nested slot 16 through 24
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-bisect-17-24"
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$root/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate reap16="$root/masks/reap16.mask" \
+            --candidate reap17="$root/masks/reap17.mask" \
+            --candidate reap18="$root/masks/reap18.mask" \
+            --candidate reap19="$root/masks/reap19.mask" \
+            --candidate reap20="$root/masks/reap20.mask" \
+            --candidate reap21="$root/masks/reap21.mask" \
+            --candidate reap22="$root/masks/reap22.mask" \
+            --candidate reap23="$root/masks/reap23.mask" \
+            --candidate reap24="$root/masks/reap24.mask" \
+            --work-dir "$root/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Summarize exact breakpoint
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-bisect-17-24'
+          sp=root/'sentinel/sentinel-summary.json'
+          report=json.loads((root/'source/reap-vl-report.json').read_text())
+          s=json.loads(sp.read_text()) if sp.is_file() else None
+          rows=[] if not s else s['candidates']
+          first_fail=next((r for r in rows if not r['token_exact']),None)
+          strongest=max((r for r in rows if r['token_exact']),key=lambda r:r['disabled_count'],default=None)
+          culprit=None
+          if first_fail:
+              n=first_fail['disabled_count']
+              row=report['prune_order'][n-1]
+              culprit={'rank':n,'layer':row['layer'],'expert':row['expert'],'final_score':row['final_score']}
+          out={
+              'schema':'kimi-reap-vl-sentinel-bisect-fine-v1',
+              'source_run_id':33319374959,
+              'source_artifact_id':int(os.environ['SOURCE_ARTIFACT_ID']),
+              'baseline_generated_ids':None if not s else s['baseline_generated_ids'],
+              'candidates':rows,
+              'strongest_exact':strongest,
+              'first_failing_nested_candidate':first_fail,
+              'culprit_slot_if_monotonic':culprit,
+              'scope':'Single held-out four-token sentinel only; nested attribution assumes the first failure is caused by adding that ranked slot and is not a full quality gate.'
+          }
+          (root/'evidence/fine-bisect-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('REAP_FINE_BISECT_FINAL',json.dumps(out,sort_keys=True))
+          PY
+          cp "$RUNNER_TEMP/reap-bisect-17-24"/masks/*.mask "$RUNNER_TEMP/reap-bisect-17-24/evidence/" || true
+          cp "$RUNNER_TEMP/reap-bisect-17-24/sentinel/sentinel-summary.json" "$RUNNER_TEMP/reap-bisect-17-24/evidence/fine-sentinel-summary.json" 2>/dev/null || true
+
+      - name: Upload fine bisect evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-reap-vl-sentinel-bisect-17-24-evidence
+          path: ${{ runner.temp }}/reap-bisect-17-24/evidence/*
+          if-no-files-found: warn
