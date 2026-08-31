@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define Q8_0_BLOCK 32u
 #define Q8_0_BYTES 34u
@@ -15,18 +16,30 @@
  * owns one cache; if that assumption changes, this pilot must be redesigned. */
 static KvlExpertCache *g_layerpin_cache = NULL;
 static int g_layerpin_last_layer = -1;
+static uint64_t g_layerpin_hyst_decode_passes = 0;
+static uint64_t g_layerpin_hyst_retained = 0;
 
-static int layerpin_phase_update(KvlExpertCache *cache, int layer) {
+static int layerpin_hysteresis_enabled(void) {
+    const char *v = getenv("KVL_LAYERPIN_HYSTERESIS");
+    return v && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+}
+
+static int layerpin_phase_update(KvlExpertCache *cache, int layer,
+                                 int use_hysteresis) {
     if (cache != g_layerpin_cache) {
         g_layerpin_cache = cache;
         g_layerpin_last_layer = -1;
+        g_layerpin_hyst_decode_passes = 0;
+        g_layerpin_hyst_retained = 0;
     }
     if (!cache->pinned_of && g_layerpin_last_layer == 26 && layer == 1) {
         /* n=0 on dense L0 is only an activation sentinel: it lazily allocates
          * pinned_of without protecting any record. The routed layers populate
          * their two pins as the first decode forward walks L1..L26. */
         if (kvl_expert_cache_pin_layer(cache, 0, NULL, 0) != 0) return -1;
-        fprintf(stderr, "kvl_layerpin: activated_after_prefill=yes slots=%d\n", cache->n_slots);
+        fprintf(stderr,
+                "kvl_layerpin: activated_after_prefill=yes slots=%d policy=%s\n",
+                cache->n_slots, use_hysteresis ? "hysteresis" : "topweight");
     }
     g_layerpin_last_layer = layer;
     return 0;
@@ -37,13 +50,31 @@ static size_t q8_0_matrix_bytes(int in, int out) {
     return (size_t)out * ((size_t)in / Q8_0_BLOCK) * Q8_0_BYTES;
 }
 
-static int pin_heaviest_routes(KvlExpertCache *cache, int layer,
-                               const KvlRouterConfig *router_cfg,
-                               const int *top_ids, const float *top_weights) {
+static int layerpin_is_pinned(const KvlExpertCache *cache, int layer, int expert) {
+    if (!cache || !cache->store || !cache->pinned_of ||
+        layer < 0 || expert < 0 ||
+        layer >= (int)cache->store->hdr.n_layers ||
+        expert >= (int)cache->store->hdr.n_experts)
+        return 0;
+    const size_t key = (size_t)layer * cache->store->hdr.n_experts + (size_t)expert;
+    return cache->pinned_of[key] != 0;
+}
+
+static int expert_already_selected(const int *pins, int n, int expert) {
+    for (int i = 0; i < n; ++i)
+        if (pins[i] == expert) return 1;
+    return 0;
+}
+
+static int pin_routes(KvlExpertCache *cache, int layer,
+                      const KvlRouterConfig *router_cfg,
+                      const int *top_ids, const float *top_weights,
+                      int use_hysteresis, int *retained_out) {
     if (!cache || !cache->store || !router_cfg || !top_ids || !top_weights)
         return -1;
 
     const int n_pin = router_cfg->top_k < LAYER_PIN_COUNT ? router_cfg->top_k : LAYER_PIN_COUNT;
+    if (retained_out) *retained_out = 0;
     if (n_pin <= 0) return kvl_expert_cache_pin_layer(cache, layer, NULL, 0);
 
     /* This pilot intentionally reserves two experts for every routed layer and
@@ -54,21 +85,50 @@ static int pin_heaviest_routes(KvlExpertCache *cache, int layer,
     const int needed_slots = routed_layers * LAYER_PIN_COUNT + router_cfg->top_k;
     if (routed_layers <= 0 || cache->n_slots < needed_slots) return -1;
 
-    int best[LAYER_PIN_COUNT] = {-1, -1};
-    for (int j = 0; j < router_cfg->top_k; ++j) {
-        if (best[0] < 0 || top_weights[j] > top_weights[best[0]]) {
-            best[1] = best[0];
-            best[0] = j;
-        } else if (best[1] < 0 || top_weights[j] > top_weights[best[1]]) {
-            best[1] = j;
+    int pins[LAYER_PIN_COUNT] = {-1, -1};
+    int n_selected = 0;
+    int retained = 0;
+
+    if (use_hysteresis && cache->pinned_of) {
+        /* Hysteresis is deliberately routing-safe: an old pin is retained only
+         * if the CURRENT router still selected that exact expert in top-k. No
+         * expert outside current top-k is kept merely because it was hot before.
+         * If both old pins survive, both win regardless of their current rank;
+         * this trades pin churn for temporal reuse without changing MoE math. */
+        int keep_idx[LAYER_PIN_COUNT] = {-1, -1};
+        for (int j = 0; j < router_cfg->top_k; ++j) {
+            if (!layerpin_is_pinned(cache, layer, top_ids[j])) continue;
+            for (int p = 0; p < n_pin; ++p) {
+                if (keep_idx[p] < 0 || top_weights[j] > top_weights[keep_idx[p]]) {
+                    for (int q = n_pin - 1; q > p; --q) keep_idx[q] = keep_idx[q - 1];
+                    keep_idx[p] = j;
+                    break;
+                }
+            }
+        }
+        for (int p = 0; p < n_pin; ++p) {
+            if (keep_idx[p] < 0) continue;
+            const int e = top_ids[keep_idx[p]];
+            if (expert_already_selected(pins, n_selected, e)) continue;
+            pins[n_selected++] = e;
+            retained++;
         }
     }
 
-    int pins[LAYER_PIN_COUNT];
-    for (int i = 0; i < n_pin; ++i) {
-        if (best[i] < 0) return -1;
-        pins[i] = top_ids[best[i]];
+    /* Fill remaining pin slots with the heaviest current routes. With
+     * hysteresis disabled this is byte-for-byte the old top-weight policy's
+     * selection rule, including stable first-occurrence behavior on ties. */
+    while (n_selected < n_pin) {
+        int best = -1;
+        for (int j = 0; j < router_cfg->top_k; ++j) {
+            if (expert_already_selected(pins, n_selected, top_ids[j])) continue;
+            if (best < 0 || top_weights[j] > top_weights[best]) best = j;
+        }
+        if (best < 0) return -1;
+        pins[n_selected++] = top_ids[best];
     }
+
+    if (retained_out) *retained_out = retained;
     return kvl_expert_cache_pin_layer(cache, layer, pins, n_pin);
 }
 
@@ -89,7 +149,10 @@ static int moe_token_gguf_q8_impl(KvlExpertCache *cache, int layer,
         !top_ids || !top_weights || !scratch || expert_intermediate_size <= 0)
         return -1;
 
-    if (use_layer_pins && layerpin_phase_update(cache, layer) != 0) return -1;
+    const int use_hysteresis = use_layer_pins && layerpin_hysteresis_enabled();
+    if (use_layer_pins &&
+        layerpin_phase_update(cache, layer, use_hysteresis) != 0)
+        return -1;
 
     const int H = router_cfg->hidden_size;
     const int I = expert_intermediate_size;
@@ -100,9 +163,22 @@ static int moe_token_gguf_q8_impl(KvlExpertCache *cache, int layer,
 
     /* pinned_of is NULL for all prefill calls. It becomes non-NULL only at the
      * L26->L1 transition above, so prefill remains the exact baseline cache path. */
-    if (use_layer_pins && cache->pinned_of &&
-        pin_heaviest_routes(cache, layer, router_cfg, top_ids, top_weights) != 0)
-        return -1;
+    if (use_layer_pins && cache->pinned_of) {
+        int retained = 0;
+        if (pin_routes(cache, layer, router_cfg, top_ids, top_weights,
+                       use_hysteresis, &retained) != 0)
+            return -1;
+        if (use_hysteresis) {
+            g_layerpin_hyst_retained += (uint64_t)retained;
+            if (layer == 26) {
+                g_layerpin_hyst_decode_passes++;
+                fprintf(stderr,
+                        "kvl_layerpin_hyst: decode_pass=%llu retained_total=%llu\n",
+                        (unsigned long long)g_layerpin_hyst_decode_passes,
+                        (unsigned long long)g_layerpin_hyst_retained);
+            }
+        }
+    }
 
     (void)kvl_expert_cache_getmany(cache, layer, top_ids, router_cfg->top_k);
     for (int i = 0; i < H; ++i) out[i] = 0.0f;

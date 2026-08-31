@@ -1,0 +1,281 @@
+name: Real Kimi GGUF Q8_0 Windows layer-pin hysteresis A/B
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-layerpin-hyst
+    paths:
+      - 'src/gguf_q8_moe.c'
+      - '.github/workflows/kimi-gguf-q8-windows-layerpin-hyst-ab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-layerpin-hyst-ab:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned tooling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@$env:LLAMA_CPP_GGUF_COMMIT#subdirectory=gguf-py"
+
+      - name: Build unchanged layer-pin binary and cache unit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PARALLEL_KERNELS=OFF
+          cmake --build build --config Release --target kvl_generate_gguf_q8_layerpin kvl_cache_layer_pin_probe
+          .\build\Release\kvl_cache_layer_pin_probe.exe
+          if (-not (Test-Path 'build\Release\kvl_generate_gguf_q8_layerpin.exe')) { throw 'layer-pin generator missing' }
+
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $work = Join-Path $env:RUNNER_TEMP 'kimi-official-trunk-source'
+          python tools/fetch_tokenizer.py $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION
+          python tools/pack_full_text.py $work $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION --expert-format none
+          if (-not (Test-Path (Join-Path $packed 'trunk.bin'))) { throw 'trunk missing' }
+          if (Test-Path (Join-Path $packed 'experts.bin')) { throw 'unexpected packed experts' }
+
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(
+              repo_id=os.environ['GGUF_REPO'],
+              revision=os.environ['GGUF_REVISION'],
+              filename=os.environ['GGUF_FILE'],
+              local_dir=packed,
+          ))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          '@ | python -
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-layerpin-hyst-ab'
+          New-Item -ItemType Directory -Force -Path $e | Out-Null
+          python tools/index_kimi_gguf_q8.py (Join-Path $packed 'experts.bin') (Join-Path $packed 'experts.idx') --summary-json (Join-Path $e 'index-summary.json')
+
+      - name: Prove hysteresis is disabled throughout prefill
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-layerpin-hyst-ab'
+          $prompt = 'Count from 1 to 20 in order, separated by spaces. Output only the numbers.'
+          $bin = Join-Path (Get-Location) 'build\Release\kvl_generate_gguf_q8_layerpin.exe'
+
+          Remove-Item Env:KVL_LAYERPIN_HYSTERESIS -ErrorAction SilentlyContinue
+          python tools/kvl_chat.py $packed $prompt --binary $bin --cache-mib 512 --ram-mib 4096 --max-new 1 --temperature 0 --seed 1 --show-tokens 1> (Join-Path $e 'prefill-uniform.out') 2> (Join-Path $e 'prefill-uniform.err')
+          $env:KVL_LAYERPIN_HYSTERESIS = '1'
+          python tools/kvl_chat.py $packed $prompt --binary $bin --cache-mib 512 --ram-mib 4096 --max-new 1 --temperature 0 --seed 1 --show-tokens 1> (Join-Path $e 'prefill-hyst.out') 2> (Join-Path $e 'prefill-hyst.err')
+          Remove-Item Env:KVL_LAYERPIN_HYSTERESIS -ErrorAction SilentlyContinue
+
+          Get-Content (Join-Path $e 'prefill-uniform.err')
+          Get-Content (Join-Path $e 'prefill-hyst.err')
+          if (Select-String -Path (Join-Path $e 'prefill-uniform.err') -Pattern 'activated_after_prefill=yes' -Quiet) { throw 'uniform pins activated during prefill-only control' }
+          if (Select-String -Path (Join-Path $e 'prefill-hyst.err') -Pattern 'activated_after_prefill=yes' -Quiet) { throw 'hysteresis pins activated during prefill-only control' }
+
+      - name: Run balanced uniform versus hysteresis decode A/B
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-layerpin-hyst-ab'
+          $prompt = 'Count from 1 to 20 in order, separated by spaces. Output only the numbers.'
+          $bin = Join-Path (Get-Location) 'build\Release\kvl_generate_gguf_q8_layerpin.exe'
+
+          function Run-One([string]$label, [bool]$hyst) {
+            $out = Join-Path $e ($label + '.out')
+            $err = Join-Path $e ($label + '.err')
+            if ($hyst) { $env:KVL_LAYERPIN_HYSTERESIS = '1' }
+            else { Remove-Item Env:KVL_LAYERPIN_HYSTERESIS -ErrorAction SilentlyContinue }
+            Write-Host "KIMI_LAYERPIN_HYST_BEGIN label=$label hyst=$hyst"
+            python tools/kvl_chat.py $packed $prompt --binary $bin --cache-mib 512 --ram-mib 4096 --max-new 12 --temperature 0 --seed 1 --show-tokens 1> $out 2> $err
+            Get-Content $out
+            Get-Content $err
+            if (-not (Select-String -Path $err -Pattern 'expert_direct_io=yes' -Quiet)) { throw "$label expert direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern 'trunk_direct_io=yes' -Quiet)) { throw "$label trunk direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern 'kvl_layerpin: activated_after_prefill=yes' -Quiet)) { throw "$label layer-pin activation missing" }
+            if ($hyst) {
+              if (-not (Select-String -Path $err -Pattern 'policy=hysteresis' -Quiet)) { throw "$label hysteresis policy marker missing" }
+              if (-not (Select-String -Path $err -Pattern 'kvl_layerpin_hyst:' -Quiet)) { throw "$label hysteresis retention evidence missing" }
+            } else {
+              if (-not (Select-String -Path $err -Pattern 'policy=topweight' -Quiet)) { throw "$label uniform policy marker missing" }
+              if (Select-String -Path $err -Pattern 'kvl_layerpin_hyst:' -Quiet) { throw "$label uniform run emitted hysteresis evidence" }
+            }
+            Write-Host "KIMI_LAYERPIN_HYST_END label=$label hyst=$hyst"
+          }
+
+          Run-One 'uniform_a' $false
+          Run-One 'hyst_a' $true
+          Run-One 'hyst_b' $true
+          Run-One 'uniform_b' $false
+          Remove-Item Env:KVL_LAYERPIN_HYSTERESIS -ErrorAction SilentlyContinue
+
+      - name: Summarize correctness, retention, I/O and hosted-runner timing
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import json, os, re, statistics
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-windows-layerpin-hyst-ab'
+          timing_rx = re.compile(r'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)')
+          ids_rx = re.compile(r'\[kvl\] generated ids:\s*([^\r\n]+)')
+          cache_rx = re.compile(
+              r'kvl_cache: .*? req=(\d+) hit=(\d+) miss=(\d+) hit_rate=[0-9.]+% evict=(\d+) '
+              r'prefetch=(\d+)/(\d+) reads=(\d+) bytes=([0-9.]+) MiB rate=([0-9.]+) MiB/s failures=(\d+)'
+          )
+          hyst_rx = re.compile(r'kvl_layerpin_hyst: decode_pass=(\d+) retained_total=(\d+)')
+
+          def parse(label):
+              ep = root / f'{label}.err'
+              op = root / f'{label}.out'
+              if not ep.exists() or not op.exists(): return {'missing': True}
+              err = ep.read_text(errors='replace')
+              out = op.read_text(errors='replace').strip()
+              tm = timing_rx.search(err); cm = cache_rx.search(err); im = ids_rx.search(err)
+              if not tm or not cm or not im: return {'parse_error': True, 'output': out}
+              hm = hyst_rx.findall(err)
+              return {
+                  'output': out,
+                  'ids': [int(x) for x in im.group(1).split()],
+                  'direct_io': 'expert_direct_io=yes' in err and 'trunk_direct_io=yes' in err,
+                  'policy_hysteresis': 'policy=hysteresis' in err,
+                  'policy_topweight': 'policy=topweight' in err,
+                  'hyst_decode_passes': int(hm[-1][0]) if hm else 0,
+                  'hyst_retained_total': int(hm[-1][1]) if hm else 0,
+                  'first_token_s': float(tm.group(1)),
+                  'avg_next_s': float(tm.group(2)),
+                  'total_s': float(tm.group(3)),
+                  'generated': int(tm.group(4)),
+                  'requests': int(cm.group(1)),
+                  'hits': int(cm.group(2)),
+                  'misses': int(cm.group(3)),
+                  'evictions': int(cm.group(4)),
+                  'prefetch_reads': int(cm.group(5)),
+                  'prefetch_batches': int(cm.group(6)),
+                  'read_ops': int(cm.group(7)),
+                  'bytes_mib': float(cm.group(8)),
+                  'rate_mib_s': float(cm.group(9)),
+                  'failures': int(cm.group(10)),
+              }
+
+          pre_u = parse('prefill-uniform')
+          pre_h = parse('prefill-hyst')
+          labels = ['uniform_a','hyst_a','hyst_b','uniform_b']
+          runs = {x: parse(x) for x in labels}
+          uniform = [runs['uniform_a'], runs['uniform_b']]
+          hyst = [runs['hyst_a'], runs['hyst_b']]
+
+          counter_keys = ['requests','hits','misses','evictions','prefetch_reads','prefetch_batches','read_ops','bytes_mib']
+          prefill_equal = all(pre_u.get(k) == pre_h.get(k) for k in counter_keys)
+          prefill_token_equal = pre_u.get('ids') == pre_h.get('ids')
+
+          def med(rows, key): return statistics.median(r[key] for r in rows)
+          uniform_reads = med(uniform, 'prefetch_reads')
+          hyst_reads = med(hyst, 'prefetch_reads')
+          uniform_bytes = med(uniform, 'bytes_mib')
+          hyst_bytes = med(hyst, 'bytes_mib')
+          uniform_next = med(uniform, 'avg_next_s')
+          hyst_next = med(hyst, 'avg_next_s')
+          retained = med(hyst, 'hyst_retained_total')
+          passes = med(hyst, 'hyst_decode_passes')
+
+          seqs = [runs[x].get('ids') for x in labels]
+          sequence_exact = all(s == seqs[0] for s in seqs[1:])
+          generated_min = min(r.get('generated', 0) for r in runs.values())
+          io_better_than_uniform = hyst_reads < uniform_reads and hyst_bytes < uniform_bytes
+
+          summary = {
+              'claim_boundary': 'Windows-2025 hosted-runner real-weight text pilot comparing two decode-only cache policies with identical router/math, 512 MiB expert cache, AVX2 and direct I/O. Hysteresis may retain an old pin only when that expert remains in the current top-6. Hosted-runner timing is not a target-laptop benchmark or a global speed claim.',
+              'policy': {'pins_per_routed_layer': 2, 'routed_layers': 26, 'reserved_pin_slots': 52, 'transient_slots': 6, 'cache_mib': 512, 'hysteresis_rule': 'retain previous pin iff it is still in current top-k; fill remaining pins by current route weight'},
+              'prefill_control': {'uniform': pre_u, 'hysteresis': pre_h, 'counter_exact': prefill_equal, 'token_exact': prefill_token_equal},
+              'runs': runs,
+              'sequence_exact_all_long_runs': sequence_exact,
+              'generated_min': generated_min,
+              'hysteresis_median_decode_passes': passes,
+              'hysteresis_median_retained_pin_decisions': retained,
+              'uniform_median_prefetch_reads': uniform_reads,
+              'hysteresis_median_prefetch_reads': hyst_reads,
+              'saved_expert_loads_vs_uniform_total_run': uniform_reads - hyst_reads,
+              'uniform_median_bytes_mib': uniform_bytes,
+              'hysteresis_median_bytes_mib': hyst_bytes,
+              'saved_expert_mib_vs_uniform_total_run': uniform_bytes - hyst_bytes,
+              'expert_bytes_reduction_fraction_vs_uniform_total_run': (uniform_bytes-hyst_bytes)/uniform_bytes if uniform_bytes else None,
+              'uniform_median_avg_next_s': uniform_next,
+              'hysteresis_median_avg_next_s': hyst_next,
+              'hosted_runner_next_token_speedup_x_vs_uniform': uniform_next/hyst_next if hyst_next else None,
+              'io_better_than_uniform': io_better_than_uniform,
+          }
+          root.mkdir(parents=True, exist_ok=True)
+          (root/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          if pre_u.get('missing') or pre_h.get('missing') or pre_u.get('parse_error') or pre_h.get('parse_error'):
+              raise SystemExit('prefill control parse failed')
+          if not prefill_equal or not prefill_token_equal:
+              raise SystemExit('hysteresis changed prefill behavior')
+          if any(r.get('missing') or r.get('parse_error') for r in runs.values()):
+              raise SystemExit('long A/B parse failed')
+          if not all(r['direct_io'] and r['failures'] == 0 for r in runs.values()):
+              raise SystemExit('direct-I/O/correctness infrastructure gate failed')
+          if not runs['uniform_a']['policy_topweight'] or not runs['uniform_b']['policy_topweight']:
+              raise SystemExit('uniform policy marker missing')
+          if not runs['hyst_a']['policy_hysteresis'] or not runs['hyst_b']['policy_hysteresis']:
+              raise SystemExit('hysteresis policy marker missing')
+          if not sequence_exact:
+              raise SystemExit('hysteresis changed generated token sequence')
+          if generated_min < 10:
+              raise SystemExit('prompt ended too early for steady decode evidence')
+          if retained <= 0 or passes <= 1:
+              raise SystemExit('hysteresis did not retain prior pins across decode passes')
+          if not io_better_than_uniform:
+              raise SystemExit('hysteresis did not reduce physical expert loads/bytes versus uniform top-weight pins')
+          '@ | python -
+
+      - name: Upload hysteresis evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-windows-layerpin-hyst-ab-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-windows-layerpin-hyst-ab/**
+          retention-days: 14
