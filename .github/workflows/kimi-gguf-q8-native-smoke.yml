@@ -29,11 +29,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2025]
+        avx2: ['OFF', 'ON']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=${{ matrix.avx2 }}
       - name: Build GGUF Q8_0 probes and generators
         run: >-
           cmake --build build --config Release --target
@@ -121,34 +122,47 @@ jobs:
           python tools/index_kimi_gguf_q8.py \
             "$f/sparse.gguf" "$f/experts.idx" --summary-json "$f/index-summary.json"
           ls -lh "$f/experts.idx"
-      - name: Build native C probes
+      - name: Build scalar and AVX2 native probes
         shell: bash
         run: |
           set -euo pipefail
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target kvl_q8_0_expert_probe kvl_gguf_store_probe -j2
-      - name: Compare native Q8_0 against pinned llama.cpp oracle
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar --target kvl_q8_0_expert_probe kvl_gguf_store_probe -j2
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 --target kvl_q8_0_expert_probe kvl_gguf_store_probe -j2
+      - name: Compare scalar Q8_0 against pinned llama.cpp oracle
         shell: bash
         run: |
           set -euo pipefail
           f="$RUNNER_TEMP/q8_0_fixture"
-          ./build/kvl_q8_0_expert_probe \
+          ./build-scalar/kvl_q8_0_expert_probe \
             "$f/gate.q8" "$f/up.q8" "$f/down.q8" \
             "$f/x_h.f32" "$f/x_i.f32" \
             "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
-            2>&1 | tee "$f/native-smoke.log"
-          grep -q 'KIMI_GGUF_Q8_0_NATIVE_SMOKE_PASS' "$f/native-smoke.log"
-      - name: Validate scatter O_DIRECT through ExpertCache
+            2>&1 | tee "$f/native-scalar.log"
+          grep -q 'KIMI_GGUF_Q8_0_NATIVE_SMOKE_PASS' "$f/native-scalar.log"
+      - name: Compare AVX2 Q8_0 against pinned llama.cpp oracle
         shell: bash
         run: |
           set -euo pipefail
           f="$RUNNER_TEMP/q8_0_fixture"
-          ./build/kvl_gguf_store_probe \
+          ./build-avx2/kvl_q8_0_expert_probe \
+            "$f/gate.q8" "$f/up.q8" "$f/down.q8" \
+            "$f/x_h.f32" "$f/x_i.f32" \
+            "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
+            2>&1 | tee "$f/native-avx2.log"
+          grep -q 'KIMI_GGUF_Q8_0_NATIVE_SMOKE_PASS' "$f/native-avx2.log"
+      - name: Validate AVX2 scatter O_DIRECT through ExpertCache
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/q8_0_fixture"
+          ./build-avx2/kvl_gguf_store_probe \
             "$f/sparse.gguf" "$f/experts.idx" \
             "$f/x_h.f32" "$f/x_i.f32" \
             "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
-            2>&1 | tee "$f/store-smoke.log"
-          grep -q 'KIMI_GGUF_STORE_SMOKE_PASS' "$f/store-smoke.log"
+            2>&1 | tee "$f/store-avx2.log"
+          grep -q 'KIMI_GGUF_STORE_SMOKE_PASS' "$f/store-avx2.log"
       - name: Upload numerical and storage evidence
         uses: actions/upload-artifact@v4
         with:
@@ -156,6 +170,7 @@ jobs:
           path: |
             ${{ runner.temp }}/q8_0_fixture/fixture.json
             ${{ runner.temp }}/q8_0_fixture/index-summary.json
-            ${{ runner.temp }}/q8_0_fixture/native-smoke.log
-            ${{ runner.temp }}/q8_0_fixture/store-smoke.log
+            ${{ runner.temp }}/q8_0_fixture/native-scalar.log
+            ${{ runner.temp }}/q8_0_fixture/native-avx2.log
+            ${{ runner.temp }}/q8_0_fixture/store-avx2.log
           retention-days: 14
