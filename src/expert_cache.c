@@ -253,10 +253,11 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
      * around the whole batch, not the sum of per-read durations, so reported aggregate
      * throughput is meaningful when reads overlap. */
     const double batch_t0 = now_s();
+    int i;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1)
 #endif
-    for (int i = 0; i < nw; ++i) {
+    for (i = 0; i < nw; ++i) {
         w[i].got = kvl_expert_load(c->store, w[i].r,
             c->arena + (size_t)w[i].slot * c->slot_bytes);
     }
@@ -264,19 +265,19 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
 
     /* Phase 3: publish only complete records. */
     int ok = 0;
-    for (int i = 0; i < nw; ++i) {
-        c->read_ops += kvl_expert_load_read_ops(c->store, w[i].r);
-        if (w[i].got != (int64_t)w[i].r->read_bytes) {
+    for (int j = 0; j < nw; ++j) {
+        c->read_ops += kvl_expert_load_read_ops(c->store, w[j].r);
+        if (w[j].got != (int64_t)w[j].r->read_bytes) {
             c->read_failures++;
-            c->key_of[w[i].slot] = KVL_CACHE_EMPTY;
-            c->record_of_slot[w[i].slot] = NULL;
+            c->key_of[w[j].slot] = KVL_CACHE_EMPTY;
+            c->record_of_slot[w[j].slot] = NULL;
             continue;
         }
-        c->record_of_slot[w[i].slot] = w[i].r;
-        c->key_of[w[i].slot] = w[i].key;
-        c->slot_of[w[i].key] = w[i].slot;
-        c->used_at[w[i].slot] = ++c->clock;
-        c->bytes_read += w[i].r->read_bytes;
+        c->record_of_slot[w[j].slot] = w[j].r;
+        c->key_of[w[j].slot] = w[j].key;
+        c->slot_of[w[j].key] = w[j].slot;
+        c->used_at[w[j].slot] = ++c->clock;
+        c->bytes_read += w[j].r->read_bytes;
         c->prefetch_reads++;
         ok++;
     }
