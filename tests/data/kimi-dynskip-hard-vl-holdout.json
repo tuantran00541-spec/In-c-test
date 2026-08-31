@@ -1,0 +1,17 @@
+{
+  "schema": "kimi-dynskip-hard-vl-holdout-v1",
+  "model": "moonshotai/Kimi-VL-A3B-Instruct",
+  "model_revision": "398eede0903cd983a2bfa0cc634e9ac1d843f375",
+  "generator_source_commit": "3371971cbc1f7a7dfa72baf68a91779bee24fd1e",
+  "initial_policy_under_test": "tests/data/kimi-dynskip-media-l22-26-t012-k5.policy",
+  "purpose": "Policy-selection holdout for multimodal reasoning retention; not a hidden or general intelligence benchmark.",
+  "usage_rule": "Do not tune dynamic-skip thresholds, layer ranges, min_keep, or expert protections against these six case outcomes. Use separate calibration evidence for policy search, then evaluate shortlisted policies on this frozen holdout.",
+  "cases": [
+    {"id": "hard-weighted-inventory", "domain": "visual_counting_arithmetic", "expected": "37"},
+    {"id": "hard-vi-quadrant-arithmetic", "domain": "vietnamese_spatial_arithmetic", "expected": "19"},
+    {"id": "hard-color-cycle-induction", "domain": "visual_pattern_induction", "expected": "green"},
+    {"id": "hard-maze-shortest-path", "domain": "visual_planning", "expected": "13"},
+    {"id": "hard-size-ordering", "domain": "visual_comparison_ordering", "expected": "green"},
+    {"id": "hard-dot-matrix-rule", "domain": "visual_pattern_counting", "expected": "5"}
+  ]
+}
