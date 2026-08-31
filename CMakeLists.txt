@@ -3,6 +3,7 @@ project(kimi_vl_lowram C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(KVL_USE_AVX2 "Use AVX2 BF16/Q8 GEMV backends" OFF)
+option(KVL_MSVC_PARALLEL_KERNELS "Enable OpenMP for selected MSVC GEMV and expert-prefetch kernels" OFF)
 
 if(MSVC)
   add_compile_options(/W4)
@@ -10,11 +11,22 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# Linux keeps the existing target-wide OpenMP behavior. On MSVC, enable OpenMP
-# only for the long-context prefill translation unit so legacy OpenMP parsing does
-# not suddenly change unrelated Q8/cache kernels or their nested behavior.
+# Linux keeps the existing target-wide OpenMP behavior. On MSVC, long-context
+# prefill retains its established OpenMP path. The broader fast path is opt-in
+# until real Windows A/B evidence justifies promotion: GEMV translation units and
+# expert-cache prefetch are independent phases, so this enables useful parallelism
+# without putting the MoE expert loop itself inside a nested OpenMP region.
 if(MSVC)
   set_source_files_properties(src/mla_prefill_streaming.c PROPERTIES COMPILE_OPTIONS "/openmp")
+  if(KVL_MSVC_PARALLEL_KERNELS)
+    set_source_files_properties(
+      src/ops.c
+      src/q8_ops.c
+      src/gguf_q8_0.c
+      src/q5_ops.c
+      src/expert_cache.c
+      PROPERTIES COMPILE_OPTIONS "/openmp")
+  endif()
 else()
   find_package(OpenMP)
 endif()
@@ -121,7 +133,7 @@ target_link_libraries(kvl_generate_dynskip PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
 add_executable(kvl_generate_vl_dynskip src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl_dynskip PRIVATE kvl_storage)
-target_compile_definitions(kvl_generate_vl_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
+target_compile_definitions(kvl_generate_vl_dynskip PRIVATE kvl_moe_token_q8_dynskip_auto)
 add_executable(kvl_dynskip_probe src/dynskip_probe.c)
 target_link_libraries(kvl_dynskip_probe PRIVATE kvl_storage)
 
