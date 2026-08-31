@@ -1,0 +1,241 @@
+name: Real Kimi GGUF Q8_0 Windows one-token decode I/O
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - '.github/workflows/kimi-gguf-q8-windows-decode-io.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-decode-io:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned tooling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@$env:LLAMA_CPP_GGUF_COMMIT#subdirectory=gguf-py"
+
+      - name: Build Windows AVX2 baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PARALLEL_KERNELS=OFF
+          cmake --build build --config Release --target kvl_generate_gguf_q8
+          if (-not (Test-Path 'build\Release\kvl_generate_gguf_q8.exe')) { throw 'generator missing' }
+
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $work = Join-Path $env:RUNNER_TEMP 'kimi-official-trunk-source'
+          python tools/fetch_tokenizer.py $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION
+          python tools/pack_full_text.py $work $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION --expert-format none
+          if (-not (Test-Path (Join-Path $packed 'trunk.bin'))) { throw 'trunk missing' }
+          if (Test-Path (Join-Path $packed 'experts.bin')) { throw 'unexpected packed experts' }
+
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(
+              repo_id=os.environ['GGUF_REPO'],
+              revision=os.environ['GGUF_REVISION'],
+              filename=os.environ['GGUF_FILE'],
+              local_dir=packed,
+          ))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          '@ | python -
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-decode-io'
+          New-Item -ItemType Directory -Force -Path $e | Out-Null
+          python tools/index_kimi_gguf_q8.py (Join-Path $packed 'experts.bin') (Join-Path $packed 'experts.idx') --summary-json (Join-Path $e 'index-summary.json')
+
+      - name: Run max-new 1 versus 2 twice
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-decode-io'
+          $prompt = 'Tính 125 + 75. Chỉ trả lời bằng số.'
+          $binary = Join-Path (Get-Location) 'build\Release\kvl_generate_gguf_q8.exe'
+
+          function Run-One([string]$label, [int]$maxNew) {
+            $out = Join-Path $e ($label + '.out')
+            $err = Join-Path $e ($label + '.err')
+            Write-Host "KIMI_DECODE_IO_BEGIN label=$label max_new=$maxNew"
+            python tools/kvl_chat.py $packed $prompt `
+              --binary $binary --cache-mib 512 --ram-mib 4096 `
+              --max-new $maxNew --temperature 0 --seed 1 --show-tokens `
+              1> $out 2> $err
+            Get-Content $out
+            Get-Content $err
+            if (-not (Select-String -Path $err -Pattern 'expert_direct_io=yes' -Quiet)) { throw "$label expert direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern 'trunk_direct_io=yes' -Quiet)) { throw "$label trunk direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern 'kvl_cache:' -Quiet)) { throw "$label cache report missing" }
+            if (-not (Select-String -Path $err -Pattern '\[kvl\] generated ids: 1208' -Quiet)) { throw "$label first generated token drifted" }
+            if ($maxNew -eq 2 -and -not (Select-String -Path $err -Pattern '\[kvl\] generated ids: 1208 163586' -Quiet)) { throw "$label second generated token drifted" }
+            Write-Host "KIMI_DECODE_IO_END label=$label max_new=$maxNew"
+          }
+
+          Run-One 'one_a' 1
+          Run-One 'two_a' 2
+          Run-One 'one_b' 1
+          Run-One 'two_b' 2
+
+      - name: Summarize one-token decode deltas
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import json, os, re, statistics
+          from pathlib import Path
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-windows-decode-io'
+          timing_rx = re.compile(r'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)')
+          token_rx = re.compile(r'\[kvl\] token=(\d+) dt=([0-9.]+)s')
+          cache_rx = re.compile(
+              r'kvl_cache: .*? req=(\d+) hit=(\d+) miss=(\d+) hit_rate=[0-9.]+% evict=(\d+) '
+              r'prefetch=(\d+)/(\d+) reads=(\d+) bytes=([0-9.]+) MiB rate=([0-9.]+) MiB/s failures=(\d+)'
+          )
+
+          labels = [('one_a', 1), ('two_a', 2), ('one_b', 1), ('two_b', 2)]
+          runs = {}
+          for label, expected_generated in labels:
+              ep = root / f'{label}.err'
+              op = root / f'{label}.out'
+              if not ep.exists() or not op.exists():
+                  runs[label] = {'missing': True}
+                  continue
+              err = ep.read_text(errors='replace')
+              out = op.read_text(errors='replace').strip()
+              tm = timing_rx.search(err)
+              cm = cache_rx.search(err)
+              toks = [(int(t), float(dt)) for t, dt in token_rx.findall(err)]
+              if not tm or not cm:
+                  runs[label] = {'parse_error': True, 'output': out}
+                  continue
+              bytes_mib = float(cm.group(8))
+              rate_mib_s = float(cm.group(9))
+              runs[label] = {
+                  'output': out,
+                  'direct_io': 'expert_direct_io=yes' in err and 'trunk_direct_io=yes' in err,
+                  'first_token_s': float(tm.group(1)),
+                  'avg_next_s': float(tm.group(2)),
+                  'total_s': float(tm.group(3)),
+                  'generated': int(tm.group(4)),
+                  'token_dts': toks,
+                  'decode_token_s': toks[1][1] if len(toks) >= 2 else None,
+                  'requests': int(cm.group(1)),
+                  'hits': int(cm.group(2)),
+                  'misses': int(cm.group(3)),
+                  'evictions': int(cm.group(4)),
+                  'prefetch_reads': int(cm.group(5)),
+                  'prefetch_batches': int(cm.group(6)),
+                  'read_ops': int(cm.group(7)),
+                  'bytes_mib': bytes_mib,
+                  'rate_mib_s': rate_mib_s,
+                  'read_seconds_est': bytes_mib / rate_mib_s if rate_mib_s > 0 else None,
+                  'failures': int(cm.group(10)),
+                  'expected_generated': expected_generated,
+              }
+
+          pairs = []
+          for suffix in ('a', 'b'):
+              one = runs.get(f'one_{suffix}', {})
+              two = runs.get(f'two_{suffix}', {})
+              if one.get('parse_error') or two.get('parse_error') or one.get('missing') or two.get('missing'):
+                  continue
+              delta = {
+                  'pair': suffix,
+                  'requests': two['requests'] - one['requests'],
+                  'hits': two['hits'] - one['hits'],
+                  'misses': two['misses'] - one['misses'],
+                  'evictions': two['evictions'] - one['evictions'],
+                  'prefetch_reads': two['prefetch_reads'] - one['prefetch_reads'],
+                  'prefetch_batches': two['prefetch_batches'] - one['prefetch_batches'],
+                  'read_ops': two['read_ops'] - one['read_ops'],
+                  'bytes_mib': round(two['bytes_mib'] - one['bytes_mib'], 6),
+                  'read_seconds_est': (two['read_seconds_est'] - one['read_seconds_est']) if one['read_seconds_est'] is not None and two['read_seconds_est'] is not None else None,
+                  'decode_token_s': two['decode_token_s'],
+              }
+              if delta['read_seconds_est'] is not None and delta['decode_token_s'] is not None:
+                  delta['expert_read_fraction_of_decode_est'] = delta['read_seconds_est'] / delta['decode_token_s'] if delta['decode_token_s'] > 0 else None
+                  delta['non_expert_read_residual_s_est'] = delta['decode_token_s'] - delta['read_seconds_est']
+              pairs.append(delta)
+
+          med = {}
+          if pairs:
+              for key in ('requests','hits','misses','evictions','prefetch_reads','prefetch_batches','read_ops','bytes_mib','read_seconds_est','decode_token_s','expert_read_fraction_of_decode_est','non_expert_read_residual_s_est'):
+                  vals = [p[key] for p in pairs if p.get(key) is not None]
+                  med[key] = statistics.median(vals) if vals else None
+
+          summary = {
+              'claim_boundary': 'Windows-2025 hosted-runner baseline AVX2, 512 MiB cache, direct I/O. max_new=1 vs max_new=2 isolates one autoregressive forward after identical deterministic prefill. read_seconds is estimated from rounded aggregate bytes/rate, so the read-time fraction is diagnostic rather than an exact CPU-vs-I/O decomposition. Not a target-laptop benchmark.',
+              'runs': runs,
+              'pair_deltas': pairs,
+              'median_delta': med,
+          }
+          root.mkdir(parents=True, exist_ok=True)
+          (root / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+          good = [r for r in runs.values() if not r.get('missing') and not r.get('parse_error')]
+          if len(good) != 4:
+              raise SystemExit('decode I/O parse gate failed')
+          if not all(r['direct_io'] and r['failures'] == 0 and r['generated'] == r['expected_generated'] for r in good):
+              raise SystemExit('decode I/O correctness/direct-I/O gate failed')
+          if len(pairs) != 2:
+              raise SystemExit('decode I/O pair gate failed')
+          deterministic_keys = ('requests','hits','misses','evictions','prefetch_reads','prefetch_batches','read_ops','bytes_mib')
+          if any(pairs[0][k] != pairs[1][k] for k in deterministic_keys):
+              raise SystemExit('decode I/O counter deltas were not deterministic across repeats')
+          if pairs[0]['requests'] <= 0 or pairs[0]['read_ops'] < 0 or pairs[0]['bytes_mib'] < 0:
+              raise SystemExit('decode I/O deltas are not physically plausible')
+          '@ | python -
+
+      - name: Upload one-token decode evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-windows-decode-io-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-windows-decode-io/**
+          retention-days: 14
