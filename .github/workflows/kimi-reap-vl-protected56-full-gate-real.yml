@@ -1,0 +1,288 @@
+name: Real Kimi REAP-VL protected56 full gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-reap-vl-protected56-full-gate-real.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  protected56-full-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      MASK: "tests/data/kimi-reap-vl-protected56.mask"
+      TEXT_CACHE_MIB: "1536"
+      VL_CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Q8 oracle runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_vl
+          test -x ./build/kvl_vision
+          python tests/test_q8_matvec.py --build-dir build
+          test -s "$MASK"
+          test "$(grep -Ev '^[[:space:]]*(#|$)' "$MASK" | wc -l)" -eq 56
+          mkdir -p "$RUNNER_TEMP/protected56/evidence" "$RUNNER_TEMP/protected56/vl-images"
+          cp "$MASK" "$RUNNER_TEMP/protected56/evidence/protected56.mask"
+
+      - name: Restore six VL regression cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/protected56/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/protected56/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]: d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          for row in suite['cases']:
+              if row['id']=='vl-synthetic-shapes': row['sanity_contains']=['red','blue','green']
+              if row['id']=='vl-synthetic-checker': row['sanity_contains']=['checker']
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':16,
+               'prompt':'Describe the dominant line pattern in this image in one short sentence.',
+               'sanity_contains':['diagonal','purple']},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':4,
+               'prompt':'How many red circles are visible? Reply with only the integer.',
+               'sanity_contains':['5']},
+          ])
+          assert len(suite['cases'])==6
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          print('PROTECTED56_VL_SUITE_READY cases=6')
+          PY
+          python tools/run_kimi_pruning_vl_guard.py --validate-only --suite "$RUNNER_TEMP/protected56/vl-suite.json"
+          python tools/run_kimi_pruning_vl_phase_b.py --validate-only --suite "$RUNNER_TEMP/protected56/vl-suite.json"
+
+      - name: Fetch pinned metadata and initial MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'protected56/kimi-source'; root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(repo_id='moonshotai/Kimi-VL-A3B-Instruct',revision=os.environ['KIMI_REV'],filename=name,local_dir=root))
+          PY
+
+      - name: Pack pinned full Q8 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/protected56/kimi-source"
+          packed="$RUNNER_TEMP/protected56/packed-q8"
+          python tools/pack_vision.py "$src" "$packed"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin" && test -s "$packed/vision.bin"
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/packed-q8'
+          got=(p/'experts.bin').stat().st_size; expected=14428930048
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'PROTECTED56_Q8_ORACLE_PASS records={h[5]} bytes={got}')
+          PY
+          df -h "$RUNNER_TEMP"
+
+      - name: Confirm four-token held-out sentinel
+        id: sentinel_run
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$RUNNER_TEMP/protected56/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate protected56="$MASK" \
+            --work-dir "$RUNNER_TEMP/protected56/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Evaluate sentinel
+        id: sentinel_gate
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56'
+          p=root/'sentinel/sentinel-summary.json'; outp=pathlib.Path(os.environ['GITHUB_OUTPUT'])
+          ok=False
+          if p.is_file():
+              r=json.loads(p.read_text()); (root/'evidence/sentinel-summary.json').write_text(json.dumps(r,indent=2,sort_keys=True)+'\n')
+              rows=r.get('candidates',[]); ok=bool(len(rows)==1 and rows[0].get('token_exact'))
+          with outp.open('a') as f: f.write(f'pass={str(ok).lower()}\n')
+          print(f'PROTECTED56_SENTINEL_GATE ok={ok}')
+          PY
+
+      - name: Run 14-prompt text long-generation gate
+        if: steps.sentinel_gate.outputs.pass == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_phase_b.py \
+            --model-dir "$RUNNER_TEMP/protected56/packed-q8" --binary ./build/kvl_generate \
+            --mask "$MASK" --candidate protected56 \
+            --work-dir "$RUNNER_TEMP/protected56/text-long" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/protected56/text-long/phase-b-summary.json" "$RUNNER_TEMP/protected56/evidence/text-long-summary.json"
+
+      - name: Evaluate text long-generation gate
+        id: text_gate
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/evidence'; p=root/'text-long-summary.json'
+          ok=False
+          if p.is_file():
+              a=json.loads(p.read_text())['aggregate']; ok=a['token_exact_prompts']==a['prompts'] and not a['divergent_prompts']
+              print(f'PROTECTED56_TEXT_GATE exact={a["token_exact_prompts"]}/{a["prompts"]} ok={ok}')
+          else: print('PROTECTED56_TEXT_GATE no_summary')
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a') as f: f.write(f'pass={str(ok).lower()}\n')
+          PY
+
+      - name: Run six-case VL route and logit guard
+        if: steps.text_gate.outputs.pass == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_vl_guard.py \
+            --model-dir "$RUNNER_TEMP/protected56/packed-q8" --image-root "$RUNNER_TEMP/protected56/vl-images" \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --suite "$RUNNER_TEMP/protected56/vl-suite.json" --mask "$MASK" \
+            --work-dir "$RUNNER_TEMP/protected56/vl-guard" \
+            --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/protected56/vl-guard/vl-guard-summary.json" "$RUNNER_TEMP/protected56/evidence/vl-guard-summary.json"
+
+      - name: Evaluate VL next-token guard
+        id: vl_gate
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/evidence'; p=root/'vl-guard-summary.json'
+          ok=False
+          if p.is_file():
+              a=json.loads(p.read_text())['aggregate']
+              ok=(a['first_token_exact']==a['cases'] and a['logit_argmax_agree']==a['cases'] and
+                  a['logit_min_topk_overlap']>=0.8 and a['logit_max_js_divergence']<=0.01)
+              print(f'PROTECTED56_VL_GUARD exact={a["first_token_exact"]}/{a["cases"]} max_js={a["logit_max_js_divergence"]:.9g} ok={ok}')
+          else: print('PROTECTED56_VL_GUARD no_summary')
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a') as f: f.write(f'pass={str(ok).lower()}\n')
+          PY
+
+      - name: Run six-case VL long-generation gate
+        if: steps.vl_gate.outputs.pass == 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_pruning_vl_phase_b.py \
+            --model-dir "$RUNNER_TEMP/protected56/packed-q8" --image-root "$RUNNER_TEMP/protected56/vl-images" \
+            --vision-binary ./build/kvl_vision --generate-binary ./build/kvl_generate_vl \
+            --suite "$RUNNER_TEMP/protected56/vl-suite.json" --mask "$MASK" \
+            --work-dir "$RUNNER_TEMP/protected56/vl-long" \
+            --cache-mib "$VL_CACHE_MIB" --ram-mib "$RAM_MIB"
+          cp "$RUNNER_TEMP/protected56/vl-long/vl-phase-b-summary.json" "$RUNNER_TEMP/protected56/evidence/vl-long-summary.json"
+
+      - name: Summarize protected56 full-gate evidence
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'protected56/evidence'
+          def load(name):
+              p=root/name
+              return json.loads(p.read_text()) if p.is_file() else None
+          sentinel=load('sentinel-summary.json'); text=load('text-long-summary.json'); guard=load('vl-guard-summary.json'); vl=load('vl-long-summary.json')
+          sentinel_pass=bool(sentinel and len(sentinel.get('candidates',[]))==1 and sentinel['candidates'][0].get('token_exact'))
+          text_pass=bool(text and text['aggregate']['token_exact_prompts']==text['aggregate']['prompts'] and not text['aggregate']['divergent_prompts'])
+          guard_pass=bool(guard and guard['aggregate']['first_token_exact']==guard['aggregate']['cases'] and
+                          guard['aggregate']['logit_argmax_agree']==guard['aggregate']['cases'] and
+                          guard['aggregate']['logit_min_topk_overlap']>=0.8 and guard['aggregate']['logit_max_js_divergence']<=0.01)
+          vl_pass=bool(vl and vl['aggregate']['token_exact_cases']==vl['aggregate']['cases'] and not vl['aggregate']['divergent_cases'])
+          q8_record=8671232; q5_record=5677056; n=56
+          out={
+              'schema':'kimi-reap-vl-protected56-full-gate-v1',
+              'source_revision':os.environ['KIMI_REV'],
+              'candidate':'protected56',
+              'disabled_expert_slots':n,
+              'protected_slots':[[11,41]],
+              'sentinel_pass':sentinel_pass,
+              'sentinel':sentinel,
+              'text_long':None if text is None else text['aggregate'],
+              'vl_guard':None if guard is None else guard['aggregate'],
+              'vl_long':None if vl is None else vl['aggregate'],
+              'promotion_candidate_on_tested_scope':bool(sentinel_pass and text_pass and guard_pass and vl_pass),
+              'projected_q8_removed_bytes_if_physically_compacted':n*q8_record,
+              'projected_q5_removed_bytes_if_same_logical_mask_is_later_supported':n*q5_record,
+              'physical_compaction_tested':False,
+              'q5_combination_tested':False,
+              'claim_boundary':'Logical protected56 pruning on the pinned full Q8 oracle. Passing means deterministic agreement on these tested text/VL gates only; no global quality, physical compaction, Q5+mask, or speed claim.'
+          }
+          (root/'protected56-full-gate-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('PROTECTED56_FINAL',json.dumps(out,sort_keys=True))
+          PY
+
+      - name: Upload protected56 full-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-reap-vl-protected56-full-gate-evidence
+          path: ${{ runner.temp }}/protected56/evidence/*
+          if-no-files-found: warn
