@@ -1,0 +1,190 @@
+name: Real Kimi GGUF Q8_0 Windows OpenMP A/B
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - 'CMakeLists.txt'
+      - 'src/ops.c'
+      - 'src/q8_ops.c'
+      - 'src/gguf_q8_0.c'
+      - 'src/expert_cache.c'
+      - '.github/workflows/kimi-gguf-q8-windows-openmp-ab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-real-ab:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      OMP_DYNAMIC: 'FALSE'
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned tooling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@$env:LLAMA_CPP_GGUF_COMMIT#subdirectory=gguf-py"
+
+      - name: Build Windows AVX2 baseline and opt-in parallel kernels
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build-off -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PARALLEL_KERNELS=OFF
+          cmake --build build-off --config Release --target kvl_generate_gguf_q8 kvl_q8_0_expert_probe kvl_gguf_store_probe
+          cmake -S . -B build-on -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PARALLEL_KERNELS=ON
+          cmake --build build-on --config Release --target kvl_generate_gguf_q8 kvl_q8_0_expert_probe kvl_gguf_store_probe
+          if (-not (Test-Path 'build-on\Release\kvl_generate_gguf_q8.exe')) { throw 'parallel generator missing' }
+
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $work = Join-Path $env:RUNNER_TEMP 'kimi-official-trunk-source'
+          python tools/fetch_tokenizer.py $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION
+          python tools/pack_full_text.py $work $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION --expert-format none
+          if (-not (Test-Path (Join-Path $packed 'trunk.bin'))) { throw 'trunk missing' }
+          if (Test-Path (Join-Path $packed 'experts.bin')) { throw 'unexpected packed experts' }
+
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(
+              repo_id=os.environ['GGUF_REPO'],
+              revision=os.environ['GGUF_REVISION'],
+              filename=os.environ['GGUF_FILE'],
+              local_dir=packed,
+          ))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          '@ | python -
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-openmp-ab'
+          New-Item -ItemType Directory -Force -Path $e | Out-Null
+          python tools/index_kimi_gguf_q8.py (Join-Path $packed 'experts.bin') (Join-Path $packed 'experts.idx') --summary-json (Join-Path $e 'index-summary.json')
+          Get-PSDrive -PSProvider FileSystem
+
+      - name: Run balanced Windows OpenMP A/B
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-openmp-ab'
+          $prompt = 'Tính 125 + 75. Chỉ trả lời bằng số.'
+          $off = Join-Path (Get-Location) 'build-off\Release\kvl_generate_gguf_q8.exe'
+          $on = Join-Path (Get-Location) 'build-on\Release\kvl_generate_gguf_q8.exe'
+
+          function Run-One([string]$label, [string]$binary, [int]$threads) {
+            $env:OMP_NUM_THREADS = [string]$threads
+            $out = Join-Path $e ($label + '.out')
+            $err = Join-Path $e ($label + '.err')
+            Write-Host "KIMI_WIN_OMP_BEGIN label=$label threads=$threads"
+            python tools/kvl_chat.py $packed $prompt `
+              --binary $binary --cache-mib 512 --ram-mib 4096 `
+              --max-new 8 --temperature 0 --seed 1 --show-tokens `
+              1> $out 2> $err
+            Get-Content $out
+            Get-Content $err
+            if (-not (Select-String -Path $out -Pattern '(^|[^0-9])200([^0-9]|$)' -Quiet)) { throw "$label wrong output" }
+            if (-not (Select-String -Path $err -Pattern 'expert_direct_io=yes' -Quiet)) { throw "$label expert direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern 'trunk_direct_io=yes' -Quiet)) { throw "$label trunk direct I/O missing" }
+            if (-not (Select-String -Path $err -Pattern '\[kvl\] timing first_token=' -Quiet)) { throw "$label timing missing" }
+            Write-Host "KIMI_WIN_OMP_END label=$label threads=$threads"
+          }
+
+          Run-One 'off_1' $off 1
+          Run-One 'on_1' $on 1
+          Run-One 'on_2' $on 2
+          Run-One 'on_4' $on 4
+          Run-One 'off_2' $off 1
+
+      - name: Summarize Windows timing and correctness
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import json, os, re, statistics
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-windows-openmp-ab'
+          rx = re.compile(r'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)')
+          cases = [('off_1', False, 1), ('on_1', True, 1), ('on_2', True, 2), ('on_4', True, 4), ('off_2', False, 1)]
+          rows=[]
+          for label, enabled, threads in cases:
+              ep = root / f'{label}.err'
+              op = root / f'{label}.out'
+              if not ep.exists() or not op.exists():
+                  rows.append({'label':label,'parallel':enabled,'threads':threads,'missing':True})
+                  continue
+              err=ep.read_text(errors='replace')
+              out=op.read_text(errors='replace').strip()
+              m=rx.search(err)
+              rows.append({
+                  'label':label,'parallel':enabled,'threads':threads,'output':out,
+                  'correct':bool(re.search(r'(^|[^0-9])200([^0-9]|$)',out)),
+                  'direct_io':'expert_direct_io=yes' in err and 'trunk_direct_io=yes' in err,
+                  'first_token_s':float(m.group(1)) if m else None,
+                  'avg_next_s':float(m.group(2)) if m else None,
+                  'total_s':float(m.group(3)) if m else None,
+                  'generated':int(m.group(4)) if m else None,
+              })
+          good=[r for r in rows if not r.get('missing') and r.get('first_token_s') is not None]
+          off=[r for r in good if not r['parallel']]
+          base_ft=statistics.median(r['first_token_s'] for r in off) if off else None
+          base_next=statistics.median(r['avg_next_s'] for r in off) if off else None
+          for r in good:
+              r['first_token_speedup_vs_off_x']=base_ft/r['first_token_s'] if base_ft and r['first_token_s'] else None
+              r['next_token_speedup_vs_off_x']=base_next/r['avg_next_s'] if base_next and r['avg_next_s'] else None
+          summary={
+              'claim_boundary':'Windows-2025 hosted-runner pilot; same model/assets, AVX2 in both builds, opt-in MSVC OpenMP selected kernels OFF versus ON. Not a target-laptop benchmark.',
+              'off_median_first_token_s':base_ft,
+              'off_median_avg_next_s':base_next,
+              'runs':rows,
+          }
+          root.mkdir(parents=True, exist_ok=True)
+          (root/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          if len(good) != len(cases) or not all(r.get('correct') and r.get('direct_io') for r in good):
+              raise SystemExit('Windows OpenMP A/B correctness/direct-I/O gate failed')
+          '@ | python -
+
+      - name: Upload Windows OpenMP evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-windows-openmp-ab-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-windows-openmp-ab/**
+          retention-days: 14
