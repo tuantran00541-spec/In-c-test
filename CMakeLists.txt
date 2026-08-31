@@ -13,9 +13,9 @@ endif()
 
 # Linux keeps the existing target-wide OpenMP behavior. On MSVC, long-context
 # prefill retains its established OpenMP path. The broader fast path is opt-in
-# until real Windows A/B evidence justifies promotion: GEMV translation units and
-# expert-cache prefetch are independent phases, so this enables useful parallelism
-# without putting the MoE expert loop itself inside a nested OpenMP region.
+# until real Windows A/B evidence justifies promotion. Use the LLVM OpenMP mode
+# for the opt-in kernels: unlike legacy /openmp (OpenMP 2.0 parser), it accepts
+# the C11 loop forms already used by these cross-platform kernels.
 if(MSVC)
   set_source_files_properties(src/mla_prefill_streaming.c PROPERTIES COMPILE_OPTIONS "/openmp")
   if(KVL_MSVC_PARALLEL_KERNELS)
@@ -25,7 +25,7 @@ if(MSVC)
       src/gguf_q8_0.c
       src/q5_ops.c
       src/expert_cache.c
-      PROPERTIES COMPILE_OPTIONS "/openmp")
+      PROPERTIES COMPILE_OPTIONS "/openmp:llvm")
   endif()
 else()
   find_package(OpenMP)
