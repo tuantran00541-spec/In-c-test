@@ -81,7 +81,7 @@ static int load_into_slot(KvlExpertCache *c, int slot, const KvlExpertRecord *r)
         c->arena + (size_t)slot * c->slot_bytes);
     const double dt = now_s() - t0;
     c->read_seconds += dt;
-    c->read_ops++;
+    c->read_ops += kvl_expert_load_read_ops(c->store, r);
     if (got != (int64_t)r->read_bytes) {
         c->read_failures++;
         return -1;
@@ -265,7 +265,7 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
     /* Phase 3: publish only complete records. */
     int ok = 0;
     for (int i = 0; i < nw; ++i) {
-        c->read_ops++;
+        c->read_ops += kvl_expert_load_read_ops(c->store, w[i].r);
         if (w[i].got != (int64_t)w[i].r->read_bytes) {
             c->read_failures++;
             c->key_of[w[i].slot] = KVL_CACHE_EMPTY;
