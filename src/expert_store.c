@@ -268,6 +268,29 @@ static int bind_sparse_q8_mask(KvlExpertStore *s, const char *idx_path) {
     return 0;
 }
 
+static int validate_gguf_source(const KvlExpertIndexHeader *hdr,
+                                const KvlExpertRecord *r,
+                                const KvlGgufQ8Source *q) {
+    if (!hdr || !r || !q) return -1;
+    const uint64_t align = KVL_EXPERT_ALIGN;
+    const uint64_t src_off[3] = {q->gate_file_offset, q->up_file_offset, q->down_file_offset};
+    const uint64_t src_bytes[3] = {q->gate_read_bytes, q->up_read_bytes, q->down_read_bytes};
+    const uint64_t dst_off[3] = {q->gate_dst_offset, q->up_dst_offset, q->down_dst_offset};
+    const uint64_t payload_off[3] = {r->gate_off, r->up_off, r->down_off};
+    const uint64_t payload_bytes[3] = {r->gate_bytes, r->up_bytes, r->down_bytes};
+    uint64_t total = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!src_bytes[i] || (src_off[i] % align) || (src_bytes[i] % align) ||
+            (dst_off[i] % align) || dst_off[i] + src_bytes[i] > r->read_bytes ||
+            src_off[i] + src_bytes[i] > hdr->data_file_bytes ||
+            payload_off[i] < dst_off[i] ||
+            payload_off[i] + payload_bytes[i] > dst_off[i] + src_bytes[i])
+            return -1;
+        total += src_bytes[i];
+    }
+    return total == r->read_bytes ? 0 : -1;
+}
+
 static int read_index(KvlExpertStore *s, const char *idx_path) {
     FILE *f = fopen(idx_path, "rb");
     if (!f) return -1;
@@ -281,6 +304,19 @@ static int read_index(KvlExpertStore *s, const char *idx_path) {
     if (!s->records) { fclose(f); return -1; }
     if (fread(s->records, sizeof *s->records, s->hdr.n_records, f) != s->hdr.n_records) {
         fclose(f); return -1;
+    }
+    if (s->hdr.dtype == KVL_DTYPE_GGUF_Q8_0) {
+        s->gguf_q8_sources = (KvlGgufQ8Source *)calloc(s->hdr.n_records, sizeof *s->gguf_q8_sources);
+        if (!s->gguf_q8_sources ||
+            fread(s->gguf_q8_sources, sizeof *s->gguf_q8_sources, s->hdr.n_records, f) != s->hdr.n_records) {
+            fclose(f); return -1;
+        }
+        for (uint32_t i = 0; i < s->hdr.n_records; ++i) {
+            if (validate_gguf_source(&s->hdr, &s->records[i], &s->gguf_q8_sources[i]) != 0) {
+                fprintf(stderr, "kvl: invalid GGUF Q8_0 source record %u\n", i);
+                fclose(f); return -1;
+            }
+        }
     }
     fclose(f);
     size_t map_n = (size_t)s->hdr.n_layers * s->hdr.n_experts;
@@ -322,7 +358,7 @@ void kvl_expert_store_close(KvlExpertStore *s) {
         close(s->fd);
 #endif
     }
-    free(s->records); free(s->record_of);
+    free(s->records); free(s->gguf_q8_sources); free(s->record_of);
     memset(s, 0, sizeof *s); s->fd = -1;
 }
 
@@ -340,5 +376,32 @@ int kvl_expert_alloc_buffer(const KvlExpertRecord *r, void **out) {
 
 int64_t kvl_expert_load(const KvlExpertStore *s, const KvlExpertRecord *r, void *aligned_buf) {
     if (!s || s->fd < 0 || !r || !aligned_buf) return -1;
-    return kvl_pread(s->fd, aligned_buf, (size_t)r->read_bytes, r->file_offset);
+    if (s->hdr.dtype != KVL_DTYPE_GGUF_Q8_0)
+        return kvl_pread(s->fd, aligned_buf, (size_t)r->read_bytes, r->file_offset);
+
+    if (!s->gguf_q8_sources || r < s->records || r >= s->records + s->hdr.n_records)
+        return -1;
+    const size_t idx = (size_t)(r - s->records);
+    const KvlGgufQ8Source *q = &s->gguf_q8_sources[idx];
+    unsigned char *base = (unsigned char *)aligned_buf;
+    int64_t total = 0;
+
+    const int64_t g = kvl_pread(s->fd, base + q->gate_dst_offset,
+                                (size_t)q->gate_read_bytes, q->gate_file_offset);
+    if (g != (int64_t)q->gate_read_bytes) return -1;
+    total += g;
+    const int64_t u = kvl_pread(s->fd, base + q->up_dst_offset,
+                                (size_t)q->up_read_bytes, q->up_file_offset);
+    if (u != (int64_t)q->up_read_bytes) return -1;
+    total += u;
+    const int64_t d = kvl_pread(s->fd, base + q->down_dst_offset,
+                                (size_t)q->down_read_bytes, q->down_file_offset);
+    if (d != (int64_t)q->down_read_bytes) return -1;
+    total += d;
+    return total;
+}
+
+uint32_t kvl_expert_load_read_ops(const KvlExpertStore *s, const KvlExpertRecord *r) {
+    (void)r;
+    return s && s->hdr.dtype == KVL_DTYPE_GGUF_Q8_0 ? 3u : 1u;
 }
