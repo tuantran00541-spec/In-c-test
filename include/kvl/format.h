@@ -12,6 +12,10 @@
 /* Experimental routed-expert format: signed symmetric 5-bit weights,
  * group size 128 along the input dimension, with FP32 scale per group. */
 #define KVL_DTYPE_Q5_G128 4u
+/* External GGUF-backed expert store. The normal KVL records describe the
+ * in-cache layout while one KvlGgufQ8Source per record describes three aligned
+ * positioned reads from a GGUF Q8_0 file. */
+#define KVL_DTYPE_GGUF_Q8_0 5u
 
 #pragma pack(push, 1)
 typedef struct {
@@ -30,7 +34,7 @@ typedef struct {
     uint32_t layer;
     uint32_t expert;
     uint64_t file_offset;
-    uint64_t read_bytes;   /* padded direct-I/O span */
+    uint64_t read_bytes;   /* padded direct-I/O span, or sum of GGUF part spans */
     uint64_t payload_bytes;
     uint64_t gate_off;
     uint64_t gate_bytes;
@@ -39,6 +43,22 @@ typedef struct {
     uint64_t down_off;
     uint64_t down_bytes;
 } KvlExpertRecord;
+
+/* Appended immediately after KvlExpertRecord[n_records] when dtype is
+ * KVL_DTYPE_GGUF_Q8_0. Each destination offset is 4096-aligned inside a cache
+ * slot; the corresponding KvlExpertRecord gate/up/down offset points at the
+ * actual Q8_0 payload within that aligned envelope. */
+typedef struct {
+    uint64_t gate_file_offset;
+    uint64_t gate_read_bytes;
+    uint64_t gate_dst_offset;
+    uint64_t up_file_offset;
+    uint64_t up_read_bytes;
+    uint64_t up_dst_offset;
+    uint64_t down_file_offset;
+    uint64_t down_read_bytes;
+    uint64_t down_dst_offset;
+} KvlGgufQ8Source;
 #pragma pack(pop)
 
 #endif
