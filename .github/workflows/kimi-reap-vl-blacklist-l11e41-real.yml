@@ -1,0 +1,181 @@
+name: Real Kimi REAP-VL protected sweep L11E41
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-reap-vl-blacklist-l11e41-real.yml"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  protected-reap-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      SOURCE_ARTIFACT_ID: "9734903239"
+      TEXT_CACHE_MIB: "1536"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Q8 oracle runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          python tests/test_q8_matvec.py --build-dir build
+
+      - name: Restore REAP evidence and build L11E41-protected masks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-protected"
+          mkdir -p "$root/source" "$root/masks" "$root/evidence"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${SOURCE_ARTIFACT_ID}/zip" > "$root/source.zip"
+          unzip -q "$root/source.zip" -d "$root/source"
+          test -s "$root/source/reap-vl-report.json"
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-protected'
+          report=json.loads((root/'source/reap-vl-report.json').read_text())
+          order=report['prune_order']
+          protected={(11,41)}
+          original_pos={ (int(r['layer']),int(r['expert'])): i+1 for i,r in enumerate(order) }
+          assert original_pos[(11,41)]==20, original_pos[(11,41)]
+          filtered=[r for r in order if (int(r['layer']),int(r['expert'])) not in protected]
+          counts=[19,20,21,22,23,24,32,40,48,56,80,104,128,152]
+          assert len(filtered)>=max(counts)
+          mapping=[]
+          for i,row in enumerate(filtered[:max(counts)],1):
+              mapping.append({'filtered_rank':i,'original_rank':original_pos[(int(row['layer']),int(row['expert']))],
+                              'layer':int(row['layer']),'expert':int(row['expert']),'final_score':row['final_score']})
+          for n in counts:
+              p=root/f'masks/protected{n}.mask'
+              with p.open('w') as f:
+                  f.write('# KVL_MOE_MASK_V1\n')
+                  f.write('# REAP-VL order from run 33319374959 with L11E41 protected after nested sentinel attribution.\n')
+                  for row in filtered[:n]:
+                      f.write(f"{row['layer']} {row['expert']} # reap_score={row['final_score']:.12g}\n")
+          meta={'schema':'kimi-reap-vl-protected-l11e41-v1','source_run_id':33319374959,
+                'source_artifact_id':int(os.environ['SOURCE_ARTIFACT_ID']),
+                'protected_slots':[[11,41]],'protected_original_rank':20,
+                'targets':counts,'filtered_rank_mapping':mapping}
+          (root/'evidence/protected-ranking.json').write_text(json.dumps(meta,indent=2,sort_keys=True)+'\n')
+          (root/'evidence/reap-vl-report.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n')
+          print('REAP_PROTECTED_MASKS_READY targets='+','.join(map(str,counts)))
+          print('REAP_PROTECTED_FIRST_AFTER_GUARD',json.dumps(mapping[19],sort_keys=True))
+          PY
+          cp "$root"/masks/*.mask "$root/evidence/"
+
+      - name: Pack pinned full Q8 text oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-protected"
+          src="$root/kimi-source"
+          packed="$root/packed-q8"
+          mkdir -p "$src"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin"
+          python - <<'PY'
+          import os, pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-protected/packed-q8/experts.bin'
+          got=p.stat().st_size; expected=14428930048
+          assert got==expected,(got,expected)
+          print(f'REAP_PROTECTED_Q8_ORACLE_PASS bytes={got}')
+          PY
+
+      - name: Screen protected REAP order on four-token sentinel
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/reap-protected"
+          python tools/run_kimi_pruning_sentinel_screen.py \
+            --model-dir "$root/packed-q8" --binary ./build/kvl_generate \
+            --sentinel-id eval-vi-en-01 --max-new 4 \
+            --candidate protected19="$root/masks/protected19.mask" \
+            --candidate protected20="$root/masks/protected20.mask" \
+            --candidate protected21="$root/masks/protected21.mask" \
+            --candidate protected22="$root/masks/protected22.mask" \
+            --candidate protected23="$root/masks/protected23.mask" \
+            --candidate protected24="$root/masks/protected24.mask" \
+            --candidate protected32="$root/masks/protected32.mask" \
+            --candidate protected40="$root/masks/protected40.mask" \
+            --candidate protected48="$root/masks/protected48.mask" \
+            --candidate protected56="$root/masks/protected56.mask" \
+            --candidate protected80="$root/masks/protected80.mask" \
+            --candidate protected104="$root/masks/protected104.mask" \
+            --candidate protected128="$root/masks/protected128.mask" \
+            --candidate protected152="$root/masks/protected152.mask" \
+            --work-dir "$root/sentinel" \
+            --cache-mib "$TEXT_CACHE_MIB" --ram-mib "$RAM_MIB"
+
+      - name: Summarize protected sweep
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'reap-protected'
+          p=root/'sentinel/sentinel-summary.json'
+          meta=json.loads((root/'evidence/protected-ranking.json').read_text())
+          rows=[]
+          baseline=None
+          if p.is_file():
+              s=json.loads(p.read_text()); rows=s.get('candidates',[]); baseline=s.get('baseline_generated_ids')
+              (root/'evidence/sentinel-summary.json').write_text(json.dumps(s,indent=2,sort_keys=True)+'\n')
+          exact=[r for r in rows if r.get('token_exact')]
+          fail=[r for r in rows if not r.get('token_exact')]
+          strongest=max(exact,key=lambda x:x.get('disabled_count',0)) if exact else None
+          first_fail=fail[0] if fail else None
+          first_fail_added=None
+          if first_fail:
+              n=int(first_fail['disabled_count'])
+              mp=meta['filtered_rank_mapping']
+              if 1 <= n <= len(mp): first_fail_added=mp[n-1]
+          out={'schema':'kimi-reap-vl-protected-l11e41-sentinel-v1','baseline_generated_ids':baseline,
+               'protected_slots':meta['protected_slots'],'candidates':rows,'strongest_exact':strongest,
+               'first_failing_nested_candidate':first_fail,'first_fail_added_slot':first_fail_added,
+               'scope':'Single held-out four-token sentinel only; no full quality claim.'}
+          (root/'evidence/protected-sweep-summary.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          print('REAP_PROTECTED_FINAL',json.dumps(out,sort_keys=True))
+          PY
+
+      - name: Upload protected sweep evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-reap-vl-protected-l11e41-evidence
+          path: ${{ runner.temp }}/reap-protected/evidence/*
+          if-no-files-found: warn
