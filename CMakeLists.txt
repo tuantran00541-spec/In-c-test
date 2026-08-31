@@ -36,6 +36,7 @@ add_library(kvl_storage
   src/ops.c
   src/mla_prefill_streaming.c
   src/q8_ops.c
+  src/gguf_q8_0.c
   src/q5_ops.c
   src/moe_dynamic_skip.c
   src/mla_state.c
@@ -137,5 +138,7 @@ add_executable(kvl_vision src/vision_probe.c)
 target_link_libraries(kvl_vision PRIVATE kvl_storage)
 add_executable(kvl_q8_probe src/q8_probe.c)
 target_link_libraries(kvl_q8_probe PRIVATE kvl_storage)
+add_executable(kvl_q8_0_expert_probe src/q8_0_expert_probe.c)
+target_link_libraries(kvl_q8_0_expert_probe PRIVATE kvl_storage)
 add_executable(kvl_q5_probe src/q5_probe.c)
 target_link_libraries(kvl_q5_probe PRIVATE kvl_storage)
