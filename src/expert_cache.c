@@ -51,12 +51,22 @@ static int key_for(const KvlExpertCache *c, int layer, int expert, int32_t *out)
     return 0;
 }
 
-static int pick_victim(KvlExpertCache *c) {
+static int key_in_list(int32_t key, const int32_t *keys, int n) {
+    if (!keys || n <= 0) return 0;
+    for (int i = 0; i < n; ++i)
+        if (keys[i] == key) return 1;
+    return 0;
+}
+
+static int pick_victim(KvlExpertCache *c, const int32_t *avoid_keys, int n_avoid) {
     int best = -1;
     uint64_t oldest = UINT64_MAX;
     for (int i = 0; i < c->n_slots; ++i) {
-        if (c->key_of[i] == KVL_CACHE_INFLIGHT) continue;
-        if (c->key_of[i] == KVL_CACHE_EMPTY) return i;
+        const int32_t key = c->key_of[i];
+        if (key == KVL_CACHE_INFLIGHT) continue;
+        if (key == KVL_CACHE_EMPTY) return i;
+        if (c->pinned_of && c->pinned_of[key]) continue;
+        if (key_in_list(key, avoid_keys, n_avoid)) continue;
         if (c->used_at[i] < oldest) {
             oldest = c->used_at[i];
             best = i;
@@ -138,7 +148,37 @@ void kvl_expert_cache_close(KvlExpertCache *c) {
     free(c->key_of);
     free(c->used_at);
     free(c->record_of_slot);
+    free(c->pinned_of);
     memset(c, 0, sizeof *c);
+}
+
+int kvl_expert_cache_pin_layer(KvlExpertCache *c, int layer,
+                               const int *experts, int n) {
+    if (!c || !c->store || layer < 0 || layer >= (int)c->store->hdr.n_layers ||
+        n < 0 || n > (int)c->store->hdr.n_experts || (n > 0 && !experts))
+        return -1;
+
+    /* Validate first so a bad replacement cannot silently clear the old layer pins. */
+    for (int i = 0; i < n; ++i) {
+        int32_t key;
+        if (key_for(c, layer, experts[i], &key) != 0) return -1;
+        (void)key;
+    }
+
+    const size_t map_n = (size_t)c->store->hdr.n_layers * c->store->hdr.n_experts;
+    if (!c->pinned_of) {
+        c->pinned_of = (uint8_t *)calloc(map_n, sizeof *c->pinned_of);
+        if (!c->pinned_of) return -1;
+    }
+
+    const size_t base = (size_t)layer * c->store->hdr.n_experts;
+    memset(c->pinned_of + base, 0, (size_t)c->store->hdr.n_experts);
+    for (int i = 0; i < n; ++i) {
+        int32_t key;
+        if (key_for(c, layer, experts[i], &key) != 0) return -1;
+        c->pinned_of[key] = 1;
+    }
+    return 0;
 }
 
 int kvl_expert_cache_resident(KvlExpertCache *c, int layer, int expert, KvlCachedExpert *out) {
@@ -167,7 +207,7 @@ int kvl_expert_cache_get(KvlExpertCache *c, int layer, int expert, KvlCachedExpe
 
     const KvlExpertRecord *r = kvl_expert_find(c->store, layer, expert);
     if (!r || r->read_bytes > c->slot_bytes) return -1;
-    slot = pick_victim(c);
+    slot = pick_victim(c, NULL, 0);
     if (slot < 0) return -1;
     if (c->key_of[slot] >= 0) {
         c->slot_of[c->key_of[slot]] = -1;
@@ -212,6 +252,23 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
 
     PrefetchWork *w = (PrefetchWork *)calloc((size_t)n, sizeof *w);
     if (!w) return -1;
+
+    /* When persistent layer pins are enabled, do not evict a resident member of
+     * the batch while reserving slots for another missing member of that same
+     * batch. The baseline path leaves pinned_of NULL and retains its old LRU
+     * behavior byte-for-byte. */
+    int32_t *avoid = NULL;
+    int n_avoid = 0;
+    if (c->pinned_of) {
+        avoid = (int32_t *)malloc((size_t)n * sizeof *avoid);
+        if (!avoid) { free(w); return -1; }
+        for (int i = 0; i < n; ++i) {
+            int32_t key;
+            if (key_for(c, layer, experts[i], &key) != 0) continue;
+            if (!key_in_list(key, avoid, n_avoid)) avoid[n_avoid++] = key;
+        }
+    }
+
     int nw = 0;
 
     /* Phase 1: reserve distinct slots serially. */
@@ -229,7 +286,7 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
 
         const KvlExpertRecord *r = kvl_expert_find(c->store, layer, e);
         if (!r || r->read_bytes > c->slot_bytes) continue;
-        const int slot = pick_victim(c);
+        const int slot = pick_victim(c, avoid, n_avoid);
         if (slot < 0) break;
         if (c->key_of[slot] >= 0) {
             c->slot_of[c->key_of[slot]] = -1;
@@ -246,7 +303,7 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
         nw++;
     }
 
-    if (nw == 0) { free(w); return 0; }
+    if (nw == 0) { free(avoid); free(w); return 0; }
     qsort(w, (size_t)nw, sizeof *w, cmp_work);
 
     /* Phase 2: only independent positioned reads happen in parallel. Measure the WALL
@@ -281,6 +338,7 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
         c->prefetch_reads++;
         ok++;
     }
+    free(avoid);
     free(w);
     return ok;
 }

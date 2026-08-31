@@ -76,6 +76,8 @@ add_executable(kvl_probe src/main.c)
 target_link_libraries(kvl_probe PRIVATE kvl_storage)
 add_executable(kvl_cache_probe src/cache_probe.c)
 target_link_libraries(kvl_cache_probe PRIVATE kvl_storage)
+add_executable(kvl_cache_layer_pin_probe src/cache_layer_pin_probe.c)
+target_link_libraries(kvl_cache_layer_pin_probe PRIVATE kvl_storage)
 add_executable(kvl_moe_probe src/moe_probe.c)
 target_link_libraries(kvl_moe_probe PRIVATE kvl_storage)
 target_compile_definitions(kvl_moe_probe PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
@@ -120,6 +122,13 @@ target_compile_definitions(kvl_generate_gguf_q8 PRIVATE kvl_moe_token_bf16=kvl_m
 add_executable(kvl_generate_vl_gguf_q8 src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl_gguf_q8 PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl_gguf_q8 PRIVATE kvl_moe_token_bf16=kvl_moe_token_gguf_q8_auto)
+
+# Research-only fixed-RAM cache-retention candidate. Router/math are identical to
+# the direct-GGUF baseline; two heaviest routes per MoE layer remain pinned while
+# one complete top-k batch (six slots on Kimi) stays transient.
+add_executable(kvl_generate_gguf_q8_layerpin src/generate.c src/logits_dump.c)
+target_link_libraries(kvl_generate_gguf_q8_layerpin PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_gguf_q8_layerpin PRIVATE kvl_moe_token_bf16=kvl_moe_token_gguf_q8_layerpin_auto)
 
 # Q8-only dynamic expert skipping pilot. The normal router still selects top-k;
 # weak routes are zeroed after routing without rerouting or renormalising, so the

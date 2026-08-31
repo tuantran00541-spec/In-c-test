@@ -28,6 +28,9 @@ typedef struct {
     int32_t *key_of;    /* EMPTY, INFLIGHT, or flattened key */
     uint64_t *used_at;
     const KvlExpertRecord **record_of_slot;
+    /* Lazily allocated only by the research layer-retention path. A set bit
+     * prevents the resident record from being chosen as a normal LRU victim. */
+    uint8_t *pinned_of; /* layer*n_experts+expert -> persistent layer pin */
     uint64_t clock;
 
     uint64_t requests;
@@ -44,6 +47,12 @@ typedef struct {
 
 int kvl_expert_cache_init(KvlExpertCache *c, KvlExpertStore *store, size_t budget_bytes);
 void kvl_expert_cache_close(KvlExpertCache *c);
+
+/* Replace the persistent pins for one layer. Pins name expert keys, so they can
+ * be installed before a currently-missing expert is fetched. Other layers'
+ * pins are preserved. Calling with n=0 clears this layer only. */
+int kvl_expert_cache_pin_layer(KvlExpertCache *c, int layer,
+                               const int *experts, int n);
 
 /* Prefetch as many missing experts in the batch as cache capacity permits.
  * Returns number of successfully loaded experts, or -1 on invalid arguments. */
