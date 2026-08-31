@@ -1,0 +1,7 @@
+# Conservative correctness pilot.
+# family layer normalized_topk_mass_threshold min_keep
+media 22 0.12 5
+media 23 0.12 5
+media 24 0.12 5
+media 25 0.12 5
+media 26 0.12 5
