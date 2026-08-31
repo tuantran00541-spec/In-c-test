@@ -1,0 +1,211 @@
+name: Real Kimi Q8 dynamic expert skip smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-dynamic-expert-skip
+    paths:
+      - ".github/workflows/kimi-dynskip-real.yml"
+      - "src/moe_dynamic_skip.c"
+      - "include/kvl/moe_dynamic_skip.h"
+      - "tests/data/kimi-dynskip-media-l22-26-t012-k5.policy"
+      - "CMakeLists.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kimi-dynskip-real-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  real-q8-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      CACHE_BYTES: "536870912"
+      POLICY: "tests/data/kimi-dynskip-media-l22-26-t012-k5.policy"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packing dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build baseline and dynamic-skip binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2 --target kvl_generate_vl kvl_generate_vl_dynskip kvl_vision kvl_dynskip_probe
+          ./build/kvl_dynskip_probe tests/data/kimi-dynskip-unit.policy
+          python -m py_compile tools/compare_kimi_logits.py tools/kimi_image.py tools/kimi_tokenizer.py
+          mkdir -p "$RUNNER_TEMP/dynskip/evidence"
+
+      - name: Fetch pinned Kimi metadata and initial shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'dynskip/kimi-source'
+          root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(
+                  repo_id='moonshotai/Kimi-VL-A3B-Instruct',
+                  revision=os.environ['KIMI_REV'], filename=name, local_dir=root,
+              ))
+          PY
+
+      - name: Pack pinned full Q8 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/dynskip/kimi-source"
+          packed="$RUNNER_TEMP/dynskip/packed-q8"
+          python tools/pack_vision.py "$src" "$packed"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'dynskip/packed-q8'
+          expected=14428930048
+          got=(p/'experts.bin').stat().st_size
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'KIMI_DYNSKIP_Q8_ORACLE records={h[5]} bytes={got}')
+          PY
+
+      - name: Prepare one shared VL input and run MoonViT once
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          from PIL import Image, ImageDraw
+          from tools.kimi_image import write_patches
+          from tools.kimi_tokenizer import build_encoding, encode_image_chat
+
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'dynskip'
+          packed=root/'packed-q8'
+          image=root/'count.png'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]:
+              d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(image)
+
+          patches=root/'patches.f32'; media=root/'media.f32'; ids_path=root/'prompt.ids'
+          gh,gw=write_patches(packed,image,patches)
+          media_tokens=(gh//2)*(gw//2)
+          enc,_,special=build_encoding(packed)
+          prompt='How many red circles are visible? Reply with only the integer.'
+          ids=encode_image_chat(enc,prompt,media_tokens,'You are a helpful assistant')
+          media_pad=special['<|media_pad|>']
+          assert sum(x==media_pad for x in ids)==media_tokens
+          ids_path.write_text('\n'.join(map(str,ids))+'\n',encoding='ascii')
+          subprocess.run([
+              './build/kvl_vision',str(packed/'vision.bin'),str(packed/'vision.idx'),
+              str(patches),str(gh),str(gw),str(media),
+          ],check=True)
+          manifest={'grid':[gh,gw],'media_tokens':media_tokens,'prompt_tokens':len(ids),
+                    'prompt':prompt,'revision':os.environ['KIMI_REV']}
+          (root/'evidence/input-manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          print(f'KIMI_DYNSKIP_INPUT_READY grid={gh}x{gw} media={media_tokens} prompt={len(ids)}')
+          PY
+
+      - name: Run full-Q8 baseline first token
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/dynskip"
+          packed="$root/packed-q8"
+          KVL_LOGITS_DUMP="$root/evidence/baseline.logits" KVL_LOGITS_DUMP_LIMIT=1 \
+            ./build/kvl_generate_vl \
+              "$packed/trunk.bin" "$packed/trunk.idx" \
+              "$packed/experts.bin" "$packed/experts.idx" \
+              "$root/prompt.ids" "$root/media.f32" "$CACHE_BYTES" 1 0 1 \
+              > "$root/evidence/baseline.out" 2> "$root/evidence/baseline.err"
+          cat "$root/evidence/baseline.out"
+
+      - name: Run conservative media dynamic-skip first token
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/dynskip"
+          packed="$root/packed-q8"
+          KVL_MOE_DYNSKIP_POLICY="$GITHUB_WORKSPACE/$POLICY" \
+          KVL_MOE_DYNSKIP_PROMPT_IDS="$root/prompt.ids" \
+          KVL_MOE_DYNSKIP_STATS="$root/evidence/dynskip-stats.tsv" \
+          KVL_LOGITS_DUMP="$root/evidence/candidate.logits" KVL_LOGITS_DUMP_LIMIT=1 \
+            ./build/kvl_generate_vl_dynskip \
+              "$packed/trunk.bin" "$packed/trunk.idx" \
+              "$packed/experts.bin" "$packed/experts.idx" \
+              "$root/prompt.ids" "$root/media.f32" "$CACHE_BYTES" 1 0 1 \
+              > "$root/evidence/candidate.out" 2> "$root/evidence/candidate.err"
+          cat "$root/evidence/candidate.out"
+          grep 'KIMI_DYNSKIP_SUMMARY' "$root/evidence/candidate.err"
+
+      - name: Compare token, logits and actual skipped routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/dynskip/evidence"
+          cmp "$root/baseline.out" "$root/candidate.out"
+          python tools/compare_kimi_logits.py \
+            "$root/baseline.logits" "$root/candidate.logits" \
+            --topk 10 --out "$root/logit-compare.json" | tee "$root/logit-compare.stdout"
+          python - <<'PY'
+          import csv, json, os, pathlib, shutil
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'dynskip/evidence'
+          rows=list(csv.DictReader((root/'dynskip-stats.tsv').open(),delimiter='\t'))
+          skipped=sum(int(r['skipped']) for r in rows)
+          routed=sum(int(r['routed']) for r in rows)
+          non_media=sum(int(r['skipped']) for r in rows if r['family']!='media')
+          assert skipped>0, 'policy did not skip any routed expert'
+          assert non_media==0, f'non-media routes were skipped: {non_media}'
+          comp=json.loads((root/'logit-compare.json').read_text())
+          s=comp['summary']
+          summary={
+              'schema':'kimi-dynskip-real-smoke-v1',
+              'token_exact':True,
+              'routed':routed,
+              'skipped':skipped,
+              'skip_fraction':skipped/routed if routed else 0.0,
+              'argmax_agree_records':s['argmax_agree_records'],
+              'records':s['records'],
+              'max_js_divergence':s['max_js_divergence'],
+              'min_probability_overlap':s['min_probability_overlap'],
+              'max_total_variation':s['max_total_variation'],
+              'claim_boundary':'One synthetic VL first-token Q8 smoke only; no global quality or speed claim.',
+          }
+          (root/'summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          shutil.copyfile(os.environ['POLICY'],root/'policy.txt')
+          print('KIMI_DYNSKIP_REAL_SMOKE_COMPLETE '+json.dumps(summary,sort_keys=True))
+          PY
+
+      - name: Upload dynamic-skip smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-dynskip-real-smoke-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/dynskip/evidence/*
