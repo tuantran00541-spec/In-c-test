@@ -6,9 +6,16 @@ on:
       - research/kimi-vl-gguf-q8-import
     paths:
       - 'src/gguf_q8_0.c'
+      - 'src/gguf_q8_moe.c'
+      - 'src/gguf_store_probe.c'
       - 'src/q8_0_expert_probe.c'
+      - 'src/expert_store.c'
+      - 'src/expert_cache.c'
       - 'include/kvl/ops.h'
+      - 'include/kvl/format.h'
+      - 'include/kvl/expert_store.h'
       - 'tools/make_kimi_gguf_q8_0_fixture.py'
+      - 'tools/index_kimi_gguf_q8.py'
       - 'CMakeLists.txt'
       - '.github/workflows/kimi-gguf-q8-native-smoke.yml'
   workflow_dispatch:
@@ -27,13 +34,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-      - name: Build Q8_0 probe
-        run: cmake --build build --config Release --target kvl_q8_0_expert_probe
+      - name: Build GGUF Q8_0 probes and generators
+        run: >-
+          cmake --build build --config Release --target
+          kvl_q8_0_expert_probe
+          kvl_gguf_store_probe
+          kvl_generate_gguf_q8
+          kvl_generate_vl_gguf_q8
 
   real-q8-smoke:
     runs-on: ubuntu-24.04
     env:
       LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      GGUF_HEADER_BYTES: '6937632'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,18 +63,70 @@ jobs:
           python -m pip install --no-cache-dir numpy requests
           python -m pip install --no-cache-dir \
             "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
-          python -m py_compile tools/make_kimi_gguf_q8_0_fixture.py
+          python -m py_compile tools/make_kimi_gguf_q8_0_fixture.py tools/index_kimi_gguf_q8.py
       - name: Fetch one real expert by byte range and build oracle
         shell: bash
         run: |
           set -euo pipefail
           python tools/make_kimi_gguf_q8_0_fixture.py "$RUNNER_TEMP/q8_0_fixture"
-      - name: Build native C probe
+      - name: Build sparse physical GGUF image
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import requests
+
+          root = Path(os.environ['RUNNER_TEMP']) / 'q8_0_fixture'
+          out = root / 'sparse.gguf'
+          url = (
+              f"https://huggingface.co/{os.environ['GGUF_REPO']}/resolve/"
+              f"{os.environ['GGUF_REVISION']}/{os.environ['GGUF_FILE']}?download=true"
+          )
+          header_n = int(os.environ['GGUF_HEADER_BYTES'])
+          with requests.get(
+              url,
+              headers={'Range': f'bytes=0-{header_n - 1}', 'Accept-Encoding': 'identity'},
+              stream=True,
+              allow_redirects=True,
+              timeout=(30, 180),
+          ) as r:
+              if r.status_code != 206:
+                  raise SystemExit(f'header range not honored: HTTP {r.status_code}')
+              header = r.raw.read(header_n + 1)
+          if len(header) != header_n:
+              raise SystemExit(f'header size mismatch: {len(header)} != {header_n}')
+
+          with open(out, 'wb') as f:
+              f.truncate(int(os.environ['GGUF_BYTES']))
+              f.seek(0)
+              f.write(header)
+              for name, offset in [
+                  ('down.q8', 822_783_264),
+                  ('gate.q8', 1_024_994_592),
+                  ('up.q8', 1_227_738_400),
+              ]:
+                  f.seek(offset)
+                  f.write((root / name).read_bytes())
+          print(f'KIMI_GGUF_SPARSE logical_bytes={out.stat().st_size}')
+          PY
+          ls -lh "$RUNNER_TEMP/q8_0_fixture/sparse.gguf"
+          du -h "$RUNNER_TEMP/q8_0_fixture/sparse.gguf"
+      - name: Build KVL direct-stream index from GGUF metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/q8_0_fixture"
+          python tools/index_kimi_gguf_q8.py \
+            "$f/sparse.gguf" "$f/experts.idx" --summary-json "$f/index-summary.json"
+          ls -lh "$f/experts.idx"
+      - name: Build native C probes
         shell: bash
         run: |
           set -euo pipefail
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target kvl_q8_0_expert_probe -j2
+          cmake --build build --target kvl_q8_0_expert_probe kvl_gguf_store_probe -j2
       - name: Compare native Q8_0 against pinned llama.cpp oracle
         shell: bash
         run: |
@@ -69,11 +138,24 @@ jobs:
             "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
             2>&1 | tee "$f/native-smoke.log"
           grep -q 'KIMI_GGUF_Q8_0_NATIVE_SMOKE_PASS' "$f/native-smoke.log"
-      - name: Upload numerical evidence
+      - name: Validate scatter O_DIRECT through ExpertCache
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/q8_0_fixture"
+          ./build/kvl_gguf_store_probe \
+            "$f/sparse.gguf" "$f/experts.idx" \
+            "$f/x_h.f32" "$f/x_i.f32" \
+            "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
+            2>&1 | tee "$f/store-smoke.log"
+          grep -q 'KIMI_GGUF_STORE_SMOKE_PASS' "$f/store-smoke.log"
+      - name: Upload numerical and storage evidence
         uses: actions/upload-artifact@v4
         with:
           name: kimi-gguf-q8-native-smoke-evidence
           path: |
             ${{ runner.temp }}/q8_0_fixture/fixture.json
+            ${{ runner.temp }}/q8_0_fixture/index-summary.json
             ${{ runner.temp }}/q8_0_fixture/native-smoke.log
+            ${{ runner.temp }}/q8_0_fixture/store-smoke.log
           retention-days: 14
