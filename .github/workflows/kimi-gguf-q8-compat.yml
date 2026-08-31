@@ -1,0 +1,105 @@
+name: Kimi GGUF Q8 compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - "tests/data/kimi-gguf-q8-compat.trigger"
+
+permissions:
+  contents: read
+
+jobs:
+  compat-q8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      HF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned GGUF reader and Hugging Face client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir huggingface_hub hf_xet numpy
+          python -m pip install --no-cache-dir \
+            "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
+          python -m py_compile tools/inspect_kimi_gguf_q8.py
+
+      - name: Resolve and download exact Q8 GGUF
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          from huggingface_hub import HfApi, hf_hub_download
+
+          repo=os.environ['HF_REPO']; filename=os.environ['HF_FILE']
+          info=HfApi().model_info(repo)
+          revision=info.sha
+          root=Path(os.environ['RUNNER_TEMP'])/'kimi-gguf-q8'
+          root.mkdir(parents=True, exist_ok=True)
+          p=Path(hf_hub_download(repo_id=repo, filename=filename, revision=revision, local_dir=root))
+          meta={'repo': repo, 'filename': filename, 'revision': revision, 'bytes': p.stat().st_size}
+          (root/'source.json').write_text(json.dumps(meta, indent=2)+'\n')
+          print(f"KIMI_GGUF_Q8_SOURCE revision={revision} bytes={p.stat().st_size} path={p}")
+          PY
+          df -h
+
+      - name: Inspect sparse expert physical layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/kimi-gguf-q8"
+          mkdir -p "$root/evidence"
+          python tools/inspect_kimi_gguf_q8.py \
+            "$root/$HF_FILE" \
+            --json "$root/evidence/compat.json"
+          cp "$root/source.json" "$root/evidence/source.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/'kimi-gguf-q8/evidence/compat.json'
+          r=json.loads(p.read_text())
+          v=r['verdict']; io=r['direct_io_alignment_probe']; s=r['q8_0_dequant_sample']
+          print(
+              f"KIMI_GGUF_Q8_SUMMARY streamable={int(v['direct_streamable_from_gguf'])} "
+              f"dropin={int(v['drop_in_current_kvl_q8_row'])} layers={r['moe_layer_count']} "
+              f"routed_gib={r['routed_tensor_gib']:.6f} max_pad={io['max_padding_bytes']} "
+              f"sample_finite={int(s['finite'])} sample_nonzero={int(s['nonzero'])}"
+          )
+          for layer in ('1','13','26'):
+              x=r['layer_layout'][layer]
+              print(
+                  f"KIMI_GGUF_Q8_LAYER layer={layer} parts={','.join(x['parts'])} "
+                  f"q8={int(x['all_q8_0'])} contiguous={int(x['expert_slices_contiguous'])} "
+                  f"expert_mib={x['expert_total_mib']:.6f}"
+              )
+          PY
+
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-compat-evidence
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/kimi-gguf-q8/evidence/**
