@@ -10,6 +10,7 @@ on:
       - "src/moe_dynamic_skip.c"
       - "src/dynskip_probe.c"
       - "tools/simulate_kimi_dynskip.py"
+      - "tools/run_kimi_dynskip_vl_intelligence.py"
       - "tests/test_kimi_dynskip_simulator.py"
       - "tests/data/kimi-dynskip-unit.policy"
       - "CMakeLists.txt"
@@ -34,8 +35,13 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
       - name: Build dynamic-skip targets
         run: cmake --build build --config Release --parallel 2 --target kvl_dynskip_probe kvl_generate_dynskip kvl_generate_vl_dynskip
-      - name: Compile trace simulator
-        run: python -m py_compile tools/simulate_kimi_dynskip.py tests/test_kimi_dynskip_simulator.py
+      - name: Compile research tooling
+        run: |
+          python -m py_compile tools/simulate_kimi_dynskip.py
+          python -m py_compile tools/run_kimi_dynskip_vl_intelligence.py
+          python -m py_compile tests/test_kimi_dynskip_simulator.py
+      - name: Validate hard VL intelligence suite
+        run: python tools/run_kimi_dynskip_vl_intelligence.py --validate-only
       - name: Trace simulator unit test
         run: python tests/test_kimi_dynskip_simulator.py
       - name: Dynamic-skip policy unit test (Linux)
