@@ -12,8 +12,10 @@ on:
       - "tools/simulate_kimi_dynskip.py"
       - "tools/run_kimi_dynskip_vl_intelligence.py"
       - "tools/kimi_vl_semantic_score.py"
+      - "tools/rescore_kimi_dynskip_vl_intelligence.py"
       - "tests/test_kimi_dynskip_simulator.py"
       - "tests/test_kimi_vl_semantic_score.py"
+      - "tests/test_kimi_vl_intelligence_rescore.py"
       - "tests/data/kimi-dynskip-unit.policy"
       - "CMakeLists.txt"
       - ".github/workflows/kimi-dynskip.yml"
@@ -42,12 +44,16 @@ jobs:
           python -m py_compile tools/simulate_kimi_dynskip.py
           python -m py_compile tools/run_kimi_dynskip_vl_intelligence.py
           python -m py_compile tools/kimi_vl_semantic_score.py
+          python -m py_compile tools/rescore_kimi_dynskip_vl_intelligence.py
           python -m py_compile tests/test_kimi_dynskip_simulator.py
           python -m py_compile tests/test_kimi_vl_semantic_score.py
+          python -m py_compile tests/test_kimi_vl_intelligence_rescore.py
       - name: Validate hard VL intelligence suite
         run: python tools/run_kimi_dynskip_vl_intelligence.py --validate-only
       - name: Semantic answer scorer unit test
         run: python tests/test_kimi_vl_semantic_score.py
+      - name: Semantic intelligence rescore unit test
+        run: python tests/test_kimi_vl_intelligence_rescore.py
       - name: Trace simulator unit test
         run: python tests/test_kimi_dynskip_simulator.py
       - name: Dynamic-skip policy unit test (Linux)
