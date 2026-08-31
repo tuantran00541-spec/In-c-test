@@ -133,7 +133,7 @@ target_link_libraries(kvl_generate_dynskip PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
 add_executable(kvl_generate_vl_dynskip src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl_dynskip PRIVATE kvl_storage)
-target_compile_definitions(kvl_generate_vl_dynskip PRIVATE kvl_moe_token_q8_dynskip_auto)
+target_compile_definitions(kvl_generate_vl_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
 add_executable(kvl_dynskip_probe src/dynskip_probe.c)
 target_link_libraries(kvl_dynskip_probe PRIVATE kvl_storage)
 
