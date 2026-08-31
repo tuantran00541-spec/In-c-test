@@ -96,6 +96,20 @@ int kvl_moe_token_auto(KvlExpertCache *cache, int layer,
                        float *top_weights,
                        float *scratch);
 
+/* Direct GGUF Q8_0 routed-expert dispatch. Router/shared expert/trunk remain on
+ * the established path; only the routed expert matrices use GGUF Q8_0 blocks. */
+int kvl_moe_token_gguf_q8_auto(KvlExpertCache *cache, int layer,
+                               const KvlRouterConfig *router_cfg,
+                               const float *x,
+                               const float *router_weight,
+                               const float *correction_bias,
+                               int expert_intermediate_size,
+                               const KvlMlpBF16 *shared,
+                               float *out,
+                               int *top_ids,
+                               float *top_weights,
+                               float *scratch);
+
 /* Q5 research dispatch kept separate from Q8 so baseline and candidate binaries
  * can coexist in one process/workflow without changing the established Q8 path. */
 int kvl_moe_token_q5_auto(KvlExpertCache *cache, int layer,
