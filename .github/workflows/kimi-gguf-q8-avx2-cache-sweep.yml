@@ -1,0 +1,167 @@
+name: Real Kimi GGUF Q8_0 AVX2 cache sweep
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - '.github/workflows/kimi-gguf-q8-avx2-cache-sweep.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cache-sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: '2'
+      OMP_DYNAMIC: 'FALSE'
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
+      - name: Build AVX2 direct-GGUF generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 --target kvl_generate_gguf_q8 -j2
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          work="$RUNNER_TEMP/kimi-official-trunk-source"
+          python tools/fetch_tokenizer.py "$packed" --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION"
+          python tools/pack_full_text.py "$work" "$packed" --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION" --expert-format none
+          test -s "$packed/trunk.bin"
+          test ! -e "$packed/experts.bin"
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(repo_id=os.environ['GGUF_REPO'], revision=os.environ['GGUF_REVISION'], filename=os.environ['GGUF_FILE'], local_dir=packed))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve(): src.replace(dst)
+          assert dst.stat().st_size == int(os.environ['GGUF_BYTES'])
+          PY
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-cache-sweep"
+          mkdir -p "$e"
+          python tools/index_kimi_gguf_q8.py "$packed/experts.bin" "$packed/experts.idx" --summary-json "$e/index-summary.json"
+      - name: Sweep cache inside 4 GiB hard runtime plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-cache-sweep"
+          prompt='Tính 125 + 75. Chỉ trả lời bằng số.'
+          run_one() {
+            label="$1"
+            cache="$2"
+            echo "KIMI_CACHE_SWEEP_BEGIN label=$label cache_mib=$cache"
+            python tools/kvl_chat.py "$packed" "$prompt" \
+              --binary ./build-avx2/kvl_generate_gguf_q8 \
+              --cache-mib "$cache" --ram-mib 4096 \
+              --max-new 8 --temperature 0 --seed 1 --show-tokens \
+              > >(tee "$e/$label.out") 2> >(tee "$e/$label.err" >&2)
+            grep -q 'expert_direct_io=yes' "$e/$label.err"
+            grep -Eq '(^|[^0-9])200([^0-9]|$)' "$e/$label.out"
+            grep -q '\[kvl\] timing first_token=' "$e/$label.err"
+            grep -q '^kvl_cache:' "$e/$label.err"
+            echo "KIMI_CACHE_SWEEP_END label=$label cache_mib=$cache"
+          }
+          # Repeat 512 MiB at the end to expose simple run-order drift.
+          run_one cache512_a 512
+          run_one cache640 640
+          run_one cache1024 1024
+          run_one cache1536 1536
+          run_one cache2048 2048
+          run_one cache512_b 512
+      - name: Summarize timing and physical expert reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, re, statistics
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-cache-sweep'
+          timing = re.compile(r'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)')
+          cache_rx = re.compile(r'kvl_cache: slots=([0-9]+).*?req=([0-9]+).*?reads=([0-9]+) bytes=([0-9.]+) MiB rate=([0-9.]+) MiB/s failures=([0-9]+)')
+          cases = [('cache512_a',512),('cache640',640),('cache1024',1024),('cache1536',1536),('cache2048',2048),('cache512_b',512)]
+          rows=[]
+          for label, cache_mib in cases:
+              err=(root/f'{label}.err').read_text(errors='replace')
+              out=(root/f'{label}.out').read_text(errors='replace').strip()
+              tm=timing.search(err); cm=cache_rx.search(err)
+              if not tm or not cm: raise SystemExit(f'missing metrics for {label}')
+              row={
+                'label':label,'cache_mib':cache_mib,'output':out,
+                'correct':bool(re.search(r'(^|[^0-9])200([^0-9]|$)',out)),
+                'direct_io':'expert_direct_io=yes' in err and 'trunk_direct_io=yes' in err,
+                'first_token_s':float(tm.group(1)),'avg_next_s':float(tm.group(2)),
+                'total_s':float(tm.group(3)),'generated':int(tm.group(4)),
+                'slots':int(cm.group(1)),'requests':int(cm.group(2)),
+                'read_ops':int(cm.group(3)),'bytes_read_mib':float(cm.group(4)),
+                'reported_read_rate_mib_s':float(cm.group(5)),'read_failures':int(cm.group(6)),
+              }
+              rows.append(row)
+          if not all(r['correct'] and r['direct_io'] and r['read_failures']==0 for r in rows):
+              raise SystemExit('correctness/direct-I/O/read gate failed')
+          base=[r for r in rows if r['cache_mib']==512]
+          base_ft=statistics.median(r['first_token_s'] for r in base)
+          base_next=statistics.median(r['avg_next_s'] for r in base)
+          base_bytes=statistics.median(r['bytes_read_mib'] for r in base)
+          base_reads=statistics.median(r['read_ops'] for r in base)
+          for r in rows:
+              r['first_token_speedup_vs_512x']=base_ft/r['first_token_s']
+              r['next_token_speedup_vs_512x']=base_next/r['avg_next_s'] if r['avg_next_s'] else None
+              r['bytes_reduction_vs_512_pct']=(1-r['bytes_read_mib']/base_bytes)*100
+              r['read_ops_reduction_vs_512_pct']=(1-r['read_ops']/base_reads)*100
+          summary={
+            'claim_boundary':'Same-run AVX2 cache-size sweep on GitHub CI with direct I/O and a 4 GiB runtime plan; one short deterministic prompt, not a target-laptop benchmark.',
+            'baseline_512_median_first_token_s':base_ft,
+            'baseline_512_median_avg_next_s':base_next,
+            'baseline_512_median_bytes_read_mib':base_bytes,
+            'baseline_512_median_read_ops':base_reads,
+            'runs':rows,
+          }
+          (root/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+          print(json.dumps(summary,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload cache sweep evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-avx2-cache-sweep-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-cache-sweep/**
+          retention-days: 14
