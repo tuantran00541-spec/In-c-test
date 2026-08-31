@@ -37,6 +37,7 @@ add_library(kvl_storage
   src/mla_prefill_streaming.c
   src/q8_ops.c
   src/gguf_q8_0.c
+  src/gguf_q8_moe.c
   src/q5_ops.c
   src/moe_dynamic_skip.c
   src/mla_state.c
@@ -101,6 +102,15 @@ target_compile_definitions(kvl_generate PRIVATE kvl_moe_token_bf16=kvl_moe_token
 add_executable(kvl_generate_vl src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
+
+# Direct GGUF Q8_0 routed-expert generators. Trunk/router/shared/vision remain on
+# the established BF16 path; only routed expert matrices stream from the GGUF.
+add_executable(kvl_generate_gguf_q8 src/generate.c src/logits_dump.c)
+target_link_libraries(kvl_generate_gguf_q8 PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_gguf_q8 PRIVATE kvl_moe_token_bf16=kvl_moe_token_gguf_q8_auto)
+add_executable(kvl_generate_vl_gguf_q8 src/generate_vl.c src/logits_dump.c)
+target_link_libraries(kvl_generate_vl_gguf_q8 PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_vl_gguf_q8 PRIVATE kvl_moe_token_bf16=kvl_moe_token_gguf_q8_auto)
 
 # Q8-only dynamic expert skipping pilot. The normal router still selects top-k;
 # weak routes are zeroed after routing without rerouting or renormalising, so the
