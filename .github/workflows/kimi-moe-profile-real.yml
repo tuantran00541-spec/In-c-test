@@ -1,0 +1,287 @@
+name: Real Kimi MoE multi-signal profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-reap-vl
+    paths:
+      - ".github/workflows/kimi-moe-profile-real.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kimi-moe-profile-real-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  profile-real-q8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      TEXT_SUITE: "tests/data/kimi-functional-pruning-suite.json"
+      TEXT_CACHE_MIB: "1536"
+      VL_CACHE_MIB: "512"
+      RAM_MIB: "4096"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packing and processor dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build Q8 oracle and validate profile tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2
+          test -x ./build/kvl_generate
+          test -x ./build/kvl_generate_vl
+          test -x ./build/kvl_vision
+          python -m py_compile tools/analyze_kimi_moe_profile.py tools/compare_kimi_logits.py
+          python tests/test_kimi_moe_profile.py
+          python tests/test_kimi_distribution_overlap.py
+          python tests/test_kimi_reap_vl.py
+          python tests/test_q8_matvec.py --build-dir build
+          mkdir -p "$RUNNER_TEMP/profile/evidence" "$RUNNER_TEMP/profile/vl-images"
+
+      - name: Restore six disjoint VL calibration cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .github/testdata/kimi-user-vi.jpg.b64 > "$RUNNER_TEMP/profile/vl-images/user-vi.jpg"
+          base64 -d .github/testdata/kimi-user-en.jpg.b64 > "$RUNNER_TEMP/profile/vl-images/user-en.jpg"
+          python - <<'PY'
+          import json, os, pathlib
+          from PIL import Image, ImageDraw
+
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile/vl-images'
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          d.rectangle((40,55,190,205),fill='red'); d.ellipse((245,55,395,205),fill='blue')
+          d.polygon([(220,245),(105,405),(335,405)],fill='green'); im.save(root/'synthetic-shapes.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im); cell=56
+          for y in range(8):
+              for x in range(8):
+                  if (x+y)%2: d.rectangle((x*cell,y*cell,(x+1)*cell-1,(y+1)*cell-1),fill='black')
+          im.save(root/'synthetic-checker.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for k in range(-448,896,80): d.line((k,0,k-448,448),fill='purple',width=24)
+          im.save(root/'synthetic-diagonal.png')
+          im=Image.new('RGB',(448,448),'white'); d=ImageDraw.Draw(im)
+          for x,y in [(90,90),(220,90),(350,90),(155,260),(285,260)]:
+              d.ellipse((x-38,y-38,x+38,y+38),fill='red')
+          im.save(root/'synthetic-count.png')
+
+          suite=json.loads(pathlib.Path('tests/data/kimi-functional-pruning-vl-suite.json').read_text())
+          suite['cases'].extend([
+              {'id':'vl-phase-c-diagonal','image':'synthetic-diagonal.png','max_new':1,
+               'prompt':'Describe the dominant line pattern in this image in one short sentence.'},
+              {'id':'vl-phase-c-count','image':'synthetic-count.png','max_new':1,
+               'prompt':'How many red circles are visible? Reply with only the integer.'},
+          ])
+          assert len(suite['cases'])==6
+          out=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile/vl-suite.json'
+          out.write_text(json.dumps(suite,indent=2,sort_keys=True)+'\n')
+          print('KIMI_PROFILE_VL_SUITE_READY cases=6')
+          PY
+
+      - name: Fetch pinned metadata and initial MoonViT shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+
+          root=Path(os.environ['RUNNER_TEMP'])/'profile/kimi-source'
+          root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(
+                  repo_id='moonshotai/Kimi-VL-A3B-Instruct',
+                  revision=os.environ['KIMI_REV'], filename=name, local_dir=root,
+              ))
+          PY
+
+      - name: Pack pinned full Q8 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/profile/kimi-source"
+          packed="$RUNNER_TEMP/profile/packed-q8"
+          python tools/pack_vision.py "$src" "$packed"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          test -s "$packed/trunk.bin" && test -s "$packed/experts.bin" && test -s "$packed/vision.bin"
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile/packed-q8'
+          expected=14428930048
+          got=(p/'experts.bin').stat().st_size
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'KIMI_PROFILE_Q8_ORACLE_PASS records={h[5]} bytes={got}')
+          PY
+          df -h "$RUNNER_TEMP"
+
+      - name: Collect 16 domain-labelled text profile traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          domain = {
+              'cal-en-science-01':'factual_english',
+              'cal-arithmetic-01':'reasoning',
+              'cal-en-vi-01':'translation',
+              'cal-vi-science-01':'factual_vietnamese',
+              'cal-c-01':'code',
+              'cal-vi-en-01':'translation',
+              'cal-python-01':'code',
+              'cal-logic-01':'reasoning',
+              'cal-fact-01':'factual_english',
+              'cal-json-01':'instruction_following',
+              'cal-comparison-01':'reasoning',
+              'cal-summary-01':'summarization',
+              'cal-units-01':'reasoning',
+              'cal-debug-01':'code',
+              'cal-vi-colloquial-01':'vietnamese_general',
+              'cal-context-01':'reading_comprehension',
+          }
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile'
+          root=base/'text-cal'; root.mkdir(parents=True,exist_ok=True)
+          suite=json.loads(pathlib.Path(os.environ['TEXT_SUITE']).read_text())
+          items=suite['calibration']; assert len(items)==16 and set(domain)=={x['id'] for x in items}
+          manifest=[]
+          for i,item in enumerate(items,1):
+              trace=root/f'{i:02d}-{item["id"]}.tsv'
+              env=os.environ.copy(); env['KVL_MOE_PROFILE_TRACE']=str(trace)
+              cmd=[sys.executable,'tools/kvl_chat.py',str(base/'packed-q8'),item['prompt'],
+                   '--binary','./build/kvl_generate','--cache-mib',os.environ['TEXT_CACHE_MIB'],
+                   '--ram-mib',os.environ['RAM_MIB'],'--max-new','1','--temperature','0',
+                   '--seed','1','--show-tokens']
+              with (root/f'{i:02d}.out').open('w') as out, (root/f'{i:02d}.err').open('w') as err:
+                  subprocess.run(cmd,env=env,stdout=out,stderr=err,check=True,text=True)
+              assert trace.is_file() and trace.stat().st_size>0
+              manifest.append({'id':item['id'],'domain':domain[item['id']],'trace':str(trace)})
+              print(f'KIMI_PROFILE_TEXT {i}/{len(items)} id={item["id"]} domain={domain[item["id"]]} bytes={trace.stat().st_size}',flush=True)
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Collect six domain-labelled VL profile traces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, pathlib, subprocess, sys
+
+          domain = {
+              'vl-user-vi-description':'vl_description_vietnamese',
+              'vl-user-en-description':'vl_description_english',
+              'vl-synthetic-shapes':'vl_spatial_pattern',
+              'vl-synthetic-checker':'vl_spatial_pattern',
+              'vl-phase-c-diagonal':'vl_spatial_pattern',
+              'vl-phase-c-count':'vl_counting',
+          }
+          base=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile'
+          suite=json.loads((base/'vl-suite.json').read_text())
+          assert set(domain)=={x['id'] for x in suite['cases']}
+          root=base/'vl-cal'; root.mkdir(parents=True,exist_ok=True)
+          manifest=[]
+          for i,item in enumerate(suite['cases'],1):
+              case=root/item['id']; case.mkdir(parents=True,exist_ok=True)
+              trace=case/'profile.tsv'; ids=case/'prompt.ids'
+              env=os.environ.copy(); env['KVL_MOE_PROFILE_TRACE']=str(trace)
+              cmd=[sys.executable,'tools/kvl_vl_chat.py',str(base/'packed-q8'),
+                   str(base/'vl-images'/item['image']),item['prompt'],
+                   '--vision-binary','./build/kvl_vision','--generate-binary','./build/kvl_generate_vl',
+                   '--cache-mib',os.environ['VL_CACHE_MIB'],'--ram-mib',os.environ['RAM_MIB'],
+                   '--max-new','1','--temperature','0','--seed','1','--show-tokens',
+                   '--prompt-ids-out',str(ids)]
+              with (case/'output.txt').open('w') as out, (case/'stderr.txt').open('w') as err:
+                  subprocess.run(cmd,env=env,stdout=out,stderr=err,check=True,text=True)
+              assert trace.is_file() and trace.stat().st_size>0 and ids.is_file() and ids.stat().st_size>0
+              manifest.append({'id':item['id'],'domain':domain[item['id']],
+                               'trace':str(trace),'prompt_ids':str(ids)})
+              print(f'KIMI_PROFILE_VL {i}/{len(suite["cases"])} id={item["id"]} domain={domain[item["id"]]} bytes={trace.stat().st_size}',flush=True)
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Build multi-signal profile without selecting a mask
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import importlib.util, json, os, pathlib, sys
+
+          repo=pathlib.Path.cwd()
+          spec=importlib.util.spec_from_file_location('profile',repo/'tools/analyze_kimi_moe_profile.py')
+          mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod
+          assert spec.loader is not None; spec.loader.exec_module(mod)
+          root=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile'
+          text=json.loads((root/'text-cal/manifest.json').read_text())
+          vl=json.loads((root/'vl-cal/manifest.json').read_text())
+          report=mod.build_profile(
+              [(row['domain'],pathlib.Path(row['trace'])) for row in text],
+              [(row['domain'],pathlib.Path(row['trace']),pathlib.Path(row['prompt_ids'])) for row in vl],
+              n_experts=64,
+          )
+          mod.write_outputs(root/'analysis',report)
+          evidence=root/'evidence'
+          for name in ('report.json','expert-profile.tsv','domain-profile.tsv','coactivation.tsv','sample-activation-matrix.json'):
+              (evidence/name).write_bytes((root/'analysis'/name).read_bytes())
+          manifest={'schema':'kimi-moe-multisignal-calibration-v1',
+                    'model':'moonshotai/Kimi-VL-A3B-Instruct','revision':os.environ['KIMI_REV'],
+                    'text_samples':text,'vl_samples':vl,
+                    'claim_boundary':'Profile evidence only; no mask selected and no quality/speed claim.'}
+          (evidence/'calibration-manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+          candidates=report['outlier_profile']['super_expert_like_candidates']
+          slot=next(row for row in report['experts'] if row['layer']==11 and row['expert']==41)
+          summary={'schema':'kimi-moe-multisignal-profile-summary-v1',
+                   'domains':report['domains'],'modalities':report['modalities'],
+                   'trace_formats':report['trace_formats'],
+                   'super_expert_like_candidates':candidates,
+                   'l11e41':slot,
+                   'mask_selected':False,
+                   'promotion_candidate':False,
+                   'claim_boundary':report['scope']}
+          (evidence/'profile-summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
+          print(f'KIMI_MOE_REAL_PROFILE_COMPLETE candidates={len(candidates)} mask_selected=no')
+          PY
+
+      - name: Upload raw and analyzed profile evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-moe-multisignal-profile-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/profile/evidence/*
+            ${{ runner.temp }}/profile/text-cal/*.tsv
+            ${{ runner.temp }}/profile/text-cal/*.out
+            ${{ runner.temp }}/profile/text-cal/*.err
+            ${{ runner.temp }}/profile/text-cal/manifest.json
+            ${{ runner.temp }}/profile/vl-cal/*/profile.tsv
+            ${{ runner.temp }}/profile/vl-cal/*/prompt.ids
+            ${{ runner.temp }}/profile/vl-cal/*/output.txt
+            ${{ runner.temp }}/profile/vl-cal/*/stderr.txt
+            ${{ runner.temp }}/profile/vl-cal/manifest.json

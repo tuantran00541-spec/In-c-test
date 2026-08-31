@@ -21,6 +21,7 @@ static unsigned char g_moe_disabled[KVL_MOE_LAB_MAX_LAYERS][KVL_MOE_LAB_MAX_EXPE
 static int g_moe_mask_state;
 static FILE *g_moe_trace;
 static int g_moe_trace_state;
+static int g_moe_trace_profile;
 static unsigned long long g_moe_trace_event;
 
 static int q8_better(float a, int ia, float b, int ib) {
@@ -185,15 +186,31 @@ static int q8_router_for_layer(int layer, const KvlRouterConfig *cfg, const floa
 static void moe_trace_open(void) {
     if (g_moe_trace_state) return;
     g_moe_trace_state = 1;
-    const char *path = getenv("KVL_MOE_TRACE");
+    const char *profile_path = getenv("KVL_MOE_PROFILE_TRACE");
+    const char *legacy_path = getenv("KVL_MOE_TRACE");
+    const char *path = profile_path && profile_path[0] ? profile_path : legacy_path;
     if (!path || !path[0]) return;
+    g_moe_trace_profile = profile_path && profile_path[0];
+    if (g_moe_trace_profile && legacy_path && legacy_path[0])
+        fprintf(stderr,
+                "kvl: KVL_MOE_PROFILE_TRACE takes precedence over KVL_MOE_TRACE\n");
     g_moe_trace = fopen(path, "a+");
     if (!g_moe_trace) {
-        fprintf(stderr, "kvl: cannot open KVL_MOE_TRACE=%s\n", path);
+        fprintf(stderr, "kvl: cannot open %s=%s\n",
+                g_moe_trace_profile ? "KVL_MOE_PROFILE_TRACE" : "KVL_MOE_TRACE",
+                path);
         return;
     }
-    if (fseek(g_moe_trace, 0, SEEK_END) == 0 && ftell(g_moe_trace) == 0)
-        fputs("# event\tlayer\texpert\trouter_weight\toutput_l2\tsaliency\n", g_moe_trace);
+    if (fseek(g_moe_trace, 0, SEEK_END) == 0 && ftell(g_moe_trace) == 0) {
+        if (g_moe_trace_profile) {
+            fputs("# KVL_MOE_PROFILE_TRACE_V2\n", g_moe_trace);
+            fputs("# event\tlayer\texpert\trouter_weight\toutput_l2\tsaliency"
+                  "\toutput_max_abs\n", g_moe_trace);
+        } else {
+            fputs("# event\tlayer\texpert\trouter_weight\toutput_l2\tsaliency\n",
+                  g_moe_trace);
+        }
+    }
 }
 
 static unsigned long long moe_trace_begin(void) {
@@ -212,16 +229,28 @@ static void moe_trace_expert(unsigned long long event, int layer, int expert,
                              float router_weight, const float *output, int n) {
     if (!event || !output || n <= 0) return;
     double sq = 0.0;
-    for (int i = 0; i < n; ++i) sq += (double)output[i] * (double)output[i];
+    double max_abs = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double value = (double)output[i];
+        const double magnitude = fabs(value);
+        sq += value * value;
+        if (magnitude > max_abs) max_abs = magnitude;
+    }
     const double l2 = sqrt(sq);
     const double saliency = fabs((double)router_weight) * l2;
 #ifdef _OPENMP
 #pragma omp critical(kvl_moe_trace_io)
 #endif
     {
-        if (g_moe_trace)
-            fprintf(g_moe_trace, "%llu\t%d\t%d\t%.9g\t%.12g\t%.12g\n",
-                    event, layer, expert, router_weight, l2, saliency);
+        if (g_moe_trace) {
+            if (g_moe_trace_profile)
+                fprintf(g_moe_trace,
+                        "%llu\t%d\t%d\t%.9g\t%.12g\t%.12g\t%.12g\n",
+                        event, layer, expert, router_weight, l2, saliency, max_abs);
+            else
+                fprintf(g_moe_trace, "%llu\t%d\t%d\t%.9g\t%.12g\t%.12g\n",
+                        event, layer, expert, router_weight, l2, saliency);
+        }
     }
 }
 

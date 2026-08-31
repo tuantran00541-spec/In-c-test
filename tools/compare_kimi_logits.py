@@ -88,10 +88,14 @@ def compare_record(a, b, topk):
     kl_ba = 0.0
     js = 0.0
     max_prob_delta = 0.0
+    probability_overlap = 0.0
+    total_variation_l1 = 0.0
     for x, y in zip(a, b):
         pa = math.exp(float(x) - za)
         pb = math.exp(float(y) - zb)
         dp = abs(pa - pb)
+        probability_overlap += min(pa, pb)
+        total_variation_l1 += dp
         if dp > max_prob_delta:
             max_prob_delta = dp
         if pa > 0.0 and pb > 0.0:
@@ -121,6 +125,8 @@ def compare_record(a, b, topk):
         "kl_variant_to_baseline": kl_ba,
         "js_divergence": js,
         "max_probability_delta": max_prob_delta,
+        "probability_overlap": probability_overlap,
+        "total_variation": 0.5 * total_variation_l1,
     }
 
 
@@ -157,6 +163,13 @@ def main() -> int:
             "max_abs_logit_delta": max(r["max_abs_logit_delta"] for r in records),
             "max_js_divergence": max(r["js_divergence"] for r in records),
             "min_topk_overlap_fraction": min(r["topk_overlap_fraction"] for r in records),
+            "mean_probability_overlap": sum(r["probability_overlap"] for r in records) / len(records),
+            "min_probability_overlap": min(r["probability_overlap"] for r in records),
+            "max_total_variation": max(r["total_variation"] for r in records),
+            "esap_claim_boundary": (
+                "probability_overlap equals token-level ESAP only when baseline and variant "
+                "records use identical teacher-forced prefixes"
+            ),
         },
     }
     text = json.dumps(report, indent=2, sort_keys=True) + "\n"
