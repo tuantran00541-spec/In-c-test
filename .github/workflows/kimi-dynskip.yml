@@ -1,0 +1,37 @@
+name: Kimi dynamic expert skip
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-dynamic-expert-skip
+    paths:
+      - "include/kvl/moe_dynamic_skip.h"
+      - "src/moe_dynamic_skip.c"
+      - "src/dynskip_probe.c"
+      - "tests/data/kimi-dynskip-unit.policy"
+      - "CMakeLists.txt"
+      - ".github/workflows/kimi-dynskip.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dynskip-unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure portable build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+      - name: Build dynamic-skip targets
+        run: cmake --build build --config Release --parallel 2 --target kvl_dynskip_probe kvl_generate_dynskip kvl_generate_vl_dynskip
+      - name: Dynamic-skip policy unit test (Linux)
+        if: runner.os != 'Windows'
+        run: ./build/kvl_dynskip_probe tests/data/kimi-dynskip-unit.policy
+      - name: Dynamic-skip policy unit test (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\Release\kvl_dynskip_probe.exe tests\data\kimi-dynskip-unit.policy
