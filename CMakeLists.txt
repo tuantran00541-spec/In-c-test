@@ -37,6 +37,7 @@ add_library(kvl_storage
   src/mla_prefill_streaming.c
   src/q8_ops.c
   src/q5_ops.c
+  src/moe_dynamic_skip.c
   src/mla_state.c
   src/mla_compressed_state.c
   src/mla_compressed_q8_state.c
@@ -99,6 +100,19 @@ target_compile_definitions(kvl_generate PRIVATE kvl_moe_token_bf16=kvl_moe_token
 add_executable(kvl_generate_vl src/generate_vl.c src/logits_dump.c)
 target_link_libraries(kvl_generate_vl PRIVATE kvl_storage)
 target_compile_definitions(kvl_generate_vl PRIVATE kvl_moe_token_bf16=kvl_moe_token_auto)
+
+# Q8-only dynamic expert skipping pilot. The normal router still selects top-k;
+# weak routes are zeroed after routing without rerouting or renormalising, so the
+# expert cache can avoid requesting skipped records. A policy is opt-in through
+# KVL_MOE_DYNSKIP_POLICY and requires the exact KVL_MOE_DYNSKIP_PROMPT_IDS file.
+add_executable(kvl_generate_dynskip src/generate.c src/logits_dump.c)
+target_link_libraries(kvl_generate_dynskip PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
+add_executable(kvl_generate_vl_dynskip src/generate_vl.c src/logits_dump.c)
+target_link_libraries(kvl_generate_vl_dynskip PRIVATE kvl_storage)
+target_compile_definitions(kvl_generate_vl_dynskip PRIVATE kvl_moe_token_bf16=kvl_moe_token_q8_dynskip_auto)
+add_executable(kvl_dynskip_probe src/dynskip_probe.c)
+target_link_libraries(kvl_dynskip_probe PRIVATE kvl_storage)
 
 # Separate Q5 research binaries keep the established Q8 dispatch untouched so a
 # real-weight A/B can use the same trunk/vision/tokenizer with different expert stores.
