@@ -1,6 +1,5 @@
 #include "kvl/moe_dynamic_skip.h"
 
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -9,7 +8,7 @@ static int fail(const char *msg) {
     return 1;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     const int prompt[] = {
         163594, 101, 163601, 102, 163586,
         163587, 103, 163601,
@@ -67,6 +66,18 @@ int main(void) {
         return fail("content decision returned error");
     if (skipped != 5) return fail("min_keep=1 must retain one route");
     if (!keep[0]) return fail("highest normalized route was not retained");
+
+    if (argc == 2) {
+        if (kvl_moe_dynskip_load_policy(argv[1]) != 0)
+            return fail("policy file parser rejected valid fixture");
+        if (kvl_moe_dynskip_apply_policy(KVL_MOE_FAMILY_MEDIA, 26, 6,
+                                         weights, keep, &skipped) != 0)
+            return fail("parsed media policy decision returned error");
+        if (skipped != 1)
+            return fail("parsed policy did not preserve min_keep=5");
+    } else if (argc != 1) {
+        return fail("usage: kvl_dynskip_probe [policy-file]");
+    }
 
     puts("KIMI_DYNSKIP_UNIT_PASS");
     return 0;
