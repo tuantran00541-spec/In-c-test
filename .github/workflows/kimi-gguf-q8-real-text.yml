@@ -1,0 +1,196 @@
+name: Real Kimi GGUF Q8_0 text prompts
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - '.github/workflows/kimi-gguf-q8-real-text.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  q8-text:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      OMP_NUM_THREADS: '2'
+      OMP_DYNAMIC: 'FALSE'
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h /
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir \
+            huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir \
+            "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
+          python -m py_compile tools/pack_full_text.py tools/index_kimi_gguf_q8.py tools/kvl_chat.py
+      - name: Build direct-GGUF generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target kvl_generate_gguf_q8 -j2
+      - name: Fetch pinned tokenizer assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          python tools/fetch_tokenizer.py "$packed" \
+            --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION"
+      - name: Pack BF16 trunk only from official checkpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/kimi-official-trunk-source"
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          python tools/pack_full_text.py "$work" "$packed" \
+            --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION" \
+            --expert-format none
+          test -s "$packed/trunk.bin"
+          test -s "$packed/trunk.idx"
+          test ! -e "$packed/experts.bin"
+          test ! -e "$packed/experts.idx"
+          du -h "$packed/trunk.bin" "$packed/trunk.idx"
+          df -h /
+      - name: Download pinned full Q8_0 GGUF without repacking
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(
+              repo_id=os.environ['GGUF_REPO'],
+              revision=os.environ['GGUF_REVISION'],
+              filename=os.environ['GGUF_FILE'],
+              local_dir=packed,
+          ))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          print(f'KIMI_GGUF_Q8_REAL_SOURCE bytes={dst.stat().st_size} path={dst}')
+          PY
+          df -h /
+      - name: Build tiny direct-stream expert index
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          evidence="$RUNNER_TEMP/kimi-gguf-q8-evidence"
+          mkdir -p "$evidence"
+          python tools/index_kimi_gguf_q8.py \
+            "$packed/experts.bin" "$packed/experts.idx" \
+            --summary-json "$evidence/index-summary.json"
+          test -s "$packed/experts.idx"
+          ls -lh "$packed/trunk.bin" "$packed/experts.bin" "$packed/experts.idx"
+      - name: Run English arithmetic prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-evidence"
+          python tools/kvl_chat.py "$packed" \
+            'Calculate 17 * 23. Reply with only the integer.' \
+            --binary ./build/kvl_generate_gguf_q8 --cache-mib 512 --ram-mib 4096 \
+            --max-new 10 --temperature 0 --seed 1 --show-tokens \
+            > >(tee "$e/en-arithmetic.out") 2> >(tee "$e/en-arithmetic.err" >&2)
+          test -s "$e/en-arithmetic.out"
+          grep -q 'expert_direct_io=yes' "$e/en-arithmetic.err"
+      - name: Run Vietnamese discount reasoning prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-evidence"
+          python tools/kvl_chat.py "$packed" \
+            'Một cửa hàng giảm giá 20%, rồi giảm tiếp 10% trên giá đã giảm. Tổng mức giảm so với giá ban đầu là bao nhiêu phần trăm? Trả lời chỉ bằng phần trăm cuối cùng.' \
+            --binary ./build/kvl_generate_gguf_q8 --cache-mib 512 --ram-mib 4096 \
+            --max-new 14 --temperature 0 --seed 1 --show-tokens \
+            > >(tee "$e/vi-discount.out") 2> >(tee "$e/vi-discount.err" >&2)
+          test -s "$e/vi-discount.out"
+          grep -q 'expert_direct_io=yes' "$e/vi-discount.err"
+      - name: Run English science explanation prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-evidence"
+          python tools/kvl_chat.py "$packed" \
+            'Answer in one concise sentence: Why does ordinary ice float on liquid water?' \
+            --binary ./build/kvl_generate_gguf_q8 --cache-mib 512 --ram-mib 4096 \
+            --max-new 28 --temperature 0 --seed 1 --show-tokens \
+            > >(tee "$e/en-science.out") 2> >(tee "$e/en-science.err" >&2)
+          test -s "$e/en-science.out"
+          grep -q 'expert_direct_io=yes' "$e/en-science.err"
+      - name: Run Vietnamese science explanation prompt
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-evidence"
+          python tools/kvl_chat.py "$packed" \
+            'Viết đúng một câu ngắn giải thích vì sao bầu trời thường có màu xanh vào ban ngày.' \
+            --binary ./build/kvl_generate_gguf_q8 --cache-mib 512 --ram-mib 4096 \
+            --max-new 28 --temperature 0 --seed 1 --show-tokens \
+            > >(tee "$e/vi-science.out") 2> >(tee "$e/vi-science.err" >&2)
+          test -s "$e/vi-science.out"
+          grep -q 'expert_direct_io=yes' "$e/vi-science.err"
+      - name: Summarize prompt evidence
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-evidence'
+          def text(name):
+              p=root/name
+              return p.read_text(errors='replace').strip() if p.exists() else None
+          summary = {
+              'claim_boundary': 'Real native-C text smoke using BF16 official trunk plus routed experts streamed directly from pinned Q8_0 GGUF; not a speed benchmark or global quality evaluation.',
+              'en_arithmetic': text('en-arithmetic.out'),
+              'vi_discount': text('vi-discount.out'),
+              'en_science': text('en-science.out'),
+              'vi_science': text('vi-science.out'),
+          }
+          summary['en_arithmetic_contains_391'] = bool(summary['en_arithmetic'] and '391' in summary['en_arithmetic'])
+          summary['vi_discount_contains_28'] = bool(summary['vi_discount'] and '28' in summary['vi_discount'])
+          (root/'prompt-summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+      - name: Upload text evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-real-text-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-evidence/**
+          retention-days: 14
