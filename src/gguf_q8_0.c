@@ -123,11 +123,12 @@ void kvl_matvec_ggml_q8_0(float *y, const float *x, const void *blob,
     const uint8_t *bytes = (const uint8_t *)blob;
     const int blocks_per_row = in / KVL_GGML_Q8_0_BLOCK;
     const size_t row_bytes = (size_t)blocks_per_row * KVL_GGML_Q8_0_BYTES;
+    int o;
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if(out > 64)
 #endif
-    for (int o = 0; o < out; ++o) {
+    for (o = 0; o < out; ++o) {
         const uint8_t *row = bytes + (size_t)o * row_bytes;
 #ifdef KVL_USE_AVX2
         y[o] = q8_0_row_avx2(row, x, blocks_per_row);
