@@ -1,0 +1,115 @@
+name: Real Kimi Q8 dynamic skip VL gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-dynamic-expert-skip
+    paths:
+      - ".github/workflows/kimi-dynskip-vl-gate.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kimi-dynskip-vl-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  vl-gate-q8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      OMP_NUM_THREADS: "2"
+      OMP_DYNAMIC: "FALSE"
+      KIMI_REV: "398eede0903cd983a2bfa0cc634e9ac1d843f375"
+      POLICY: "tests/data/kimi-dynskip-media-l22-26-t012-k5.policy"
+      CACHE_BYTES: "536870912"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packing and image dependencies
+        run: |
+          python -m pip install --no-cache-dir huggingface_hub safetensors numpy pillow tiktoken transformers jinja2
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build and validate dynamic-skip targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build -j 2 --target kvl_generate_vl kvl_generate_vl_dynskip kvl_vision kvl_dynskip_probe
+          ./build/kvl_dynskip_probe tests/data/kimi-dynskip-unit.policy
+          python -m py_compile tools/run_kimi_dynskip_vl_gate.py tools/compare_kimi_logits.py
+          mkdir -p "$RUNNER_TEMP/dynskip-gate/evidence"
+
+      - name: Fetch pinned Kimi metadata and initial shard
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          root=Path(os.environ['RUNNER_TEMP'])/'dynskip-gate/kimi-source'
+          root.mkdir(parents=True,exist_ok=True)
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              print(hf_hub_download(
+                  repo_id='moonshotai/Kimi-VL-A3B-Instruct',
+                  revision=os.environ['KIMI_REV'], filename=name, local_dir=root,
+              ))
+          PY
+
+      - name: Pack pinned full Q8 oracle once
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/dynskip-gate/kimi-source"
+          packed="$RUNNER_TEMP/dynskip-gate/packed-q8"
+          python tools/pack_vision.py "$src" "$packed"
+          python tools/fetch_tokenizer.py "$packed" --revision "$KIMI_REV"
+          python tools/pack_full_text.py "$src" "$packed" --revision "$KIMI_REV" --expert-format q8
+          python - <<'PY'
+          import os, pathlib, struct
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'dynskip-gate/packed-q8'
+          expected=14428930048
+          got=(p/'experts.bin').stat().st_size
+          assert got==expected,(got,expected)
+          raw=(p/'experts.idx').read_bytes(); h=struct.unpack_from('<8sIIIIIIQQ',raw,0)
+          assert h[0]==b'KVLXPRT1' and h[5]==1664 and h[6]==3
+          print(f'KIMI_DYNSKIP_GATE_Q8_ORACLE records={h[5]} bytes={got}')
+          PY
+
+      - name: Run six-case baseline versus conservative media skip gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/run_kimi_dynskip_vl_gate.py \
+            --model-dir "$RUNNER_TEMP/dynskip-gate/packed-q8" \
+            --work-dir "$RUNNER_TEMP/dynskip-gate/work" \
+            --evidence-dir "$RUNNER_TEMP/dynskip-gate/evidence" \
+            --policy "$POLICY" \
+            --vision-binary ./build/kvl_vision \
+            --baseline-binary ./build/kvl_generate_vl \
+            --candidate-binary ./build/kvl_generate_vl_dynskip \
+            --cache-bytes "$CACHE_BYTES" \
+            --revision "$KIMI_REV"
+
+      - name: Upload six-case dynamic-skip evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-dynskip-vl-gate-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/dynskip-gate/evidence/**
