@@ -3,7 +3,7 @@ project(kimi_vl_lowram C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(KVL_USE_AVX2 "Use AVX2 BF16/Q8 GEMV backends" OFF)
-option(KVL_MSVC_PARALLEL_KERNELS "Enable OpenMP for selected MSVC GEMV and expert-prefetch kernels" OFF)
+option(KVL_MSVC_PARALLEL_KERNELS "Enable OpenMP for selected MSVC direct-GGUF kernels" OFF)
 
 if(MSVC)
   add_compile_options(/W4)
@@ -12,20 +12,17 @@ else()
 endif()
 
 # Linux keeps the existing target-wide OpenMP behavior. On MSVC, long-context
-# prefill retains its established OpenMP path. The broader fast path is opt-in
-# until real Windows A/B evidence justifies promotion. Use the LLVM OpenMP mode
-# for the opt-in kernels: unlike legacy /openmp (OpenMP 2.0 parser), it accepts
-# the C11 loop forms already used by these cross-platform kernels.
+# prefill retains its established OpenMP path. The broader fast path remains
+# opt-in until real Windows A/B evidence justifies promotion. For the first
+# direct-GGUF pilot, enable only the two kernels whose OpenMP induction loops are
+# compatible with MSVC's native /openmp parser: Q8_0 row GEMV and expert prefetch.
 if(MSVC)
   set_source_files_properties(src/mla_prefill_streaming.c PROPERTIES COMPILE_OPTIONS "/openmp")
   if(KVL_MSVC_PARALLEL_KERNELS)
     set_source_files_properties(
-      src/ops.c
-      src/q8_ops.c
       src/gguf_q8_0.c
-      src/q5_ops.c
       src/expert_cache.c
-      PROPERTIES COMPILE_OPTIONS "/openmp:llvm")
+      PROPERTIES COMPILE_OPTIONS "/openmp")
   endif()
 else()
   find_package(OpenMP)
