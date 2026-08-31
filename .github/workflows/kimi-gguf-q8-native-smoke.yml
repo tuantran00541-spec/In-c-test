@@ -1,0 +1,79 @@
+name: Kimi GGUF Q8_0 native smoke
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - 'src/gguf_q8_0.c'
+      - 'src/q8_0_expert_probe.c'
+      - 'include/kvl/ops.h'
+      - 'tools/make_kimi_gguf_q8_0_fixture.py'
+      - 'CMakeLists.txt'
+      - '.github/workflows/kimi-gguf-q8-native-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build Q8_0 probe
+        run: cmake --build build --config Release --target kvl_q8_0_expert_probe
+
+  real-q8-smoke:
+    runs-on: ubuntu-24.04
+    env:
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned GGUF oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir numpy requests
+          python -m pip install --no-cache-dir \
+            "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
+          python -m py_compile tools/make_kimi_gguf_q8_0_fixture.py
+      - name: Fetch one real expert by byte range and build oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/make_kimi_gguf_q8_0_fixture.py "$RUNNER_TEMP/q8_0_fixture"
+      - name: Build native C probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target kvl_q8_0_expert_probe -j2
+      - name: Compare native Q8_0 against pinned llama.cpp oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="$RUNNER_TEMP/q8_0_fixture"
+          ./build/kvl_q8_0_expert_probe \
+            "$f/gate.q8" "$f/up.q8" "$f/down.q8" \
+            "$f/x_h.f32" "$f/x_i.f32" \
+            "$f/gate_ref.f32" "$f/up_ref.f32" "$f/down_ref.f32" \
+            2>&1 | tee "$f/native-smoke.log"
+          grep -q 'KIMI_GGUF_Q8_0_NATIVE_SMOKE_PASS' "$f/native-smoke.log"
+      - name: Upload numerical evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-native-smoke-evidence
+          path: |
+            ${{ runner.temp }}/q8_0_fixture/fixture.json
+            ${{ runner.temp }}/q8_0_fixture/native-smoke.log
+          retention-days: 14
