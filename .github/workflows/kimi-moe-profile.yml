@@ -9,9 +9,11 @@ on:
       - "CMakeLists.txt"
       - "src/q8_ops.c"
       - "tools/analyze_kimi_moe_profile.py"
+      - "tools/kimi_moe_token_profile.py"
       - "tools/analyze_kimi_reap_vl.py"
       - "tools/compare_kimi_logits.py"
       - "tests/test_kimi_moe_profile.py"
+      - "tests/test_kimi_moe_token_profile.py"
       - "tests/test_kimi_distribution_overlap.py"
       - "tests/test_kimi_reap_vl.py"
       - "spec/KIMI_MOE_MULTISIGNAL_PROFILE.md"
@@ -39,10 +41,13 @@ jobs:
       - name: Compile profiler tools
         run: |
           python -m py_compile tools/analyze_kimi_moe_profile.py
+          python -m py_compile tools/kimi_moe_token_profile.py
           python -m py_compile tools/analyze_kimi_reap_vl.py
           python -m py_compile tools/compare_kimi_logits.py
       - name: Multi-signal profiler unit test
         run: python tests/test_kimi_moe_profile.py
+      - name: Token-aware profiler unit test
+        run: python tests/test_kimi_moe_token_profile.py
       - name: Distribution-overlap unit test
         run: python tests/test_kimi_distribution_overlap.py
       - name: Legacy REAP analyzer compatibility test
