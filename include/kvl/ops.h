@@ -47,6 +47,11 @@ void kvl_matvec_bf16(float *y, const float *x, const uint16_t *w,
  * followed by row-major signed int8 weights [out,in]. */
 void kvl_matvec_q8_rowwise(float *y, const float *x, const void *blob,
                            int in, int out);
+/* llama.cpp/GGUF Q8_0: 32 signed int8 values per block with one IEEE FP16
+ * scale stored before the 32 quants (34 bytes/block). Quantization runs along
+ * the input dimension, so each matrix row is independently block-addressable. */
+void kvl_matvec_ggml_q8_0(float *y, const float *x, const void *blob,
+                          int in, int out);
 /* Experimental Q5 expert-only format: each matrix blob is FP32 scales for
  * contiguous input groups of 128, then a row-major packed 5-bit signed stream.
  * Values use symmetric RTN range [-15,15]. */
