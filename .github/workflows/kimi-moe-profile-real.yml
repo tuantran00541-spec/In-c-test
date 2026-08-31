@@ -56,8 +56,9 @@ jobs:
           test -x ./build/kvl_generate
           test -x ./build/kvl_generate_vl
           test -x ./build/kvl_vision
-          python -m py_compile tools/analyze_kimi_moe_profile.py tools/compare_kimi_logits.py
+          python -m py_compile tools/analyze_kimi_moe_profile.py tools/kimi_moe_token_profile.py tools/compare_kimi_logits.py
           python tests/test_kimi_moe_profile.py
+          python tests/test_kimi_moe_token_profile.py
           python tests/test_kimi_distribution_overlap.py
           python tests/test_kimi_reap_vl.py
           python tests/test_q8_matvec.py --build-dir build
@@ -172,16 +173,17 @@ jobs:
           items=suite['calibration']; assert len(items)==16 and set(domain)=={x['id'] for x in items}
           manifest=[]
           for i,item in enumerate(items,1):
-              trace=root/f'{i:02d}-{item["id"]}.tsv'
+              trace=root/f'{i:02d}-{item["id"]}.tsv'; ids=root/f'{i:02d}-{item["id"]}.ids'
               env=os.environ.copy(); env['KVL_MOE_PROFILE_TRACE']=str(trace)
               cmd=[sys.executable,'tools/kvl_chat.py',str(base/'packed-q8'),item['prompt'],
                    '--binary','./build/kvl_generate','--cache-mib',os.environ['TEXT_CACHE_MIB'],
                    '--ram-mib',os.environ['RAM_MIB'],'--max-new','1','--temperature','0',
-                   '--seed','1','--show-tokens']
+                   '--seed','1','--show-tokens','--prompt-ids-out',str(ids)]
               with (root/f'{i:02d}.out').open('w') as out, (root/f'{i:02d}.err').open('w') as err:
                   subprocess.run(cmd,env=env,stdout=out,stderr=err,check=True,text=True)
-              assert trace.is_file() and trace.stat().st_size>0
-              manifest.append({'id':item['id'],'domain':domain[item['id']],'trace':str(trace)})
+              assert trace.is_file() and trace.stat().st_size>0 and ids.is_file() and ids.stat().st_size>0
+              manifest.append({'id':item['id'],'domain':domain[item['id']],
+                               'trace':str(trace),'prompt_ids':str(ids)})
               print(f'KIMI_PROFILE_TEXT {i}/{len(items)} id={item["id"]} domain={domain[item["id"]]} bytes={trace.stat().st_size}',flush=True)
           (root/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
           PY
@@ -225,17 +227,19 @@ jobs:
           (root/'manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
           PY
 
-      - name: Build multi-signal profile without selecting a mask
+      - name: Build raw and token-aware profiles without selecting a mask
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import importlib.util, json, os, pathlib, sys
 
-          repo=pathlib.Path.cwd()
+          repo=pathlib.Path.cwd(); sys.path.insert(0,str(repo/'tools'))
           spec=importlib.util.spec_from_file_location('profile',repo/'tools/analyze_kimi_moe_profile.py')
           mod=importlib.util.module_from_spec(spec); sys.modules[spec.name]=mod
           assert spec.loader is not None; spec.loader.exec_module(mod)
+          import kimi_moe_token_profile as token_mod
+
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'profile'
           text=json.loads((root/'text-cal/manifest.json').read_text())
           vl=json.loads((root/'vl-cal/manifest.json').read_text())
@@ -245,26 +249,41 @@ jobs:
               n_experts=64,
           )
           mod.write_outputs(root/'analysis',report)
+          token_report=token_mod.build_token_profile(
+              [(row['domain'],pathlib.Path(row['trace']),pathlib.Path(row['prompt_ids'])) for row in text+vl],
+              n_experts=64,
+          )
+          token_mod.write_outputs(root/'token-analysis',token_report)
+
           evidence=root/'evidence'
           for name in ('report.json','expert-profile.tsv','domain-profile.tsv','coactivation.tsv','sample-activation-matrix.json'):
               (evidence/name).write_bytes((root/'analysis'/name).read_bytes())
-          manifest={'schema':'kimi-moe-multisignal-calibration-v1',
+          for name in ('token-aware-report.json','token-family-profile.tsv','token-class-profile.tsv',
+                       'domain-token-family-profile.tsv','token-family-coactivation.tsv'):
+              (evidence/name).write_bytes((root/'token-analysis'/name).read_bytes())
+          manifest={'schema':'kimi-moe-multisignal-calibration-v2',
                     'model':'moonshotai/Kimi-VL-A3B-Instruct','revision':os.environ['KIMI_REV'],
                     'text_samples':text,'vl_samples':vl,
+                    'token_partition':token_report['token_partition'],
                     'claim_boundary':'Profile evidence only; no mask selected and no quality/speed claim.'}
           (evidence/'calibration-manifest.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
           candidates=report['outlier_profile']['super_expert_like_candidates']
           slot=next(row for row in report['experts'] if row['layer']==11 and row['expert']==41)
-          summary={'schema':'kimi-moe-multisignal-profile-summary-v1',
+          scoped={family:data['super_expert_like_candidates']
+                  for family,data in token_report['outlier_profiles'].items()}
+          summary={'schema':'kimi-moe-multisignal-profile-summary-v2',
                    'domains':report['domains'],'modalities':report['modalities'],
                    'trace_formats':report['trace_formats'],
                    'super_expert_like_candidates':candidates,
+                   'token_families':token_report['token_families'],
+                   'token_aware_super_expert_like_candidates':scoped,
                    'l11e41':slot,
                    'mask_selected':False,
                    'promotion_candidate':False,
                    'claim_boundary':report['scope']}
           (evidence/'profile-summary.json').write_text(json.dumps(summary,indent=2,sort_keys=True)+'\n')
-          print(f'KIMI_MOE_REAL_PROFILE_COMPLETE candidates={len(candidates)} mask_selected=no')
+          counts={family:len(rows) for family,rows in scoped.items()}
+          print(f'KIMI_MOE_REAL_PROFILE_COMPLETE raw_candidates={len(candidates)} token_candidates={counts} mask_selected=no')
           PY
 
       - name: Upload raw and analyzed profile evidence
@@ -277,6 +296,7 @@ jobs:
           path: |
             ${{ runner.temp }}/profile/evidence/*
             ${{ runner.temp }}/profile/text-cal/*.tsv
+            ${{ runner.temp }}/profile/text-cal/*.ids
             ${{ runner.temp }}/profile/text-cal/*.out
             ${{ runner.temp }}/profile/text-cal/*.err
             ${{ runner.temp }}/profile/text-cal/manifest.json
