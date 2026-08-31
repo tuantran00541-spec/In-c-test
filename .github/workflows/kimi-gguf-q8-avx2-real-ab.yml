@@ -1,0 +1,167 @@
+name: Real Kimi GGUF Q8_0 scalar vs AVX2 A/B
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-import
+    paths:
+      - '.github/workflows/kimi-gguf-q8-avx2-real-ab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      OMP_NUM_THREADS: '2'
+      OMP_DYNAMIC: 'FALSE'
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          sudo apt-get clean || true
+          df -h /
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@${LLAMA_CPP_GGUF_COMMIT}#subdirectory=gguf-py"
+      - name: Build scalar and AVX2 generators
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-scalar -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=OFF
+          cmake --build build-scalar --target kvl_generate_gguf_q8 -j2
+          cmake -S . -B build-avx2 -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build build-avx2 --target kvl_generate_gguf_q8 -j2
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          work="$RUNNER_TEMP/kimi-official-trunk-source"
+          python tools/fetch_tokenizer.py "$packed" --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION"
+          python tools/pack_full_text.py "$work" "$packed" --repo "$OFFICIAL_REPO" --revision "$OFFICIAL_REVISION" --expert-format none
+          test -s "$packed/trunk.bin"
+          test ! -e "$packed/experts.bin"
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(repo_id=os.environ['GGUF_REPO'], revision=os.environ['GGUF_REVISION'], filename=os.environ['GGUF_FILE'], local_dir=packed))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          PY
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          evidence="$RUNNER_TEMP/kimi-gguf-q8-avx2-ab"
+          mkdir -p "$evidence"
+          python tools/index_kimi_gguf_q8.py "$packed/experts.bin" "$packed/experts.idx" --summary-json "$evidence/index-summary.json"
+          df -h /
+      - name: Run balanced scalar AVX2 A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          packed="$RUNNER_TEMP/kimi-gguf-q8-runtime"
+          e="$RUNNER_TEMP/kimi-gguf-q8-avx2-ab"
+          prompt='Tính 125 + 75. Chỉ trả lời bằng số.'
+          run_one() {
+            label="$1"
+            binary="$2"
+            echo "KIMI_AVX2_AB_BEGIN label=$label"
+            python tools/kvl_chat.py "$packed" "$prompt" \
+              --binary "$binary" --cache-mib 512 --ram-mib 4096 \
+              --max-new 8 --temperature 0 --seed 1 --show-tokens \
+              > >(tee "$e/$label.out") 2> >(tee "$e/$label.err" >&2)
+            grep -q 'expert_direct_io=yes' "$e/$label.err"
+            grep -Eq '(^|[^0-9])200([^0-9]|$)' "$e/$label.out"
+            grep -q '\[kvl\] timing first_token=' "$e/$label.err"
+            echo "KIMI_AVX2_AB_END label=$label"
+          }
+          # Balanced order limits simple warm-cache/order bias without claiming a formal benchmark.
+          run_one scalar_1 ./build-scalar/kvl_generate_gguf_q8
+          run_one avx2_1 ./build-avx2/kvl_generate_gguf_q8
+          run_one avx2_2 ./build-avx2/kvl_generate_gguf_q8
+          run_one scalar_2 ./build-scalar/kvl_generate_gguf_q8
+      - name: Summarize A/B timing and correctness
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, re, statistics
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-avx2-ab'
+          rx = re.compile(r'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)')
+          rows = []
+          for label in ['scalar_1','avx2_1','avx2_2','scalar_2']:
+              err = (root/f'{label}.err').read_text(errors='replace')
+              out = (root/f'{label}.out').read_text(errors='replace').strip()
+              m = rx.search(err)
+              if not m:
+                  raise SystemExit(f'missing timing for {label}')
+              rows.append({
+                  'label': label,
+                  'output': out,
+                  'correct': bool(re.search(r'(^|[^0-9])200([^0-9]|$)', out)),
+                  'direct_io': 'expert_direct_io=yes' in err and 'trunk_direct_io=yes' in err,
+                  'first_token_s': float(m.group(1)),
+                  'avg_next_s': float(m.group(2)),
+                  'total_s': float(m.group(3)),
+                  'generated': int(m.group(4)),
+              })
+          scalar = [r for r in rows if r['label'].startswith('scalar')]
+          avx2 = [r for r in rows if r['label'].startswith('avx2')]
+          def med(kind, field): return statistics.median(r[field] for r in kind)
+          summary = {
+              'claim_boundary': 'Balanced S-A-A-S same-run GitHub CI observation; KVL_USE_AVX2 also enables existing BF16 AVX2 kernels, so this is full-runtime AVX2 versus scalar, not an isolated Q8_0-kernel benchmark or target-laptop benchmark.',
+              'runs': rows,
+              'scalar_median_first_token_s': med(scalar, 'first_token_s'),
+              'avx2_median_first_token_s': med(avx2, 'first_token_s'),
+              'scalar_median_avg_next_s': med(scalar, 'avg_next_s'),
+              'avx2_median_avg_next_s': med(avx2, 'avg_next_s'),
+              'scalar_median_total_s': med(scalar, 'total_s'),
+              'avx2_median_total_s': med(avx2, 'total_s'),
+          }
+          for metric in ['first_token','avg_next','total']:
+              s = summary[f'scalar_median_{metric}_s']
+              a = summary[f'avx2_median_{metric}_s']
+              summary[f'{metric}_speedup_x'] = s / a if a else None
+              summary[f'{metric}_reduction_pct'] = (1.0 - a/s)*100.0 if s else None
+          if not all(r['correct'] and r['direct_io'] for r in rows):
+              raise SystemExit('correctness/direct-I/O gate failed')
+          (root/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2)+'\n')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+      - name: Upload A/B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-avx2-real-ab-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-avx2-ab/**
+          retention-days: 14
