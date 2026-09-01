@@ -45,10 +45,10 @@ jobs:
           for name in ('src/ops.c', 'src/q8_ops.c', 'src/q5_ops.c'):
               p = Path(name)
               s = p.read_text(encoding='utf-8')
-              old = '    for (int o = 0; o < out; ++o) {'
-              new = '    int o;\n    for (o = 0; o < out; ++o) {'
+              old = '#ifdef _OPENMP\n#pragma omp parallel for schedule(static) if(out > 64)\n#endif\n    for (int o = 0; o < out; ++o) {'
+              new = '    int o;\n#ifdef _OPENMP\n#pragma omp parallel for schedule(static) if(out > 64)\n#endif\n    for (o = 0; o < out; ++o) {'
               if old not in s:
-                  raise SystemExit(f'expected OpenMP loop not found in {name}')
+                  raise SystemExit(f'expected OpenMP loop block not found in {name}')
               p.write_text(s.replace(old, new, 1), encoding='utf-8')
           '@ | python -
 
