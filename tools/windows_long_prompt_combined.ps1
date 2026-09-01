@@ -29,8 +29,12 @@ if ($Threads.Count -eq 0) { throw "-ThreadList must contain at least one positiv
 $env:OMP_DYNAMIC = 'FALSE'
 $env:OMP_NESTED = 'FALSE'
 
-$ShortPrompt = "Xin chào. Hãy trả lời đúng một câu ngắn."
-$LongPrompt = "Hãy viết một bài khoảng 700–1000 từ bằng tiếng Việt về chủ đề: Một chiếc laptop phổ thông có thể chạy mô hình AI lớn hoàn toàn bằng CPU như thế nào? Giải thích theo cách dễ hiểu nhưng vẫn có chi tiết kỹ thuật. Bài viết cần có mở đầu, phần giải thích về RAM, SSD/NVMe, quantization, MoE, cache, tốc độ token, giới hạn thực tế, và phần kết luận. Không dùng danh sách gạch đầu dòng quá nhiều; ưu tiên viết thành các đoạn văn liền mạch. Hãy duy trì mạch văn tự nhiên, không lặp ý, không dừng giữa chừng, và tiếp tục cho đến khi hoàn thành toàn bộ bài viết."
+# Keep this .ps1 strictly ASCII so Windows PowerShell 5.1 does not depend on a
+# UTF-8 BOM. Decode the exact Vietnamese prompts from UTF-8 Base64 at runtime.
+$ShortPromptB64 = 'WGluIGNow6BvLiBIw6N5IHRy4bqjIGzhu51pIMSRw7puZyBt4buZdCBjw6J1IG5n4bqvbi4='
+$LongPromptB64 = 'SMOjeSB2aeG6v3QgbeG7mXQgYsOgaSBraG/huqNuZyA3MDDigJMxMDAwIHThu6sgYuG6sW5nIHRp4bq/bmcgVmnhu4d0IHbhu4EgY2jhu6cgxJHhu4E6IE3hu5l0IGNoaeG6v2MgbGFwdG9wIHBo4buVIHRow7RuZyBjw7MgdGjhu4MgY2jhuqF5IG3DtCBow6xuaCBBSSBs4bubbiBob8OgbiB0b8OgbiBi4bqxbmcgQ1BVIG5oxrAgdGjhur8gbsOgbz8gR2nhuqNpIHRow61jaCB0aGVvIGPDoWNoIGThu4UgaGnhu4N1IG5oxrBuZyB24bqrbiBjw7MgY2hpIHRp4bq/dCBr4bu5IHRodeG6rXQuIELDoGkgdmnhur90IGPhuqduIGPDsyBt4bufIMSR4bqndSwgcGjhuqduIGdp4bqjaSB0aMOtY2ggduG7gSBSQU0sIFNTRC9OVk1lLCBxdWFudGl6YXRpb24sIE1vRSwgY2FjaGUsIHThu5FjIMSR4buZIHRva2VuLCBnaeG7m2kgaOG6oW4gdGjhu7FjIHThur8sIHbDoCBwaOG6p24ga+G6v3QgbHXhuq1uLiBLaMO0bmcgZMO5bmcgZGFuaCBzw6FjaCBn4bqhY2ggxJHhuqd1IGTDsm5nIHF1w6Egbmhp4buBdTsgxrB1IHRpw6puIHZp4bq/dCB0aMOgbmggY8OhYyDEkW/huqFuIHbEg24gbGnhu4FuIG3huqFjaC4gSMOjeSBkdXkgdHLDrCBt4bqhY2ggdsSDbiB04buxIG5oacOqbiwga2jDtG5nIGzhurdwIMO9LCBraMO0bmcgZOG7q25nIGdp4buvYSBjaOG7q25nLCB2w6AgdGnhur9wIHThu6VjIGNobyDEkeG6v24ga2hpIGhvw6BuIHRow6BuaCB0b8OgbiBi4buZIGLDoGkgdmnhur90Lg=='
+$ShortPrompt = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($ShortPromptB64))
+$LongPrompt = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($LongPromptB64))
 
 $timingRx = [regex]'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)'
 $idsRx = [regex]'\[kvl\] generated ids:\s*(.*)$'
@@ -171,8 +175,8 @@ Write-Host "Token timings will stream directly below."
 Write-Host ""
 
 # Inherit the console for the expensive run so token timings remain visible live.
-# This is intentionally one candidate run only; the 41-minute historical baseline
-# above is reused instead of burning another full-model baseline pass.
+# This is intentionally one candidate run only; the historical baseline above is
+# reused instead of burning another full-model baseline pass.
 & $Python .\tools\kvl_chat.py `
     $ModelDir `
     $LongPrompt `
@@ -189,4 +193,4 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "LONG_COMBINED_EXACT_RUN_FINISHED"
-Write-Host "Compare the final [kvl] timing, kvl_cache, kvl_trunk_cache, RAM peak and CPU/disk observations against the saved baseline above."
+Write-Host "Compare final timing/cache stats plus RAM, CPU and disk observations against the saved baseline above."
