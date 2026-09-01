@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef KVL_USE_AVX2
+#include <immintrin.h>
+#endif
+
 enum {
     VD = 1152,
     VHEADS = 16,
@@ -45,11 +49,66 @@ static void layernorm_bf16(float *y, const float *x,
     }
 }
 
-static void linear_bias(float *y, const float *x,
-                        const uint16_t *weight, const uint16_t *bias,
-                        int in, int out) {
-    kvl_matvec_bf16(y, x, weight, in, out);
-    if (bias) for (int i = 0; i < out; ++i) y[i] += kvl_bf16_to_f32(bias[i]);
+/* Vision-only batched BF16 projection prototype. Each individual dot product is
+ * deliberately identical to kvl_matvec_bf16; only loop ordering changes so a
+ * weight row stays hot while it is applied to every patch/token in the batch. */
+static float vision_dot_bf16_ref(const uint16_t *row, const float *x, int n) {
+    double acc = 0.0;
+    for (int i = 0; i < n; ++i)
+        acc += (double)kvl_bf16_to_f32(row[i]) * (double)x[i];
+    return (float)acc;
+}
+
+#ifdef KVL_USE_AVX2
+static float vision_dot_bf16_avx2(const uint16_t *row, const float *x, int n) {
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m128i w16 = _mm_loadu_si128((const __m128i *)(row + i));
+        __m256i w32 = _mm256_cvtepu16_epi32(w16);
+        w32 = _mm256_slli_epi32(w32, 16);
+        const __m256 wf = _mm256_castsi256_ps(w32);
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(wf, xv));
+    }
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float out = _mm_cvtss_f32(sum);
+    for (; i < n; ++i) out += kvl_bf16_to_f32(row[i]) * x[i];
+    return out;
+}
+#endif
+
+static void vision_matmul_bf16(float *y, const float *x, const uint16_t *w,
+                               int rows, int in, int out) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(out > 64 && rows > 1)
+#endif
+    for (int o = 0; o < out; ++o) {
+        const uint16_t *wr = w + (size_t)o * (size_t)in;
+        for (int r = 0; r < rows; ++r) {
+            const float *xr = x + (size_t)r * (size_t)in;
+#ifdef KVL_USE_AVX2
+            y[(size_t)r * (size_t)out + o] = vision_dot_bf16_avx2(wr, xr, in);
+#else
+            y[(size_t)r * (size_t)out + o] = vision_dot_bf16_ref(wr, xr, in);
+#endif
+        }
+    }
+}
+
+static void linear_bias_batch(float *y, const float *x,
+                              const uint16_t *weight, const uint16_t *bias,
+                              int rows, int in, int out) {
+    vision_matmul_bf16(y, x, weight, rows, in, out);
+    if (!bias) return;
+    for (int r = 0; r < rows; ++r) {
+        float *yr = y + (size_t)r * (size_t)out;
+        for (int o = 0; o < out; ++o) yr[o] += kvl_bf16_to_f32(bias[o]);
+    }
 }
 
 static float gelu_tanh(float x) {
@@ -135,12 +194,11 @@ static int run_block(KvlTrunkStore *vs, int layer, float *x, int seq, int gh, in
         loadv(vs,layer,KVL_VISION_MLP1_WEIGHT,&f1w) ||
         loadv(vs,layer,KVL_VISION_MLP1_BIAS,&f1b)) goto done;
 
-    for (int t=0;t<seq;++t) {
+    for (int t=0;t<seq;++t)
         layernorm_bf16(norm+(size_t)t*VD,x+(size_t)t*VD,
                        (const uint16_t*)n0w.data,(const uint16_t*)n0b.data,VD,LN_EPS);
-        linear_bias(qkv+(size_t)t*3*VD,norm+(size_t)t*VD,
-                    (const uint16_t*)qw.data,(const uint16_t*)qb.data,VD,3*VD);
-    }
+    linear_bias_batch(qkv,norm,(const uint16_t*)qw.data,(const uint16_t*)qb.data,
+                      seq,VD,3*VD);
 
     for (int t=0;t<seq;++t) {
         const int row=t/gw, col=t%gw;
@@ -175,19 +233,22 @@ static int run_block(KvlTrunkStore *vs, int layer, float *x, int seq, int gh, in
                 ho[d]=(float)a;
             }
         }
-        linear_bias(tmpd,attn+(size_t)t*VD,
-                    (const uint16_t*)ow.data,(const uint16_t*)ob.data,VD,VD);
-        for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=tmpd[d];
     }
+    linear_bias_batch(tmpd,attn,(const uint16_t*)ow.data,(const uint16_t*)ob.data,
+                      seq,VD,VD);
+    for (int t=0;t<seq;++t)
+        for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=tmpd[(size_t)t*VD+d];
 
-    for(int t=0;t<seq;++t){
-        float *xt=x+(size_t)t*VD;
-        layernorm_bf16(norm,xt,(const uint16_t*)n1w.data,(const uint16_t*)n1b.data,VD,LN_EPS);
-        linear_bias(inter,norm,(const uint16_t*)f0w.data,(const uint16_t*)f0b.data,VD,VI);
-        for(int i=0;i<VI;++i)inter[i]=gelu_tanh(inter[i]);
-        linear_bias(tmpd,inter,(const uint16_t*)f1w.data,(const uint16_t*)f1b.data,VI,VD);
-        for(int d=0;d<VD;++d)xt[d]+=tmpd[d];
-    }
+    for(int t=0;t<seq;++t)
+        layernorm_bf16(norm+(size_t)t*VD,x+(size_t)t*VD,
+                       (const uint16_t*)n1w.data,(const uint16_t*)n1b.data,VD,LN_EPS);
+    linear_bias_batch(inter,norm,(const uint16_t*)f0w.data,(const uint16_t*)f0b.data,
+                      seq,VD,VI);
+    for(size_t i=0;i<(size_t)seq*VI;++i)inter[i]=gelu_tanh(inter[i]);
+    linear_bias_batch(tmpd,inter,(const uint16_t*)f1w.data,(const uint16_t*)f1b.data,
+                      seq,VI,VD);
+    for(int t=0;t<seq;++t)
+        for(int d=0;d<VD;++d)x[(size_t)t*VD+d]+=tmpd[(size_t)t*VD+d];
     rc=0;
 
 done:
@@ -225,15 +286,15 @@ int kvl_vision_forward(KvlTrunkStore *vs, const float *patches,
     qkv=(float*)malloc((size_t)seq*3*VD*sizeof(float));
     attn=(float*)malloc((size_t)seq*VD*sizeof(float));
     scores=(float*)malloc((size_t)seq*sizeof(float));
-    inter=(float*)malloc((size_t)VI*sizeof(float));
-    tmpd=(float*)malloc((size_t)VD*sizeof(float));
-    concat=(float*)malloc((size_t)PROJECT*sizeof(float));
-    projtmp=(float*)malloc((size_t)PROJECT*sizeof(float));
+    inter=(float*)malloc((size_t)seq*VI*sizeof(float));
+    tmpd=(float*)malloc((size_t)seq*VD*sizeof(float));
+    concat=(float*)malloc((size_t)merged*PROJECT*sizeof(float));
+    projtmp=(float*)malloc((size_t)merged*PROJECT*sizeof(float));
     if(!x||!norm||!qkv||!attn||!scores||!inter||!tmpd||!concat||!projtmp)goto done;
 
+    linear_bias_batch(x,patches,(const uint16_t*)pw.data,(const uint16_t*)pb.data,
+                      seq,PATCH_IN,VD);
     for(int t=0;t<seq;++t){
-        linear_bias(x+(size_t)t*VD,patches+(size_t)t*PATCH_IN,
-                    (const uint16_t*)pw.data,(const uint16_t*)pb.data,PATCH_IN,VD);
         const int oh=t/gw,ow=t%gw;
         if(gh==ph&&gw==pwid){
             const uint16_t *pp=(const uint16_t*)pos.data+(size_t)t*VD;
@@ -263,20 +324,23 @@ int kvl_vision_forward(KvlTrunkStore *vs, const float *patches,
        loadv(vs,KVL_TRUNK_GLOBAL_LAYER,KVL_VISION_PROJECTOR_L2_BIAS,&l2b))goto done;
 
     for(int mh=0;mh<gh/2;++mh)for(int mw=0;mw<gw/2;++mw){
+        const int m=mh*(gw/2)+mw;
         const int ids[4]={
             (2*mh)*gw+2*mw,
             (2*mh)*gw+2*mw+1,
             (2*mh+1)*gw+2*mw,
             (2*mh+1)*gw+2*mw+1
         };
+        float *row=concat+(size_t)m*PROJECT;
         for(int k=0;k<4;++k)
-            layernorm_bf16(concat+(size_t)k*VD,norm+(size_t)ids[k]*VD,
+            layernorm_bf16(row+(size_t)k*VD,norm+(size_t)ids[k]*VD,
                            (const uint16_t*)pnw.data,(const uint16_t*)pnb.data,VD,LN_EPS);
-        linear_bias(projtmp,concat,(const uint16_t*)l1w.data,(const uint16_t*)l1b.data,PROJECT,PROJECT);
-        for(int i=0;i<PROJECT;++i)projtmp[i]=gelu_exact(projtmp[i]);
-        linear_bias(out+(size_t)(mh*(gw/2)+mw)*TEXT_D,projtmp,
-                    (const uint16_t*)l2w.data,(const uint16_t*)l2b.data,PROJECT,TEXT_D);
     }
+    linear_bias_batch(projtmp,concat,(const uint16_t*)l1w.data,(const uint16_t*)l1b.data,
+                      merged,PROJECT,PROJECT);
+    for(size_t i=0;i<(size_t)merged*PROJECT;++i)projtmp[i]=gelu_exact(projtmp[i]);
+    linear_bias_batch(out,projtmp,(const uint16_t*)l2w.data,(const uint16_t*)l2b.data,
+                      merged,PROJECT,TEXT_D);
     *out_tokens=merged;
     rc=0;
 
