@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from kimi_tokenizer import build_encoding, decode_generated, encode_chat
+from kvl_memory_plan import FULL_TRUNK_CACHE_MIB, parse_trunk_cache_request
 
 EOS_ID = 163585
 IM_END_ID = 163586
@@ -34,6 +35,7 @@ FIXED_RUNTIME_SAFETY = 256 * 1024 * 1024
 # Batch prefill currently holds six [S,H] FP32 outer buffers. kvl_mla_prefill_bf16 also holds
 # expanded Q/K/V at 32 KiB/token. Add 8 KiB/token margin for temporary vectors/allocator slack.
 BATCH_PREFILL_BYTES_PER_TOKEN = (6 * HIDDEN * 4) + (32 * 1024) + (8 * 1024)
+MIB = 1024 * 1024
 
 
 def default_binary() -> str:
@@ -48,8 +50,8 @@ def planned_bytes(prompt_tokens: int, max_new: int, cache_mib: int,
     capacity = prompt_tokens + max_new
     compressed_state = LAYERS * capacity * KV_LATENT_PLUS_ROPE * 4
     batch_prefill = prompt_tokens * BATCH_PREFILL_BYTES_PER_TOKEN
-    cache = cache_mib * 1024 * 1024
-    trunk_cache = trunk_cache_mib * 1024 * 1024
+    cache = cache_mib * MIB
+    trunk_cache = trunk_cache_mib * MIB
     parts = {
         "globals": GLOBAL_BF16_BYTES,
         "expert_cache": cache,
@@ -62,8 +64,25 @@ def planned_bytes(prompt_tokens: int, max_new: int, cache_mib: int,
     return parts
 
 
+def resolve_local_trunk_cache_mib(
+    prompt_tokens: int,
+    max_new: int,
+    cache_mib: int,
+    ram_mib: int,
+    requested: str | int,
+) -> int:
+    parsed = parse_trunk_cache_request(requested)
+    if parsed is not None:
+        return parsed
+    base = planned_bytes(prompt_tokens, max_new, cache_mib, 0)
+    available = ram_mib * MIB - base["planned_peak"]
+    if available <= 0:
+        return 0
+    return min(FULL_TRUNK_CACHE_MIB, available // MIB)
+
+
 def mib(n: int) -> float:
-    return n / 1048576.0
+    return n / MIB
 
 
 def main() -> int:
@@ -74,8 +93,10 @@ def main() -> int:
     ap.add_argument("--binary", default=default_binary())
     ap.add_argument("--cache-mib", type=int, default=512,
                     help="hard routed-expert cache budget")
-    ap.add_argument("--trunk-cache-mib", type=int, default=0,
-                    help="bounded cache for non-global always-used trunk tensors; 0 keeps the established streaming path")
+    ap.add_argument(
+        "--trunk-cache-mib", default="auto",
+        help="non-global trunk cache budget in MiB, or 'auto' (default) to fill safely under --ram-mib",
+    )
     ap.add_argument("--ram-mib", type=int, default=4096,
                     help="V8 total known-working-set budget; configuration is rejected if the conservative plan exceeds it")
     ap.add_argument("--max-new", type=int, default=32)
@@ -87,10 +108,14 @@ def main() -> int:
                     help="optional research/debug path to persist the exact text prompt token ids")
     args = ap.parse_args()
 
-    if args.cache_mib <= 0 or args.trunk_cache_mib < 0 or args.ram_mib <= 0 or args.max_new <= 0:
-        raise SystemExit("expert cache, RAM budget and max-new must be positive; trunk cache must be >= 0")
+    if args.cache_mib <= 0 or args.ram_mib <= 0 or args.max_new <= 0:
+        raise SystemExit("expert cache, RAM budget and max-new must be positive")
     if args.temperature < 0:
         raise SystemExit("temperature must be >= 0")
+    try:
+        parse_trunk_cache_request(args.trunk_cache_mib)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     model = Path(args.model_dir)
     required = [
@@ -108,8 +133,11 @@ def main() -> int:
         research_ids.parent.mkdir(parents=True, exist_ok=True)
         research_ids.write_text("\n".join(map(str, prompt_ids)) + "\n", encoding="ascii")
 
-    plan = planned_bytes(len(prompt_ids), args.max_new, args.cache_mib, args.trunk_cache_mib)
-    budget = args.ram_mib * 1024 * 1024
+    trunk_cache_mib = resolve_local_trunk_cache_mib(
+        len(prompt_ids), args.max_new, args.cache_mib, args.ram_mib, args.trunk_cache_mib
+    )
+    plan = planned_bytes(len(prompt_ids), args.max_new, args.cache_mib, trunk_cache_mib)
+    budget = args.ram_mib * MIB
     if plan["planned_peak"] > budget:
         detail = ", ".join(f"{k}={mib(v):.1f}MiB" for k, v in plan.items() if k != "planned_peak")
         raise SystemExit(
@@ -119,7 +147,7 @@ def main() -> int:
 
     print(
         f"[kvl] prompt tokens={len(prompt_ids)} cache={args.cache_mib} MiB "
-        f"trunk_cache={args.trunk_cache_mib} MiB "
+        f"trunk_cache={trunk_cache_mib} MiB(requested={args.trunk_cache_mib}) "
         f"RAM plan={mib(plan['planned_peak']):.1f}/{args.ram_mib} MiB "
         f"max_new={args.max_new} temperature={args.temperature}",
         file=sys.stderr,
@@ -139,12 +167,12 @@ def main() -> int:
         args.binary,
         str(model / "trunk.bin"), str(model / "trunk.idx"),
         str(model / "experts.bin"), str(model / "experts.idx"),
-        str(ids_path), str(args.cache_mib * 1024 * 1024), str(args.max_new),
+        str(ids_path), str(args.cache_mib * MIB), str(args.max_new),
         str(args.temperature), str(args.seed),
     ]
     child_env = os.environ.copy()
     # The frontend owns this value so the RAM planner and C runtime cannot drift.
-    child_env["KVL_TRUNK_CACHE_MIB"] = str(args.trunk_cache_mib)
+    child_env["KVL_TRUNK_CACHE_MIB"] = str(trunk_cache_mib)
     generated: list[int] = []
     token_times: list[float] = []
     start = time.monotonic()
