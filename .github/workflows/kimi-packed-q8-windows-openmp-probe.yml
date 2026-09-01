@@ -37,6 +37,21 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cmake -S . -B build-off -A x64 -DKVL_USE_AVX2=ON
           cmake --build build-off --config Release --target kvl_q8_probe kvl_mla_prefill_bench
+
+          # MSVC's legacy OpenMP parser rejects C99 declarations in the canonical
+          # omp-for initializer. Patch only the research checkout; math is unchanged.
+          @'
+          from pathlib import Path
+          for name in ('src/ops.c', 'src/q8_ops.c', 'src/q5_ops.c'):
+              p = Path(name)
+              s = p.read_text(encoding='utf-8')
+              old = '    for (int o = 0; o < out; ++o) {'
+              new = '    int o;\n    for (o = 0; o < out; ++o) {'
+              if old not in s:
+                  raise SystemExit(f'expected OpenMP loop not found in {name}')
+              p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          '@ | python -
+
           cmake -S . -B build-on -A x64 -DKVL_USE_AVX2=ON -DCMAKE_C_FLAGS="/openmp"
           cmake --build build-on --config Release --target kvl_q8_probe kvl_mla_prefill_bench
 
