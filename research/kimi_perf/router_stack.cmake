@@ -9,3 +9,5 @@ add_executable(kvl_router_stack_probe
 )
 target_include_directories(kvl_router_stack_probe PRIVATE "${KVL_ROOT}/include")
 target_link_libraries(kvl_router_stack_probe PRIVATE kvl_storage kvl_router_stack)
+
+include("${CMAKE_CURRENT_LIST_DIR}/shared_q8.cmake")
