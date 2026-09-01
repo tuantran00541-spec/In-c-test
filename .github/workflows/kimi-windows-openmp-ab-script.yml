@@ -1,0 +1,47 @@
+name: Windows OpenMP A/B Script
+
+on:
+  push:
+    branches:
+      - research/kimi-msvc-q8-openmp-bench
+    paths:
+      - 'tools/windows_openmp_ab.ps1'
+      - '.github/workflows/kimi-windows-openmp-ab-script.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-script:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse PowerShell script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $text = Get-Content tools/windows_openmp_ab.ps1 -Raw
+          [scriptblock]::Create($text) | Out-Null
+
+      - name: Exercise parser with fake frontend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force fake-model, fake-bin | Out-Null
+          Set-Content -Path fake-bin\baseline.exe -Value ''
+          Set-Content -Path fake-bin\openmp.exe -Value ''
+          @'
+          @echo off
+          echo [kvl] timing first_token=10.000s avg_next=2.000s total=14.000s generated=3 1>&2
+          echo [kvl] generated ids: 1 2 163586 1>&2
+          exit /b 0
+          '@ | Set-Content -Path fake-python.cmd -Encoding ascii
+          powershell -ExecutionPolicy Bypass -File tools\windows_openmp_ab.ps1 `
+            -ModelDir .\fake-model `
+            -Python .\fake-python.cmd `
+            -BaselineBinary .\fake-bin\baseline.exe `
+            -PilotBinary .\fake-bin\openmp.exe `
+            -Threads 1,2
