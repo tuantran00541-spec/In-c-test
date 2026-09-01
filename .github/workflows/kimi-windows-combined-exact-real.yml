@@ -33,6 +33,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build isolated Windows performance research binaries
         shell: pwsh
