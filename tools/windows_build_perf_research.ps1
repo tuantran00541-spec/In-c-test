@@ -16,6 +16,7 @@ cmake --build $BuildDir --config Release --target `
     kvl_generate_token_parallel_prefill `
     kvl_generate_decode_reuse `
     kvl_generate_shared_q8 `
+    kvl_generate_combined_exact `
     kvl_q8_expert_parallel_probe `
     kvl_mla_fused_prefill_probe `
     kvl_mla_token_parallel_prefill_probe `
@@ -31,13 +32,14 @@ $fused = Join-Path $BuildDir 'Release\kvl_generate_fused_prefill.exe'
 $tokenParallel = Join-Path $BuildDir 'Release\kvl_generate_token_parallel_prefill.exe'
 $decodeReuse = Join-Path $BuildDir 'Release\kvl_generate_decode_reuse.exe'
 $sharedQ8 = Join-Path $BuildDir 'Release\kvl_generate_shared_q8.exe'
+$combinedExact = Join-Path $BuildDir 'Release\kvl_generate_combined_exact.exe'
 $q8Probe = Join-Path $BuildDir 'Release\kvl_q8_expert_parallel_probe.exe'
 $fusedProbe = Join-Path $BuildDir 'Release\kvl_mla_fused_prefill_probe.exe'
 $tokenParallelProbe = Join-Path $BuildDir 'Release\kvl_mla_token_parallel_prefill_probe.exe'
 $decodeProbe = Join-Path $BuildDir 'Release\kvl_mla_decode_reuse_probe.exe'
 $routerProbe = Join-Path $BuildDir 'Release\kvl_router_stack_probe.exe'
 $trunkLookupProbe = Join-Path $BuildDir 'Release\kvl_trunk_lookup_index_probe.exe'
-foreach ($p in @($baseline,$profile,$parallel,$fused,$tokenParallel,$decodeReuse,$sharedQ8,$q8Probe,$fusedProbe,$tokenParallelProbe,$decodeProbe,$routerProbe,$trunkLookupProbe)) {
+foreach ($p in @($baseline,$profile,$parallel,$fused,$tokenParallel,$decodeReuse,$sharedQ8,$combinedExact,$q8Probe,$fusedProbe,$tokenParallelProbe,$decodeProbe,$routerProbe,$trunkLookupProbe)) {
     if (-not (Test-Path $p)) { throw "Missing expected binary: $p" }
 }
 
@@ -65,6 +67,7 @@ Write-Host "  fused-prefill pilot    : $fused"
 Write-Host "  token-parallel prefill : $tokenParallel"
 Write-Host "  decode-reuse pilot     : $decodeReuse"
 Write-Host "  shared-Q8 pilot        : $sharedQ8"
+Write-Host "  combined exact pilot   : $combinedExact"
 Write-Host "  Q8 exactness probe     : $q8Probe"
 Write-Host "  fused prefill exact    : $fusedProbe"
 Write-Host "  token prefill exact    : $tokenParallelProbe"
