@@ -1,0 +1,41 @@
+name: Windows Kimi Performance Research Build
+
+on:
+  push:
+    branches:
+      - research/kimi-msvc-q8-openmp-bench
+    paths:
+      - 'research/kimi_perf/**'
+      - 'tools/windows_build_perf_research.ps1'
+      - '.github/workflows/kimi-windows-perf-research-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-build:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build research binaries through Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          powershell -ExecutionPolicy Bypass -File .\tools\windows_build_perf_research.ps1
+
+      - name: Verify isolated outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $paths = @(
+            'build-perf-research\core\Release\kvl_generate.exe',
+            'build-perf-research\Release\kvl_generate_profile.exe',
+            'build-perf-research\Release\kvl_generate_expert_parallel.exe'
+          )
+          foreach ($p in $paths) {
+            if (-not (Test-Path $p)) { throw "missing $p" }
+          }
+          git diff --exit-code
