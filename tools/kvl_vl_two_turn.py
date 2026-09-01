@@ -13,7 +13,13 @@ from pathlib import Path
 
 from kimi_image import write_patches
 from kimi_tokenizer import build_encoding, decode_generated, encode_image_chat
-from kvl_memory_plan import MIB, as_mib, planned_text_breakdown
+from kvl_memory_plan import (
+    MIB,
+    as_mib,
+    parse_trunk_cache_request,
+    planned_text_breakdown,
+    resolve_trunk_cache_mib,
+)
 
 EOS_ID = 163585
 IM_END_ID = 163586
@@ -41,8 +47,18 @@ def _body_before_stop(ids: list[int]) -> list[int]:
         out.append(token)
     return out
 
-def _plan_or_die(prompt_n: int, max_new: int, cache_mib: int, ram_mib: int, label: str) -> None:
-    plan = planned_text_breakdown(prompt_n, max_new, cache_mib)
+def _plan_or_die(
+    prompt_n: int,
+    max_new: int,
+    cache_mib: int,
+    ram_mib: int,
+    trunk_cache_request: str | int,
+    label: str,
+) -> int:
+    trunk_cache_mib = resolve_trunk_cache_mib(
+        prompt_n, max_new, cache_mib, ram_mib, trunk_cache_request
+    )
+    plan = planned_text_breakdown(prompt_n, max_new, cache_mib, trunk_cache_mib)
     if plan["total"] > ram_mib * MIB:
         raise SystemExit(
             f"{label} RAM plan rejected: {as_mib(plan['total']):.1f} MiB > {ram_mib} MiB"
@@ -52,9 +68,11 @@ def _plan_or_die(prompt_n: int, max_new: int, cache_mib: int, ram_mib: int, labe
         f"state_mib={as_mib(plan['compressed_state']):.2f} "
         f"seq_ws_mib={as_mib(plan['sequence_workspace']):.2f} "
         f"mla_ws_mib={as_mib(plan['streaming_mla_workspace']):.2f} "
-        f"cache_mib={as_mib(plan['expert_cache']):.2f}",
+        f"cache_mib={as_mib(plan['expert_cache']):.2f} "
+        f"trunk_cache_mib={trunk_cache_mib} requested={trunk_cache_request}",
         flush=True,
     )
+    return trunk_cache_mib
 
 def _run_turn(
     *,
@@ -65,6 +83,7 @@ def _run_turn(
     prompt_ids: list[int],
     generate_binary: str,
     cache_mib: int,
+    trunk_cache_mib: int,
     max_new: int,
     temperature: float,
     seed: int,
@@ -83,7 +102,11 @@ def _run_turn(
     generated: list[int] = []
     token_times: list[float] = []
     start = time.monotonic()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    child_env = os.environ.copy()
+    child_env["KVL_TRUNK_CACHE_MIB"] = str(trunk_cache_mib)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, text=True, bufsize=1, env=child_env
+    )
     assert proc.stdout is not None
     for line in proc.stdout:
         line = line.strip()
@@ -117,6 +140,10 @@ def main() -> int:
     ap.add_argument("--vision-binary", default=_exe("kvl_vision"))
     ap.add_argument("--generate-binary", default=_exe("kvl_generate_vl"))
     ap.add_argument("--cache-mib", type=int, default=512)
+    ap.add_argument(
+        "--trunk-cache-mib", default="auto",
+        help="text-trunk cache MiB, or 'auto' (default) per turn under --ram-mib",
+    )
     ap.add_argument("--ram-mib", type=int, default=4096)
     ap.add_argument("--max-new-turn1", type=int, default=32)
     ap.add_argument("--max-new-turn2", type=int, default=32)
@@ -129,6 +156,10 @@ def main() -> int:
         raise SystemExit("cache/RAM/max-new values must be positive")
     if args.temperature < 0:
         raise SystemExit("temperature must be >= 0")
+    try:
+        parse_trunk_cache_request(args.trunk_cache_mib)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     model = Path(args.model_dir)
     image = Path(args.image)
@@ -168,8 +199,9 @@ def main() -> int:
             raise SystemExit(
                 f"media token mismatch: expected {media_tokens}, encoded {actual_media}"
             )
-        _plan_or_die(
-            len(turn1_prompt), args.max_new_turn1, args.cache_mib, args.ram_mib, "TURN1"
+        turn1_trunk_cache = _plan_or_die(
+            len(turn1_prompt), args.max_new_turn1, args.cache_mib, args.ram_mib,
+            args.trunk_cache_mib, "TURN1"
         )
 
         vision_start = time.monotonic()
@@ -185,9 +217,9 @@ def main() -> int:
         turn1 = _run_turn(
             label="TURN1", model=model, ids_path=temp / "turn1.ids", media_path=media_path,
             prompt_ids=turn1_prompt, generate_binary=args.generate_binary,
-            cache_mib=args.cache_mib, max_new=args.max_new_turn1,
-            temperature=args.temperature, seed=args.seed, encoding=enc,
-            show_tokens=args.show_tokens,
+            cache_mib=args.cache_mib, trunk_cache_mib=turn1_trunk_cache,
+            max_new=args.max_new_turn1, temperature=args.temperature, seed=args.seed,
+            encoding=enc, show_tokens=args.show_tokens,
         )
 
         turn1_body = _body_before_stop(turn1.ids)
@@ -197,16 +229,17 @@ def main() -> int:
         )
         followup_ids = enc.encode(followup_markup, allowed_special="all")
         turn2_prompt = turn1_prompt + turn1_body + [IM_END_ID] + followup_ids
-        _plan_or_die(
-            len(turn2_prompt), args.max_new_turn2, args.cache_mib, args.ram_mib, "TURN2"
+        turn2_trunk_cache = _plan_or_die(
+            len(turn2_prompt), args.max_new_turn2, args.cache_mib, args.ram_mib,
+            args.trunk_cache_mib, "TURN2"
         )
 
         turn2 = _run_turn(
             label="TURN2", model=model, ids_path=temp / "turn2.ids", media_path=media_path,
             prompt_ids=turn2_prompt, generate_binary=args.generate_binary,
-            cache_mib=args.cache_mib, max_new=args.max_new_turn2,
-            temperature=args.temperature, seed=args.seed, encoding=enc,
-            show_tokens=args.show_tokens,
+            cache_mib=args.cache_mib, trunk_cache_mib=turn2_trunk_cache,
+            max_new=args.max_new_turn2, temperature=args.temperature, seed=args.seed,
+            encoding=enc, show_tokens=args.show_tokens,
         )
 
     wall_total = time.monotonic() - wall_start
