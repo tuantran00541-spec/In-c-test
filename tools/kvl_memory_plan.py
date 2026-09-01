@@ -23,9 +23,40 @@ PEAK_LAYER_BF16_BYTES = 3 * DENSE_INTERMEDIATE * HIDDEN * BF16_BYTES
 
 RUNTIME_MISC_SAFETY = 128 * MIB
 
-def planned_text_breakdown(prompt_tokens: int, max_new: int, cache_mib: int) -> dict[str, int]:
-    if prompt_tokens <= 0 or max_new <= 0 or cache_mib <= 0:
-        raise ValueError("prompt_tokens, max_new and cache_mib must be positive")
+# Exact non-global text-trunk payload measured from the released Kimi-VL pack is
+# 1705.66796875 MiB. The runtime accepts an integer MiB cache budget, so 1706 MiB
+# is the smallest budget that can retain all always-used layer tensors.
+FULL_TRUNK_CACHE_MIB = 1706
+
+
+def parse_trunk_cache_request(value: str | int) -> int | None:
+    """Return an explicit MiB budget, or None for planner-managed 'auto'."""
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("trunk cache must be >= 0")
+        return value
+    raw = str(value).strip().lower()
+    if raw == "auto":
+        return None
+    try:
+        parsed = int(raw, 10)
+    except ValueError as exc:
+        raise ValueError("trunk cache must be 'auto' or a non-negative integer MiB value") from exc
+    if parsed < 0:
+        raise ValueError("trunk cache must be >= 0")
+    return parsed
+
+
+def planned_text_breakdown(
+    prompt_tokens: int,
+    max_new: int,
+    cache_mib: int,
+    trunk_cache_mib: int = 0,
+) -> dict[str, int]:
+    if prompt_tokens <= 0 or max_new <= 0 or cache_mib <= 0 or trunk_cache_mib < 0:
+        raise ValueError(
+            "prompt_tokens, max_new and cache_mib must be positive; trunk_cache_mib must be >= 0"
+        )
 
     capacity = prompt_tokens + max_new
     compressed_state = LAYERS * capacity * KV_LATENT_PLUS_ROPE * FP32_BYTES
@@ -51,14 +82,46 @@ def planned_text_breakdown(prompt_tokens: int, max_new: int, cache_mib: int) -> 
         "sequence_workspace": sequence_workspace,
         "streaming_mla_workspace": streaming_mla_workspace,
         "expert_cache": cache_mib * MIB,
+        "trunk_cache": trunk_cache_mib * MIB,
         "peak_layer_bf16": PEAK_LAYER_BF16_BYTES,
         "misc_safety": RUNTIME_MISC_SAFETY,
     }
     parts["total"] = sum(parts.values())
     return parts
 
-def planned_text_bytes(prompt_tokens: int, max_new: int, cache_mib: int) -> int:
-    return planned_text_breakdown(prompt_tokens, max_new, cache_mib)["total"]
+
+def resolve_trunk_cache_mib(
+    prompt_tokens: int,
+    max_new: int,
+    cache_mib: int,
+    ram_mib: int,
+    requested: str | int = "auto",
+) -> int:
+    """Resolve a trunk-cache request without violating the conservative RAM plan.
+
+    Explicit integer budgets are returned unchanged and are validated by the caller's
+    final plan. In auto mode, use as much of the known 1706 MiB full-trunk budget as
+    the existing hard RAM contract can safely accommodate. The planner's normal peak
+    layer and misc safety allowances remain counted, so auto never borrows from them.
+    """
+    if ram_mib <= 0:
+        raise ValueError("ram_mib must be positive")
+    parsed = parse_trunk_cache_request(requested)
+    if parsed is not None:
+        return parsed
+
+    base = planned_text_breakdown(prompt_tokens, max_new, cache_mib, 0)
+    available = ram_mib * MIB - base["total"]
+    if available <= 0:
+        return 0
+    return min(FULL_TRUNK_CACHE_MIB, available // MIB)
+
+
+def planned_text_bytes(
+    prompt_tokens: int, max_new: int, cache_mib: int, trunk_cache_mib: int = 0
+) -> int:
+    return planned_text_breakdown(prompt_tokens, max_new, cache_mib, trunk_cache_mib)["total"]
+
 
 def as_mib(n: int) -> float:
     return n / MIB
