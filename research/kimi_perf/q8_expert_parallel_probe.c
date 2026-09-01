@@ -1,6 +1,7 @@
 #include "kvl/ops.h"
 #include "kvl/format.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +18,23 @@ int kvl_moe_token_q8_expert_parallel_auto(KvlExpertCache *cache, int layer,
                                            float *top_weights,
                                            float *scratch);
 
-enum { H = 32, I = 20, E = 64, K = 6, LAYER = 1 };
+enum { H = 32, I = 20, SI = 40, E = 64, K = 6, LAYER = 1 };
 
 static size_t align_up(size_t n, size_t a) {
     return (n + a - 1u) / a * a;
+}
+
+static uint16_t f32_to_bf16(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof bits);
+    return (uint16_t)(bits >> 16);
+}
+
+static void fill_bf16(uint16_t *dst, size_t n, int seed) {
+    for (size_t i = 0; i < n; ++i) {
+        const int v = (int)((i * 31u + (unsigned)seed * 19u) % 241u) - 120;
+        dst[i] = f32_to_bf16((float)v / 1024.0f);
+    }
 }
 
 static void fill_q8(void *dst, int out, int in, int seed) {
@@ -128,21 +142,33 @@ int main(void) {
                 ((e * 17 + i * 3) % 37 - 18) * 0.006f + (float)e * 0.0002f;
     }
 
+    uint16_t *sg = (uint16_t *)malloc((size_t)SI * H * sizeof(uint16_t));
+    uint16_t *su = (uint16_t *)malloc((size_t)SI * H * sizeof(uint16_t));
+    uint16_t *sd = (uint16_t *)malloc((size_t)H * SI * sizeof(uint16_t));
+    if (!sg || !su || !sd) return 2;
+    fill_bf16(sg, (size_t)SI * H, 11);
+    fill_bf16(su, (size_t)SI * H, 13);
+    fill_bf16(sd, (size_t)H * SI, 17);
+    KvlMlpBF16 shared = {sg, su, sd, SI};
+
     KvlRouterConfig rc = {H, E, K, 1, 1, 1, 2.446f};
     int base_ids[K], par_ids[K];
     float base_w[K], par_w[K], base_out[H], par_out[H];
-    const size_t baseline_scratch_n = (size_t)3 * I + H;
-    const size_t parallel_scratch_n = (size_t)K * ((size_t)2 * I + H);
-    const size_t scratch_n = baseline_scratch_n > parallel_scratch_n
-        ? baseline_scratch_n : parallel_scratch_n;
+    const int maxI = SI > I ? SI : I;
+    const size_t baseline_scratch_n = (size_t)3 * maxI + H;
+    const size_t parallel_lane_n = (size_t)K * ((size_t)2 * I + H);
+    const size_t parallel_shared_n = (size_t)3 * maxI + H;
+    size_t scratch_n = baseline_scratch_n;
+    if (parallel_lane_n > scratch_n) scratch_n = parallel_lane_n;
+    if (parallel_shared_n > scratch_n) scratch_n = parallel_shared_n;
     float *base_scratch = (float *)calloc(scratch_n, sizeof(float));
     float *par_scratch = (float *)calloc(scratch_n, sizeof(float));
     if (!base_scratch || !par_scratch) return 2;
 
-    if (kvl_moe_token_auto(&base_cache, LAYER, &rc, x, router, bias, I, NULL,
+    if (kvl_moe_token_auto(&base_cache, LAYER, &rc, x, router, bias, I, &shared,
                            base_out, base_ids, base_w, base_scratch) != 0 ||
         kvl_moe_token_q8_expert_parallel_auto(&par_cache, LAYER, &rc, x, router, bias,
-                                              I, NULL, par_out, par_ids, par_w,
+                                              I, &shared, par_out, par_ids, par_w,
                                               par_scratch) != 0) {
         fprintf(stderr, "MoE probe forward failed\n");
         return 1;
@@ -151,7 +177,7 @@ int main(void) {
     const int ids_exact = memcmp(base_ids, par_ids, sizeof base_ids) == 0;
     const int weights_exact = memcmp(base_w, par_w, sizeof base_w) == 0;
     const int out_exact = memcmp(base_out, par_out, sizeof base_out) == 0;
-    printf("ids_exact=%s weights_exact=%s out_exact=%s\n",
+    printf("ids_exact=%s weights_exact=%s full_moe_out_exact=%s\n",
            ids_exact ? "yes" : "no",
            weights_exact ? "yes" : "no",
            out_exact ? "yes" : "no");
@@ -166,12 +192,13 @@ int main(void) {
     }
 
     free(base_scratch); free(par_scratch);
+    free(sg); free(su); free(sd);
     kvl_expert_cache_close(&base_cache);
     kvl_expert_cache_close(&par_cache);
     kvl_expert_store_close(&store);
     remove(bin_path); remove(idx_path);
 
     if (!ids_exact || !weights_exact || !out_exact) return 1;
-    puts("PACKED_Q8_EXPERT_PARALLEL_BIT_EXACT_PASS");
+    puts("PACKED_Q8_EXPERT_PARALLEL_FULL_MOE_BIT_EXACT_PASS");
     return 0;
 }
