@@ -1,4 +1,4 @@
-name: Windows OpenMP A/B Script
+name: Windows Speed Sweep Scripts
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - research/kimi-msvc-q8-openmp-bench
     paths:
       - 'tools/windows_openmp_ab.ps1'
+      - 'tools/windows_cache_tradeoff_sweep.ps1'
       - '.github/workflows/kimi-windows-openmp-ab-script.yml'
   workflow_dispatch:
 
@@ -23,14 +24,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Parse PowerShell script
+      - name: Parse PowerShell scripts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $text = Get-Content tools/windows_openmp_ab.ps1 -Raw
-          [scriptblock]::Create($text) | Out-Null
+          foreach ($path in @('tools/windows_openmp_ab.ps1','tools/windows_cache_tradeoff_sweep.ps1')) {
+            [scriptblock]::Create((Get-Content $path -Raw)) | Out-Null
+          }
 
-      - name: Exercise parser with fake frontend under Windows PowerShell 5.1
+      - name: Exercise parsers under Windows PowerShell 5.1
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -39,13 +41,29 @@ jobs:
           Set-Content -Path fake-bin\openmp.exe -Value ''
           @'
           import sys
+          args=sys.argv
+          cache='512'
+          if '--cache-mib' in args:
+              cache=args[args.index('--cache-mib')+1]
+          print(f'[kvl] prompt tokens=42 cache={cache} MiB trunk_cache=1706 MiB(requested=auto) RAM plan=3763.9/4096 MiB max_new=64 temperature=0.0', file=sys.stderr)
+          print('kvl_cache: slots=61 slot=8.27 MiB arena=504.44/512.00 MiB req=100 hit=100 miss=0 hit_rate=100.0% evict=40 prefetch=50/20 reads=50 bytes=413.50 MiB rate=1000.0 MiB/s failures=0', file=sys.stderr)
+          print('kvl_trunk_cache: resident=1705.67/1706.00 MiB loads=100 hits=90 inserts=10 reads=2985.67 MiB', file=sys.stderr)
           print('[kvl] timing first_token=10.000s avg_next=2.000s total=14.000s generated=3', file=sys.stderr)
           print('[kvl] generated ids: 1 2 163586', file=sys.stderr)
           '@ | Set-Content -Path tools\kvl_chat.py -Encoding utf8
           $py = (Get-Command python).Source
+
           powershell -ExecutionPolicy Bypass -File tools\windows_openmp_ab.ps1 `
             -ModelDir .\fake-model `
             -Python $py `
             -BaselineBinary .\fake-bin\baseline.exe `
             -PilotBinary .\fake-bin\openmp.exe `
             -ThreadList '1,2'
+          if ($LASTEXITCODE -ne 0) { throw 'OpenMP A/B mock failed' }
+
+          powershell -ExecutionPolicy Bypass -File tools\windows_cache_tradeoff_sweep.ps1 `
+            -ModelDir .\fake-model `
+            -Python $py `
+            -Binary .\fake-bin\baseline.exe `
+            -CacheList '512,768'
+          if ($LASTEXITCODE -ne 0) { throw 'Cache tradeoff mock failed' }
