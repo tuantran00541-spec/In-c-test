@@ -6,23 +6,37 @@ param(
     [int]$CacheMiB = 512,
     [int]$RamMiB = 4096,
     [int]$MaxNew = 64,
-    [int[]]$Threads = @(1,2,4,6),
+    [string]$ThreadList = "1,2,4,6",
     [string]$Prompt = "Xin chào. Hãy trả lời đúng một câu ngắn."
 )
 
 $ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $true
 
 foreach ($path in @($Python, $BaselineBinary, $PilotBinary)) {
     if (-not (Test-Path $path)) { throw "Missing required path: $path" }
 }
 if (-not (Test-Path $ModelDir)) { throw "Missing model directory: $ModelDir" }
 
+$Threads = @()
+foreach ($part in $ThreadList.Split(',')) {
+    $value = 0
+    if (-not [int]::TryParse($part.Trim(), [ref]$value) -or $value -lt 1) {
+        throw "Invalid -ThreadList entry: '$part'"
+    }
+    $Threads += $value
+}
+if ($Threads.Count -eq 0) { throw "-ThreadList must contain at least one positive integer" }
+
 $env:OMP_DYNAMIC = 'FALSE'
 $env:OMP_NESTED = 'FALSE'
 
 $timingRx = [regex]'\[kvl\] timing first_token=([0-9.]+)s avg_next=([0-9.]+)s total=([0-9.]+)s generated=([0-9]+)'
 $idsRx = [regex]'\[kvl\] generated ids:\s*(.*)$'
+
+function Quote-ProcessArg([string]$Value) {
+    if ($null -eq $Value) { return '""' }
+    return '"' + ($Value -replace '"', '\"') + '"'
+}
 
 function Invoke-KvlCase {
     param(
@@ -35,20 +49,44 @@ function Invoke-KvlCase {
     Write-Host ""
     Write-Host "=== $Label threads=$ThreadCount ==="
 
-    $lines = & $Python .\tools\kvl_chat.py `
-        $ModelDir `
-        $Prompt `
-        --binary $Binary `
-        --cache-mib $CacheMiB `
-        --ram-mib $RamMiB `
-        --max-new $MaxNew `
-        --temperature 0 `
-        --seed 1 `
-        --show-tokens 2>&1 | ForEach-Object { "$_" }
+    $argsList = @(
+        '.\tools\kvl_chat.py',
+        $ModelDir,
+        $Prompt,
+        '--binary', $Binary,
+        '--cache-mib', [string]$CacheMiB,
+        '--ram-mib', [string]$RamMiB,
+        '--max-new', [string]$MaxNew,
+        '--temperature', '0',
+        '--seed', '1',
+        '--show-tokens'
+    )
 
-    if ($LASTEXITCODE -ne 0) {
-        $lines | ForEach-Object { Write-Host $_ }
-        throw "$Label threads=$ThreadCount failed with exit code $LASTEXITCODE"
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = (Resolve-Path $Python).Path
+    $psi.WorkingDirectory = (Get-Location).Path
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Arguments = (($argsList | ForEach-Object { Quote-ProcessArg ([string]$_) }) -join ' ')
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    if (-not $proc.Start()) { throw "Failed to start $Python" }
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+    $proc.WaitForExit()
+    $stdout = $stdoutTask.Result
+    $stderr = $stderrTask.Result
+    $exitCode = $proc.ExitCode
+    $proc.Dispose()
+
+    $combined = $stdout + "`n" + $stderr
+    $lines = @($combined -split "`r?`n")
+    if ($exitCode -ne 0) {
+        $lines | ForEach-Object { if ($_ -ne '') { Write-Host $_ } }
+        throw "$Label threads=$ThreadCount failed with exit code $exitCode"
     }
 
     $timing = $null
@@ -60,11 +98,11 @@ function Invoke-KvlCase {
         if ($m2.Success) { $ids = $m2.Groups[1].Value.Trim() }
     }
     if (-not $timing) {
-        $lines | ForEach-Object { Write-Host $_ }
+        $lines | ForEach-Object { if ($_ -ne '') { Write-Host $_ } }
         throw "No timing line found for $Label threads=$ThreadCount"
     }
     if ($null -eq $ids) {
-        $lines | ForEach-Object { Write-Host $_ }
+        $lines | ForEach-Object { if ($_ -ne '') { Write-Host $_ } }
         throw "No generated-id line found for $Label threads=$ThreadCount"
     }
 
