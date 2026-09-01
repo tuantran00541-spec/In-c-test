@@ -244,3 +244,5 @@ add_executable(kvl_generate_profile
   "${KVL_ROOT}/src/logits_dump.c"
 )
 target_link_libraries(kvl_generate_profile PRIVATE kvl_storage)
+
+include("${CMAKE_CURRENT_LIST_DIR}/router_stack.cmake")
