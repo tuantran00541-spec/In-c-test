@@ -81,21 +81,26 @@ def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
 
 
+def run_checked(cmd):
+    p = subprocess.run(cmd, text=True, capture_output=True)
+    print(p.stdout, end="")
+    print(p.stderr, end="", file=sys.stderr)
+    if p.returncode:
+        raise SystemExit(p.returncode)
+
+
 def main() -> None:
     here = pathlib.Path(__file__).resolve().parent
     packer = here / "pack_shared_q8_from_trunk.py"
+    validator = here / "validate_shared_q8_real.py"
+    planner = here / "shared_q8_memory_plan.py"
     with tempfile.TemporaryDirectory(prefix="kvl-shared-q8-") as td:
         td = pathlib.Path(td)
         packed = td / "packed"
         side = td / "side"
         packed.mkdir()
         originals = make_trunk(packed)
-        p = subprocess.run([sys.executable, str(packer), str(packed), str(side)],
-                           text=True, capture_output=True)
-        print(p.stdout, end="")
-        print(p.stderr, end="", file=sys.stderr)
-        if p.returncode:
-            raise SystemExit(p.returncode)
+        run_checked([sys.executable, str(packer), str(packed), str(side)])
 
         idx = (side / "shared_q8.idx").read_bytes()
         h = EHDR.unpack_from(idx, 0)
@@ -132,6 +137,15 @@ def main() -> None:
         print(f"shared_q8_worst_rel_rms={worst_rel:.6f}")
         if worst_rel >= 0.035:
             raise SystemExit("shared Q8 synthetic MLP error exceeded 3.5%")
+
+        run_checked([
+            sys.executable, str(validator), str(packed), str(side),
+            "--samples", "4", "--max-rel", "0.05",
+        ])
+        run_checked([
+            sys.executable, str(planner), str(packed),
+            "--sidecar-dir", str(side), "--baseline-expert-cache-mib", "512",
+        ])
         print("SHARED_Q8_SIDECAR_PACK_PASS")
 
 
