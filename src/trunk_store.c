@@ -6,6 +6,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,11 +107,37 @@ static int read_index(KvlTrunkStore *s, const char *idx_path) {
     return 0;
 }
 
+static int read_cache_budget(size_t *out, int *configured) {
+    if (!out || !configured) return -1;
+    *out = 0;
+    *configured = 0;
+    const char *raw = getenv("KVL_TRUNK_CACHE_MIB");
+    if (!raw || !raw[0]) return 0;
+    *configured = 1;
+    errno = 0;
+    char *end = NULL;
+    const unsigned long long mib = strtoull(raw, &end, 10);
+    if (errno || !end || *end != '\0' || mib > (unsigned long long)(SIZE_MAX / 1048576u)) {
+        fprintf(stderr, "kvl_trunk_cache: invalid KVL_TRUNK_CACHE_MIB=%s\n", raw);
+        return -1;
+    }
+    *out = (size_t)mib * 1048576u;
+    return 0;
+}
+
 int kvl_trunk_store_open(KvlTrunkStore *s, const char *bin_path, const char *idx_path,
                          int prefer_direct_io) {
     if (!s) return -1;
     memset(s, 0, sizeof *s); s->fd = -1;
     if (read_index(s, idx_path) != 0) { kvl_trunk_store_close(s); return -1; }
+    if (read_cache_budget(&s->cache_budget_bytes, &s->cache_configured) != 0) {
+        kvl_trunk_store_close(s);
+        return -1;
+    }
+    if (s->cache_budget_bytes) {
+        s->cache_base = (void **)calloc(s->hdr.n_records, sizeof *s->cache_base);
+        if (!s->cache_base) { kvl_trunk_store_close(s); return -1; }
+    }
     s->fd = open_data(bin_path, prefer_direct_io);
     if (s->fd >= 0) s->direct_io = prefer_direct_io ? 1 : 0;
     else if (prefer_direct_io) { s->fd = open_data(bin_path, 0); s->direct_io = 0; }
@@ -118,8 +145,21 @@ int kvl_trunk_store_open(KvlTrunkStore *s, const char *bin_path, const char *idx
     return 0;
 }
 
+void kvl_trunk_cache_report(const KvlTrunkStore *s) {
+    if (!s || !s->cache_configured) return;
+    fprintf(stderr,
+            "kvl_trunk_cache: resident=%.2f/%.2f MiB loads=%llu hits=%llu "
+            "inserts=%llu reads=%.2f MiB\n",
+            s->cache_bytes / 1048576.0, s->cache_budget_bytes / 1048576.0,
+            (unsigned long long)s->load_calls,
+            (unsigned long long)s->cache_hits,
+            (unsigned long long)s->cache_inserts,
+            s->bytes_read / 1048576.0);
+}
+
 void kvl_trunk_store_close(KvlTrunkStore *s) {
     if (!s) return;
+    kvl_trunk_cache_report(s);
     if (s->fd >= 0) {
 #ifdef _WIN32
         _close(s->fd);
@@ -127,6 +167,11 @@ void kvl_trunk_store_close(KvlTrunkStore *s) {
         close(s->fd);
 #endif
     }
+    if (s->cache_base) {
+        for (uint32_t i = 0; i < s->hdr.n_records; ++i)
+            aligned_free_buf(s->cache_base[i]);
+    }
+    free(s->cache_base);
     free(s->records);
     memset(s, 0, sizeof *s); s->fd = -1;
 }
@@ -140,22 +185,48 @@ const KvlTrunkRecord *kvl_trunk_find(const KvlTrunkStore *s, uint32_t layer, uin
     return NULL;
 }
 
-int kvl_trunk_load(const KvlTrunkStore *s, uint32_t layer, uint32_t kind, KvlTrunkTensor *out) {
+int kvl_trunk_load(KvlTrunkStore *s, uint32_t layer, uint32_t kind, KvlTrunkTensor *out) {
     if (!s || s->fd < 0 || !out) return -1;
     memset(out, 0, sizeof *out);
     const KvlTrunkRecord *r = kvl_trunk_find(s, layer, kind);
     if (!r || !r->read_bytes || (r->file_offset % KVL_TRUNK_ALIGN) ||
         (r->read_bytes % KVL_TRUNK_ALIGN)) return -1;
+    s->load_calls++;
+
+    const size_t idx = (size_t)(r - s->records);
+    if (s->cache_base && idx < s->hdr.n_records && s->cache_base[idx]) {
+        s->cache_hits++;
+        out->record = r;
+        out->base = s->cache_base[idx];
+        out->data = s->cache_base[idx];
+        out->owned = 0;
+        return 0;
+    }
+
     void *buf = NULL;
     if (aligned_alloc_buf(&buf, KVL_TRUNK_ALIGN, (size_t)r->read_bytes) != 0) return -1;
-    int64_t got = pread_all(s->fd, buf, (size_t)r->read_bytes, r->file_offset);
+    const int64_t got = pread_all(s->fd, buf, (size_t)r->read_bytes, r->file_offset);
     if (got != (int64_t)r->read_bytes) { aligned_free_buf(buf); return -1; }
-    out->record = r; out->base = buf; out->data = buf;
+    s->bytes_read += r->read_bytes;
+
+    const int cache_eligible = r->layer != KVL_TRUNK_GLOBAL_LAYER && s->cache_base &&
+        r->read_bytes <= (uint64_t)(s->cache_budget_bytes - s->cache_bytes);
+    if (cache_eligible) {
+        s->cache_base[idx] = buf;
+        s->cache_bytes += (size_t)r->read_bytes;
+        s->cache_inserts++;
+        out->owned = 0;
+    } else {
+        out->owned = 1;
+    }
+    out->record = r;
+    out->base = buf;
+    out->data = buf;
     return 0;
 }
 
 void kvl_trunk_tensor_free(KvlTrunkTensor *t) {
     if (!t) return;
-    if (t->base) aligned_free_buf(t->base);
+    if (t->owned && t->base) aligned_free_buf(t->base);
     memset(t, 0, sizeof *t);
 }

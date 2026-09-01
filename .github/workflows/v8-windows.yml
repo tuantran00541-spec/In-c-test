@@ -51,4 +51,7 @@ jobs:
       - name: Exercise Windows trunk plus expert stores
         shell: pwsh
         run: |
+          $env:KVL_TRUNK_CACHE_MIB = '0'
+          python tests/test_stack_oracle.py --build-dir build/Release
+          $env:KVL_TRUNK_CACHE_MIB = '64'
           python tests/test_stack_oracle.py --build-dir build/Release

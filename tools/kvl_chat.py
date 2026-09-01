@@ -43,14 +43,17 @@ def default_binary() -> str:
     return str(Path("build") / "kvl_generate")
 
 
-def planned_bytes(prompt_tokens: int, max_new: int, cache_mib: int) -> dict[str, int]:
+def planned_bytes(prompt_tokens: int, max_new: int, cache_mib: int,
+                  trunk_cache_mib: int = 0) -> dict[str, int]:
     capacity = prompt_tokens + max_new
     compressed_state = LAYERS * capacity * KV_LATENT_PLUS_ROPE * 4
     batch_prefill = prompt_tokens * BATCH_PREFILL_BYTES_PER_TOKEN
     cache = cache_mib * 1024 * 1024
+    trunk_cache = trunk_cache_mib * 1024 * 1024
     parts = {
         "globals": GLOBAL_BF16_BYTES,
         "expert_cache": cache,
+        "trunk_cache": trunk_cache,
         "compressed_state": compressed_state,
         "batch_prefill_peak": batch_prefill,
         "runtime_safety": FIXED_RUNTIME_SAFETY,
@@ -71,6 +74,8 @@ def main() -> int:
     ap.add_argument("--binary", default=default_binary())
     ap.add_argument("--cache-mib", type=int, default=512,
                     help="hard routed-expert cache budget")
+    ap.add_argument("--trunk-cache-mib", type=int, default=0,
+                    help="bounded cache for non-global always-used trunk tensors; 0 keeps the established streaming path")
     ap.add_argument("--ram-mib", type=int, default=4096,
                     help="V8 total known-working-set budget; configuration is rejected if the conservative plan exceeds it")
     ap.add_argument("--max-new", type=int, default=32)
@@ -82,8 +87,8 @@ def main() -> int:
                     help="optional research/debug path to persist the exact text prompt token ids")
     args = ap.parse_args()
 
-    if args.cache_mib <= 0 or args.ram_mib <= 0 or args.max_new <= 0:
-        raise SystemExit("cache, RAM budget and max-new must be positive")
+    if args.cache_mib <= 0 or args.trunk_cache_mib < 0 or args.ram_mib <= 0 or args.max_new <= 0:
+        raise SystemExit("expert cache, RAM budget and max-new must be positive; trunk cache must be >= 0")
     if args.temperature < 0:
         raise SystemExit("temperature must be >= 0")
 
@@ -103,7 +108,7 @@ def main() -> int:
         research_ids.parent.mkdir(parents=True, exist_ok=True)
         research_ids.write_text("\n".join(map(str, prompt_ids)) + "\n", encoding="ascii")
 
-    plan = planned_bytes(len(prompt_ids), args.max_new, args.cache_mib)
+    plan = planned_bytes(len(prompt_ids), args.max_new, args.cache_mib, args.trunk_cache_mib)
     budget = args.ram_mib * 1024 * 1024
     if plan["planned_peak"] > budget:
         detail = ", ".join(f"{k}={mib(v):.1f}MiB" for k, v in plan.items() if k != "planned_peak")
@@ -114,6 +119,7 @@ def main() -> int:
 
     print(
         f"[kvl] prompt tokens={len(prompt_ids)} cache={args.cache_mib} MiB "
+        f"trunk_cache={args.trunk_cache_mib} MiB "
         f"RAM plan={mib(plan['planned_peak']):.1f}/{args.ram_mib} MiB "
         f"max_new={args.max_new} temperature={args.temperature}",
         file=sys.stderr,
@@ -136,11 +142,14 @@ def main() -> int:
         str(ids_path), str(args.cache_mib * 1024 * 1024), str(args.max_new),
         str(args.temperature), str(args.seed),
     ]
+    child_env = os.environ.copy()
+    # The frontend owns this value so the RAM planner and C runtime cannot drift.
+    child_env["KVL_TRUNK_CACHE_MIB"] = str(args.trunk_cache_mib)
     generated: list[int] = []
     token_times: list[float] = []
     start = time.monotonic()
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, env=child_env)
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.strip()
