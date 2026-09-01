@@ -1,0 +1,109 @@
+name: Real Kimi GGUF Q8_0 Windows layer-pin hysteresis diverse gate
+
+on:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-layerpin-hyst
+    paths:
+      - 'tools/run_kimi_layerpin_hyst_diverse_gate.py'
+      - '.github/workflows/kimi-gguf-q8-windows-layerpin-hyst-diverse.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-hyst-diverse:
+    runs-on: windows-2025
+    timeout-minutes: 180
+    env:
+      OFFICIAL_REPO: moonshotai/Kimi-VL-A3B-Instruct
+      OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
+      GGUF_REPO: mradermacher/Kimi-VL-A3B-Instruct-GGUF
+      GGUF_REVISION: d645665be0a3028dca3ef3d08dddb51ab23ecf31
+      GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
+      GGUF_BYTES: '16974941728'
+      LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned tooling
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --no-cache-dir huggingface_hub hf_xet safetensors numpy tiktoken transformers jinja2 requests
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir "git+https://github.com/ggml-org/llama.cpp.git@$env:LLAMA_CPP_GGUF_COMMIT#subdirectory=gguf-py"
+
+      - name: Build unchanged layer-pin runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PARALLEL_KERNELS=OFF
+          cmake --build build --config Release --target kvl_generate_gguf_q8_layerpin kvl_cache_layer_pin_probe
+          .\build\Release\kvl_cache_layer_pin_probe.exe
+          if (-not (Test-Path 'build\Release\kvl_generate_gguf_q8_layerpin.exe')) { throw 'layer-pin generator missing' }
+
+      - name: Fetch tokenizer and pack BF16 trunk once
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $work = Join-Path $env:RUNNER_TEMP 'kimi-official-trunk-source'
+          python tools/fetch_tokenizer.py $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION
+          python tools/pack_full_text.py $work $packed --repo $env:OFFICIAL_REPO --revision $env:OFFICIAL_REVISION --expert-format none
+          if (-not (Test-Path (Join-Path $packed 'trunk.bin'))) { throw 'trunk missing' }
+          if (Test-Path (Join-Path $packed 'experts.bin')) { throw 'unexpected packed experts' }
+
+      - name: Download pinned full Q8_0 GGUF once and build index
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          @'
+          import os
+          from pathlib import Path
+          from huggingface_hub import hf_hub_download
+          packed = Path(os.environ['RUNNER_TEMP']) / 'kimi-gguf-q8-runtime'
+          src = Path(hf_hub_download(
+              repo_id=os.environ['GGUF_REPO'],
+              revision=os.environ['GGUF_REVISION'],
+              filename=os.environ['GGUF_FILE'],
+              local_dir=packed,
+          ))
+          dst = packed / 'experts.bin'
+          if src.resolve() != dst.resolve():
+              src.replace(dst)
+          if dst.stat().st_size != int(os.environ['GGUF_BYTES']):
+              raise SystemExit(f'GGUF size mismatch: {dst.stat().st_size}')
+          '@ | python -
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-layerpin-hyst-diverse'
+          New-Item -ItemType Directory -Force -Path $e | Out-Null
+          python tools/index_kimi_gguf_q8.py (Join-Path $packed 'experts.bin') (Join-Path $packed 'experts.idx') --summary-json (Join-Path $e 'index-summary.json')
+
+      - name: Run four-prompt uniform versus hysteresis gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $packed = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-runtime'
+          $e = Join-Path $env:RUNNER_TEMP 'kimi-gguf-q8-windows-layerpin-hyst-diverse'
+          $bin = Join-Path (Get-Location) 'build\Release\kvl_generate_gguf_q8_layerpin.exe'
+          python tools/run_kimi_layerpin_hyst_diverse_gate.py $packed $bin $e --cache-mib 512 --ram-mib 4096 --max-new 16 --min-generated 8
+
+      - name: Upload diverse hysteresis evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-gguf-q8-windows-layerpin-hyst-diverse-evidence
+          path: ${{ runner.temp }}/kimi-gguf-q8-windows-layerpin-hyst-diverse/**
+          retention-days: 14
