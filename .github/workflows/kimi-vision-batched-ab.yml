@@ -69,14 +69,14 @@ jobs:
           PY
           python tools/pack_vision.py "$RUNNER_TEMP/kimi-vision-source" "$RUNNER_TEMP/packed-vision"
 
-      - name: Generate deterministic 8x8 patch grid
+      - name: Generate deterministic 14x14 patch grid
         shell: bash
         run: |
           python - <<'PY'
           import numpy as np, os
           rng=np.random.default_rng(20260901)
-          x=rng.normal(0.0,0.55,size=(8*8,3*14*14)).astype(np.float32)
-          x.tofile(os.path.join(os.environ['RUNNER_TEMP'],'patches-8x8.f32'))
+          x=rng.normal(0.0,0.55,size=(14*14,3*14*14)).astype(np.float32)
+          x.tofile(os.path.join(os.environ['RUNNER_TEMP'],'patches-14x14.f32'))
           print('patches',x.shape,'min',float(x.min()),'max',float(x.max()))
           PY
 
@@ -89,7 +89,7 @@ jobs:
           from pathlib import Path
           root=Path(os.environ['RUNNER_TEMP'])
           packed=root/'packed-vision'
-          patches=root/'patches-8x8.f32'
+          patches=root/'patches-14x14.f32'
           bins={
               'base': root/'build-base'/'kvl_vision',
               'candidate': root/'build-candidate'/'kvl_vision',
@@ -99,7 +99,7 @@ jobs:
           for i,arm in enumerate(order):
               out=root/f'out-{i}-{arm}.f32'
               cmd=[str(bins[arm]),str(packed/'vision.bin'),str(packed/'vision.idx'),
-                   str(patches),'8','8',str(out)]
+                   str(patches),'14','14',str(out)]
               t0=time.perf_counter()
               p=subprocess.run(cmd,text=True,capture_output=True,check=True)
               dt=time.perf_counter()-t0
@@ -123,7 +123,7 @@ jobs:
           base=[r for r in rows if r['arm']=='base']
           cand=[r for r in rows if r['arm']=='candidate']
           ref=np.fromfile(base[0]['output'],dtype=np.float32)
-          assert ref.shape==(16*2048,), ref.shape
+          assert ref.shape==(49*2048,), ref.shape
           max_abs=0.0
           rms_max=0.0
           for r in rows[1:]:
@@ -134,7 +134,7 @@ jobs:
               rms_max=max(rms_max,float(np.sqrt(np.mean(d*d))))
           b=statistics.median(r['seconds'] for r in base)
           c=statistics.median(r['seconds'] for r in cand)
-          print(f'vision_ab grid=8x8 omp=1 base_median_s={b:.6f} candidate_median_s={c:.6f} ratio={b/c:.4f} speedup_pct={(b/c-1)*100:.2f}')
+          print(f'vision_ab grid=14x14 omp=1 base_median_s={b:.6f} candidate_median_s={c:.6f} ratio={b/c:.4f} speedup_pct={(b/c-1)*100:.2f}')
           print(f'vision_ab output_max_abs={max_abs:.9g} output_rms_max={rms_max:.9g}')
           assert np.isfinite(ref).all()
           assert max_abs < 5e-5
@@ -144,7 +144,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kimi-vision-batched-bf16-ab
+          name: kimi-vision-batched-bf16-ab-14x14
           path: |
             ${{ runner.temp }}/vision-ab.json
             ${{ runner.temp }}/out-*-*.f32
