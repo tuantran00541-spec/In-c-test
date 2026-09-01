@@ -6,7 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 get_filename_component(KVL_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 
-# This lab intentionally compares two schedulers with all other packed-Q8
+# This lab intentionally compares candidate schedulers with all other packed-Q8
 # Windows fast paths enabled identically.
 set(KVL_USE_AVX2 ON CACHE BOOL "" FORCE)
 set(KVL_MSVC_PACKED_Q8_PARALLEL_KERNELS ON CACHE BOOL "" FORCE)
@@ -47,6 +47,67 @@ add_executable(kvl_q8_expert_parallel_probe
 target_include_directories(kvl_q8_expert_parallel_probe PRIVATE "${KVL_ROOT}/include")
 target_link_libraries(kvl_q8_expert_parallel_probe PRIVATE
   kvl_storage kvl_q8_expert_parallel
+)
+
+# Fused MLA prefill: same established attention algorithm, but latent/RoPE values
+# from the first kv_a projection pass are written directly into compressed state.
+add_library(kvl_mla_prefill_fused STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/mla_prefill_fused.c"
+)
+target_include_directories(kvl_mla_prefill_fused PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_prefill_fused PUBLIC kvl_storage)
+target_compile_definitions(kvl_mla_prefill_fused PRIVATE KVL_USE_AVX2=1)
+if(MSVC)
+  target_compile_options(kvl_mla_prefill_fused PRIVATE /arch:AVX2 /openmp)
+else()
+  target_compile_options(kvl_mla_prefill_fused PRIVATE -mavx2)
+  if(OpenMP_C_FOUND)
+    target_link_libraries(kvl_mla_prefill_fused PUBLIC OpenMP::OpenMP_C)
+  endif()
+endif()
+
+add_executable(kvl_mla_fused_prefill_probe
+  "${CMAKE_CURRENT_LIST_DIR}/mla_prefill_fused_probe.c"
+)
+target_include_directories(kvl_mla_fused_prefill_probe PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_fused_prefill_probe PRIVATE
+  kvl_storage kvl_mla_prefill_fused
+)
+
+# Build a generator clone that replaces only the duplicated
+# prefill+compressed-state pair with the fused research call.
+file(READ "${KVL_ROOT}/src/generate.c" KVL_FUSED_GENERATE)
+string(REPLACE
+  "#include \"kvl/trunk_store.h\"\n"
+  "#include \"kvl/trunk_store.h\"\n#include \"mla_prefill_fused.h\"\n"
+  KVL_FUSED_GENERATE "${KVL_FUSED_GENERATE}")
+set(KVL_FUSED_NEEDLE
+"        if (kvl_mla_prefill_bf16(work_b, work_a, seq_len, &cfg, &aw) != 0 ||\n            kvl_mla_compressed_state_prefill_bf16(work_a, seq_len, &cfg, &aw,\n                                                   &states[layer]) != 0) {")
+set(KVL_FUSED_REPLACEMENT
+"        if (kvl_mla_prefill_compressed_fused_bf16(work_b, work_a, seq_len,\n                                                   &cfg, &aw, &states[layer]) != 0) {")
+string(REPLACE "${KVL_FUSED_NEEDLE}" "${KVL_FUSED_REPLACEMENT}"
+       KVL_FUSED_GENERATE "${KVL_FUSED_GENERATE}")
+string(FIND "${KVL_FUSED_GENERATE}" "kvl_mla_prefill_compressed_fused_bf16" KVL_FUSED_POS)
+if(KVL_FUSED_POS LESS 0)
+  message(FATAL_ERROR "generate.c fused-prefill insertion point changed")
+endif()
+set(KVL_FUSED_SOURCE "${CMAKE_BINARY_DIR}/generate_fused_prefill.c")
+file(WRITE "${KVL_FUSED_SOURCE}" "${KVL_FUSED_GENERATE}")
+set_source_files_properties("${KVL_FUSED_SOURCE}" PROPERTIES
+  GENERATED TRUE
+  COMPILE_DEFINITIONS "kvl_matvec_bf16=kvl_matvec_bf16_dump;kvl_moe_token_bf16=kvl_moe_token_auto"
+)
+add_executable(kvl_generate_fused_prefill
+  "${KVL_FUSED_SOURCE}"
+  "${KVL_ROOT}/src/logits_dump.c"
+)
+target_include_directories(kvl_generate_fused_prefill PRIVATE "${CMAKE_CURRENT_LIST_DIR}")
+target_link_libraries(kvl_generate_fused_prefill PRIVATE
+  kvl_storage kvl_mla_prefill_fused
 )
 
 # Generate a measurement-only clone of generate.c at configure time. It reports
