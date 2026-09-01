@@ -12,7 +12,13 @@ from pathlib import Path
 
 from kimi_image import write_patches
 from kimi_tokenizer import build_encoding, decode_generated, encode_image_chat
-from kvl_memory_plan import MIB, as_mib, planned_text_breakdown, planned_text_bytes
+from kvl_memory_plan import (
+    MIB,
+    as_mib,
+    parse_trunk_cache_request,
+    planned_text_breakdown,
+    resolve_trunk_cache_mib,
+)
 
 EOS_ID = 163585
 IM_END_ID = 163586
@@ -32,6 +38,10 @@ def main() -> int:
     ap.add_argument("--vision-binary", default=_exe("kvl_vision"))
     ap.add_argument("--generate-binary", default=_exe("kvl_generate_vl"))
     ap.add_argument("--cache-mib", type=int, default=512)
+    ap.add_argument(
+        "--trunk-cache-mib", default="auto",
+        help="text-trunk cache MiB, or 'auto' (default) to fill safely under --ram-mib",
+    )
     ap.add_argument("--ram-mib", type=int, default=4096)
     ap.add_argument("--max-new", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=0.2)
@@ -47,6 +57,10 @@ def main() -> int:
         raise SystemExit("cache, RAM budget and max-new must be positive")
     if args.temperature < 0:
         raise SystemExit("temperature must be >= 0")
+    try:
+        parse_trunk_cache_request(args.trunk_cache_mib)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     model = Path(args.model_dir)
     required = [
@@ -84,7 +98,13 @@ def main() -> int:
             research_ids.parent.mkdir(parents=True, exist_ok=True)
             research_ids.write_text("\n".join(map(str, prompt_ids)) + "\n", encoding="ascii")
 
-        plan = planned_text_breakdown(len(prompt_ids), args.max_new, args.cache_mib)
+        trunk_cache_mib = resolve_trunk_cache_mib(
+            len(prompt_ids), args.max_new, args.cache_mib, args.ram_mib,
+            args.trunk_cache_mib,
+        )
+        plan = planned_text_breakdown(
+            len(prompt_ids), args.max_new, args.cache_mib, trunk_cache_mib
+        )
         planned = plan["total"]
         budget = args.ram_mib * MIB
         if planned > budget:
@@ -93,7 +113,8 @@ def main() -> int:
                 f"budget {args.ram_mib} MiB; state={as_mib(plan['compressed_state']):.1f} "
                 f"seq_ws={as_mib(plan['sequence_workspace']):.1f} "
                 f"mla_ws={as_mib(plan['streaming_mla_workspace']):.1f} "
-                f"cache={as_mib(plan['expert_cache']):.1f}; reduce cache/max-new/context or "
+                f"cache={as_mib(plan['expert_cache']):.1f} "
+                f"trunk_cache={as_mib(plan['trunk_cache']):.1f}; reduce cache/max-new/context or "
                 f"raise --ram-mib"
             )
 
@@ -104,6 +125,7 @@ def main() -> int:
             f"seq_ws={as_mib(plan['sequence_workspace']):.1f} "
             f"mla_ws={as_mib(plan['streaming_mla_workspace']):.1f} "
             f"cache={as_mib(plan['expert_cache']):.1f} "
+            f"trunk_cache={trunk_cache_mib:.0f}(requested={args.trunk_cache_mib}) "
             f"global={as_mib(plan['global_bf16']):.1f} "
             f"layer_peak={as_mib(plan['peak_layer_bf16']):.1f} "
             f"safety={as_mib(plan['misc_safety']):.1f} prefill=exact-head-streaming",
@@ -133,7 +155,9 @@ def main() -> int:
         generated: list[int] = []
         token_times: list[float] = []
         text_start = time.monotonic()
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        child_env = os.environ.copy()
+        child_env["KVL_TRUNK_CACHE_MIB"] = str(trunk_cache_mib)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, env=child_env)
         assert proc.stdout is not None
         for line in proc.stdout:
             line = line.strip()
