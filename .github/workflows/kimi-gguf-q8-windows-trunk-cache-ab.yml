@@ -2,6 +2,11 @@ name: Real Kimi GGUF Q8_0 Windows trunk cache A/B
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-gguf-q8-layerpin-hyst
+    paths:
+      - ".github/workflows/kimi-gguf-q8-windows-trunk-cache-ab.yml"
 
 permissions:
   contents: read
