@@ -19,7 +19,8 @@ CASES = [
         "prompt": (
             "Find the smallest positive integer n satisfying n ≡ 3 (mod 7), "
             "n ≡ 5 (mod 11), and n ≡ 8 (mod 13). "
-            "Reason briefly in at most three sentences, then end with FINAL=<integer>."
+            "Solve it internally. Do not show reasoning or any other text. "
+            "Output exactly FINAL=<integer>."
         ),
         "kind": "int",
         "answer": "346",
@@ -29,8 +30,8 @@ CASES = [
         "prompt": (
             "How many 5-digit decimal numbers can be formed from the digits 0,1,2,3,4,5,6,7 "
             "without repetition, if the number contains exactly two even digits? "
-            "A 5-digit number cannot start with 0. Reason briefly in at most three sentences, "
-            "then end with FINAL=<integer>."
+            "A 5-digit number cannot start with 0. Solve it internally. "
+            "Do not show reasoning or any other text. Output exactly FINAL=<integer>."
         ),
         "kind": "int",
         "answer": "2592",
@@ -38,9 +39,9 @@ CASES = [
     {
         "id": "rectangle-vi",
         "prompt": (
-            "Một hình chữ nhật có chu vi 70 và đường chéo dài 25. "
-            "Hãy tính diện tích hình chữ nhật. Giải thích ngắn gọn trong tối đa ba câu, "
-            "sau đó kết thúc bằng FINAL=<số nguyên>."
+            "Một hình chữ nhật có chu vi 70 và đường chéo dài 25. Hãy tính diện tích hình chữ nhật. "
+            "Hãy tự tính nhưng không hiển thị lời giải hay bất kỳ nội dung nào khác. "
+            "Chỉ xuất chính xác FINAL=<số nguyên>."
         ),
         "kind": "int",
         "answer": "300",
@@ -50,8 +51,8 @@ CASES = [
         "prompt": (
             "Three cards are drawn uniformly without replacement from a standard 52-card deck. "
             "What is the probability that exactly two of the three cards are aces? "
-            "Give the exact reduced fraction. Reason briefly in at most three sentences, "
-            "then end with FINAL=<p/q>."
+            "Give the exact reduced fraction. Solve it internally. Do not show reasoning or any other text. "
+            "Output exactly FINAL=<p/q>."
         ),
         "kind": "fraction",
         "answer": "72/5525",
@@ -269,7 +270,7 @@ def main() -> int:
             "intelligence_regression": baseline_correct and not candidate_correct,
         }
         (args.evidence_dir / f"{case['id']}-summary.json").write_text(
-            json.dumps(results[case["id"]], ensure_ascii=False, indent=2) + "\n",
+            json.dumps(results[case['id']], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 
@@ -282,7 +283,7 @@ def main() -> int:
 
     summary = {
         "claim_boundary": (
-            "Four deterministic hard-math text prompts on Windows-2025 hosted runner, "
+            "Four deterministic answer-only hard-math text prompts on Windows-2025 hosted runner, "
             "Q8_0 GGUF direct-I/O, 512 MiB cache. Quality is scored against independently "
             "verified ground truth; a baseline-correct to hysteresis-wrong transition is an "
             "intelligence-retention regression. Token exactness is a separate stronger regression check. "
