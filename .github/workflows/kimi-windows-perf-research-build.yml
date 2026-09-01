@@ -20,6 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Validate shared Q8 sidecar packer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check numpy
+          python .\research\kimi_perf\test_pack_shared_q8.py
+
       - name: Build research binaries through Windows PowerShell 5.1
         shell: pwsh
         run: |
