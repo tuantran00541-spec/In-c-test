@@ -20,6 +20,8 @@ jobs:
       OFFICIAL_REVISION: 398eede0903cd983a2bfa0cc634e9ac1d843f375
       OMP_DYNAMIC: 'FALSE'
       OMP_NESTED: 'FALSE'
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
     steps:
       - uses: actions/checkout@v4
 
