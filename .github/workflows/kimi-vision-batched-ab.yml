@@ -1,0 +1,150 @@
+name: Kimi MoonViT batched BF16 A/B
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - research/kimi-vl-vision-batched-bf16
+    paths:
+      - ".github/workflows/kimi-vision-batched-ab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  vision-ab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      BASE_SHA: daab7d8e6bfd081d6e475731aeba0f05f0338ab1
+      OMP_DYNAMIC: 'FALSE'
+      OMP_NUM_THREADS: '1'
+      PYTHONUTF8: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lightweight vision tooling
+        run: python -m pip install --no-cache-dir huggingface_hub safetensors numpy
+
+      - name: Materialize baseline source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main --depth=1
+          test "$(git rev-parse origin/main)" = "$BASE_SHA"
+          git worktree add --detach "$RUNNER_TEMP/kimi-vision-base" "$BASE_SHA"
+
+      - name: Build baseline and candidate AVX2 vision binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "$RUNNER_TEMP/kimi-vision-base" -B "$RUNNER_TEMP/build-base" \
+            -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build "$RUNNER_TEMP/build-base" -j 2 --target kvl_vision
+          cmake -S . -B "$RUNNER_TEMP/build-candidate" \
+            -DCMAKE_BUILD_TYPE=Release -DKVL_USE_AVX2=ON
+          cmake --build "$RUNNER_TEMP/build-candidate" -j 2 --target kvl_vision
+
+      - name: Fetch official vision shard and pack once
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from huggingface_hub import hf_hub_download
+          import os
+          root=os.path.join(os.environ['RUNNER_TEMP'],'kimi-vision-source')
+          for name in ('config.json','model.safetensors.index.json','model-00001-of-00007.safetensors'):
+              hf_hub_download('moonshotai/Kimi-VL-A3B-Instruct', filename=name, local_dir=root,
+                              revision='398eede0903cd983a2bfa0cc634e9ac1d843f375')
+          PY
+          python tools/pack_vision.py "$RUNNER_TEMP/kimi-vision-source" "$RUNNER_TEMP/packed-vision"
+
+      - name: Generate deterministic 8x8 patch grid
+        shell: bash
+        run: |
+          python - <<'PY'
+          import numpy as np, os
+          rng=np.random.default_rng(20260901)
+          # Already-normalized synthetic patch pixels; deterministic and large enough to
+          # exercise all 27 MoonViT blocks without needing text/expert weights.
+          x=rng.normal(0.0,0.55,size=(8*8,3*14*14)).astype(np.float32)
+          x.tofile(os.path.join(os.environ['RUNNER_TEMP'],'patches-8x8.f32'))
+          print('patches',x.shape,'min',float(x.min()),'max',float(x.max()))
+          PY
+
+      - name: Run alternating baseline candidate A/B
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, subprocess, time
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])
+          packed=root/'packed-vision'
+          patches=root/'patches-8x8.f32'
+          bins={
+              'base': root/'build-base'/'kvl_vision',
+              'candidate': root/'build-candidate'/'kvl_vision',
+          }
+          order=['base','candidate','candidate','base']
+          rows=[]
+          for i,arm in enumerate(order):
+              out=root/f'out-{i}-{arm}.f32'
+              cmd=[str(bins[arm]),str(packed/'vision.bin'),str(packed/'vision.idx'),
+                   str(patches),'8','8',str(out)]
+              t0=time.perf_counter()
+              p=subprocess.run(cmd,text=True,capture_output=True,check=True)
+              dt=time.perf_counter()-t0
+              print(f'ARM {arm} run={i} seconds={dt:.6f}')
+              print(p.stdout,end='')
+              print(p.stderr,end='')
+              rows.append({'arm':arm,'run':i,'seconds':dt,'output':str(out)})
+          (root/'vision-ab.json').write_text(json.dumps(rows,indent=2),encoding='utf-8')
+          PY
+
+      - name: Verify outputs and summarize speed
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, statistics
+          from pathlib import Path
+          import numpy as np
+          root=Path(os.environ['RUNNER_TEMP'])
+          rows=json.loads((root/'vision-ab.json').read_text())
+          base=[r for r in rows if r['arm']=='base']
+          cand=[r for r in rows if r['arm']=='candidate']
+          ref=np.fromfile(base[0]['output'],dtype=np.float32)
+          assert ref.shape==(16*2048,), ref.shape
+          max_abs=0.0
+          rms_max=0.0
+          for r in rows[1:]:
+              x=np.fromfile(r['output'],dtype=np.float32)
+              assert x.shape==ref.shape
+              d=x-ref
+              max_abs=max(max_abs,float(np.max(np.abs(d))))
+              rms_max=max(rms_max,float(np.sqrt(np.mean(d*d))))
+          b=statistics.median(r['seconds'] for r in base)
+          c=statistics.median(r['seconds'] for r in cand)
+          print(f'vision_ab grid=8x8 omp=1 base_median_s={b:.6f} candidate_median_s={c:.6f} ratio={b/c:.4f} speedup_pct={(b/c-1)*100:.2f}')
+          print(f'vision_ab output_max_abs={max_abs:.9g} output_rms_max={rms_max:.9g}')
+          assert np.isfinite(ref).all()
+          assert max_abs < 5e-5
+          PY
+
+      - name: Upload compact A/B evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kimi-vision-batched-bf16-ab
+          path: |
+            ${{ runner.temp }}/vision-ab.json
+            ${{ runner.temp }}/out-*-*.f32
+          retention-days: 7
