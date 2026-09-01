@@ -7,6 +7,8 @@ on:
     paths:
       - 'research/kimi_perf/**'
       - 'tools/windows_build_perf_research.ps1'
+      - 'tools/windows_long_prompt_combined.ps1'
+      - 'tools/windows_prepare_shared_q8.ps1'
       - '.github/workflows/kimi-windows-perf-research-build.yml'
   workflow_dispatch:
 
@@ -33,6 +35,71 @@ jobs:
           $ErrorActionPreference = 'Stop'
           powershell -ExecutionPolicy Bypass -File .\tools\windows_build_perf_research.ps1
 
+      - name: Validate long-prompt gate through Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = (Get-Location).Path
+          $script = Join-Path $repo 'tools\windows_long_prompt_combined.ps1'
+
+          # Parse both user-facing scripts with the legacy Windows PowerShell parser.
+          powershell -NoProfile -Command '$e=$null;$t=$null;[System.Management.Automation.Language.Parser]::ParseFile("tools\windows_long_prompt_combined.ps1",[ref]$t,[ref]$e)>$null;if($e.Count){$e|%%{Write-Error $_};exit 1}'
+          if ($LASTEXITCODE -ne 0) { throw 'long-prompt script parse failed' }
+          powershell -NoProfile -Command '$e=$null;$t=$null;[System.Management.Automation.Language.Parser]::ParseFile("tools\windows_prepare_shared_q8.ps1",[ref]$t,[ref]$e)>$null;if($e.Count){$e|%%{Write-Error $_};exit 1}'
+          if ($LASTEXITCODE -ne 0) { throw 'shared-Q8 prep script parse failed' }
+
+          $tmp = Join-Path $env:RUNNER_TEMP 'kvl-long-gate-mock'
+          Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $tmp 'tools') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $tmp 'model') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $tmp 'bin') | Out-Null
+          Set-Content -Encoding ascii -Path (Join-Path $tmp 'bin\baseline.exe') -Value 'mock'
+          Set-Content -Encoding ascii -Path (Join-Path $tmp 'bin\candidate.exe') -Value 'mock'
+
+          @'
+          import os, sys
+          binary = ''
+          if '--binary' in sys.argv:
+              binary = sys.argv[sys.argv.index('--binary') + 1]
+          threads = os.environ.get('OMP_NUM_THREADS', '0')
+          ids = '44 123 163586'
+          if os.environ.get('KVL_MOCK_MISMATCH') == '1' and 'candidate' in binary.lower() and threads == '4':
+              ids = '44 999 163586'
+          total = {'2':'2.4','4':'1.8','6':'2.1'}.get(threads, '3.0')
+          first = {'2':'1.2','4':'0.9','6':'1.0'}.get(threads, '1.5')
+          nxt = {'2':'0.6','4':'0.45','6':'0.55'}.get(threads, '0.7')
+          print(f'[kvl] generated ids: {ids}')
+          print(f'[kvl] timing first_token={first}s avg_next={nxt}s total={total}s generated=3')
+          '@ | Set-Content -Encoding utf8 (Join-Path $tmp 'tools\kvl_chat.py')
+
+          Push-Location $tmp
+          try {
+            $python = (Get-Command python).Source
+            $env:KVL_MOCK_MISMATCH = '0'
+            powershell -NoProfile -ExecutionPolicy Bypass -File $script `
+              -ModelDir '.\model' `
+              -Python $python `
+              -BaselineBinary '.\bin\baseline.exe' `
+              -CandidateBinary '.\bin\candidate.exe' `
+              -ThreadList '2,4,6' `
+              -SkipLong
+            if ($LASTEXITCODE -ne 0) { throw "mock exact gate should pass, exit=$LASTEXITCODE" }
+
+            $env:KVL_MOCK_MISMATCH = '1'
+            powershell -NoProfile -ExecutionPolicy Bypass -File $script `
+              -ModelDir '.\model' `
+              -Python $python `
+              -BaselineBinary '.\bin\baseline.exe' `
+              -CandidateBinary '.\bin\candidate.exe' `
+              -ThreadList '2,4,6' `
+              -SkipLong
+            if ($LASTEXITCODE -ne 3) { throw "mock mismatch gate must stop with exit=3, got $LASTEXITCODE" }
+          } finally {
+            Remove-Item Env:KVL_MOCK_MISMATCH -ErrorAction SilentlyContinue
+            Pop-Location
+          }
+          Write-Host 'LONG_PROMPT_GATE_POWERSHELL51_PASS'
+
       - name: Verify isolated outputs
         shell: pwsh
         run: |
@@ -40,7 +107,8 @@ jobs:
           $paths = @(
             'build-perf-research\core\Release\kvl_generate.exe',
             'build-perf-research\Release\kvl_generate_profile.exe',
-            'build-perf-research\Release\kvl_generate_expert_parallel.exe'
+            'build-perf-research\Release\kvl_generate_expert_parallel.exe',
+            'build-perf-research\Release\kvl_generate_combined_exact.exe'
           )
           foreach ($p in $paths) {
             if (-not (Test-Path $p)) { throw "missing $p" }
