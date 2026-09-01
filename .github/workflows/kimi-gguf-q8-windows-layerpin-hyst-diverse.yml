@@ -24,6 +24,8 @@ jobs:
       GGUF_FILE: Kimi-VL-A3B-Instruct.Q8_0.gguf
       GGUF_BYTES: '16974941728'
       LLAMA_CPP_GGUF_COMMIT: 5d4a3be26de60093263b2d41ca24c3a49de95cd5
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
 
     steps:
       - uses: actions/checkout@v4
