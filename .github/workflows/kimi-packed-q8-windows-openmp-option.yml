@@ -1,0 +1,94 @@
+name: Packed Q8 Windows OpenMP Option
+
+on:
+  push:
+    branches:
+      - research/kimi-msvc-q8-openmp
+    paths:
+      - 'CMakeLists.txt'
+      - 'tools/windows_build_openmp_pilot.ps1'
+      - '.github/workflows/kimi-packed-q8-windows-openmp-option.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-option:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      OMP_DYNAMIC: 'FALSE'
+      OMP_NESTED: 'FALSE'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build baseline and packed-Q8 OpenMP option
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build-off -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PACKED_Q8_PARALLEL_KERNELS=OFF
+          cmake --build build-off --config Release --target kvl_q8_probe kvl_generate kvl_generate_vl
+          cmake -S . -B build-on -A x64 -DKVL_USE_AVX2=ON -DKVL_MSVC_PACKED_Q8_PARALLEL_KERNELS=ON
+          cmake --build build-on --config Release --target kvl_q8_probe kvl_generate kvl_generate_vl
+
+      - name: Generate deterministic Q8 fixture
+        shell: pwsh
+        run: |
+          @'
+          import struct
+          from pathlib import Path
+          root=Path('probe-data'); root.mkdir(exist_ok=True)
+          n_in,n_out=2048,8192
+          x=[((i*37)%257-128)/128.0 for i in range(n_in)]
+          scales=[0.001+(i%17)*0.0001 for i in range(n_out)]
+          (root/'x.f32').write_bytes(struct.pack('<%df'%n_in,*x))
+          with (root/'q8.blob').open('wb') as f:
+              f.write(struct.pack('<%df'%n_out,*scales))
+              row=bytearray(n_in)
+              for o in range(n_out):
+                  for i in range(n_in): row[i]=((o*13+i*7)%255)+1
+                  f.write(row)
+          '@ | python -
+
+      - name: Verify Q8 bit-exact across thread counts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $off=Resolve-Path 'build-off\Release\kvl_q8_probe.exe'
+          $on=Resolve-Path 'build-on\Release\kvl_q8_probe.exe'
+          $blob=Resolve-Path 'probe-data\q8.blob'
+          $x=Resolve-Path 'probe-data\x.f32'
+          $env:OMP_NUM_THREADS='1'
+          & $off $blob $x 2048 8192 'probe-data\off.f32'
+          foreach($t in 1,2,4,6) {
+            $env:OMP_NUM_THREADS=[string]$t
+            & $on $blob $x 2048 8192 ("probe-data\on-$t.f32")
+          }
+          @'
+          from pathlib import Path
+          import hashlib
+          r=Path('probe-data')
+          ref=(r/'off.f32').read_bytes()
+          print('off',hashlib.sha256(ref).hexdigest())
+          for t in (1,2,4,6):
+              data=(r/f'on-{t}.f32').read_bytes()
+              print('on'+str(t),hashlib.sha256(data).hexdigest())
+              if data != ref: raise SystemExit(f'Q8 changed at {t} threads')
+          print('PACKED_Q8_OPTION_BIT_EXACT_PASS')
+          '@ | python -
+
+      - name: Validate user-facing pilot script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -ExecutionPolicy Bypass -File tools/windows_build_openmp_pilot.ps1 -BuildDir build-script
+          if (-not (Test-Path 'build-script\Release\kvl_generate.exe')) { throw 'pilot text binary missing' }
+          if (-not (Test-Path 'build-script\Release\kvl_generate_vl.exe')) { throw 'pilot VL binary missing' }
+          git diff --exit-code
