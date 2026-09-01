@@ -10,6 +10,7 @@ on:
       - 'src/expert_cache.c'
       - 'src/mla_prefill_streaming.c'
       - 'CMakeLists.txt'
+      - 'tools/windows_build_openmp_pilot.ps1'
       - '.github/workflows/kimi-packed-q8-windows-openmp-probe.yml'
   workflow_dispatch:
 
@@ -54,6 +55,8 @@ jobs:
 
           cmake -S . -B build-on -A x64 -DKVL_USE_AVX2=ON -DCMAKE_C_FLAGS="/openmp"
           cmake --build build-on --config Release --target kvl_q8_probe kvl_mla_prefill_bench
+
+          git checkout -- src/ops.c src/q8_ops.c src/q5_ops.c
 
       - name: Generate deterministic Q8 rowwise fixture
         shell: pwsh
@@ -149,3 +152,13 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "$label MLA probe failed" }
             Write-Host "MLA_END label=$label threads=$threads"
           }
+
+      - name: Validate reversible target-laptop pilot build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          pwsh -ExecutionPolicy Bypass -File tools/windows_build_openmp_pilot.ps1 -BuildDir build-script
+          if (-not (Test-Path 'build-script\Release\kvl_generate.exe')) { throw 'pilot text binary missing' }
+          if (-not (Test-Path 'build-script\Release\kvl_generate_vl.exe')) { throw 'pilot VL binary missing' }
+          git diff --exit-code -- src/ops.c src/q8_ops.c src/q5_ops.c
