@@ -11,6 +11,12 @@ typedef struct {
     KvlTrunkIndexHeader hdr;
     KvlTrunkRecord *records;
 
+    /* Open-addressed (layer,kind)->record index built once at store open. The
+     * payload records remain the source of truth; this only removes repeated
+     * linear scans from hot load_kind() paths. */
+    int32_t *lookup_slots;
+    size_t lookup_cap;
+
     /* Opt-in bounded cache for non-global trunk tensors. Global embedding,
      * final norm, and LM head are already retained by the generator and are
      * deliberately excluded to avoid duplicate residency. */
