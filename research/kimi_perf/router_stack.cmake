@@ -17,3 +17,4 @@ target_include_directories(kvl_trunk_lookup_index_probe PRIVATE "${KVL_ROOT}/inc
 target_link_libraries(kvl_trunk_lookup_index_probe PRIVATE kvl_storage)
 
 include("${CMAKE_CURRENT_LIST_DIR}/shared_q8.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/combined_exact.cmake")
