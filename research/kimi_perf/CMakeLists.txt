@@ -110,6 +110,69 @@ target_link_libraries(kvl_generate_fused_prefill PRIVATE
   kvl_storage kvl_mla_prefill_fused
 )
 
+# Token-parallel fused prefill: keep each AVX2 GEMV serial and parallelise the
+# independent prompt-token dimension instead. This avoids opening an OpenMP
+# region for every small GEMV while retaining each row's arithmetic order.
+add_library(kvl_mla_prefill_token_parallel STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/mla_prefill_token_parallel.c"
+)
+target_include_directories(kvl_mla_prefill_token_parallel PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_prefill_token_parallel PUBLIC kvl_storage)
+target_compile_definitions(kvl_mla_prefill_token_parallel PRIVATE KVL_USE_AVX2=1)
+if(MSVC)
+  target_compile_options(kvl_mla_prefill_token_parallel PRIVATE /arch:AVX2 /openmp)
+else()
+  target_compile_options(kvl_mla_prefill_token_parallel PRIVATE -mavx2)
+  if(OpenMP_C_FOUND)
+    target_link_libraries(kvl_mla_prefill_token_parallel PUBLIC OpenMP::OpenMP_C)
+  endif()
+endif()
+
+add_executable(kvl_mla_token_parallel_prefill_probe
+  "${CMAKE_CURRENT_LIST_DIR}/mla_prefill_token_parallel_probe.c"
+)
+target_include_directories(kvl_mla_token_parallel_prefill_probe PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_token_parallel_prefill_probe PRIVATE
+  kvl_storage kvl_mla_prefill_token_parallel
+)
+
+file(READ "${KVL_ROOT}/src/generate.c" KVL_TOKEN_PARALLEL_GENERATE)
+string(REPLACE
+  "#include \"kvl/trunk_store.h\"\n"
+  "#include \"kvl/trunk_store.h\"\n#include \"mla_prefill_token_parallel.h\"\n"
+  KVL_TOKEN_PARALLEL_GENERATE "${KVL_TOKEN_PARALLEL_GENERATE}")
+set(KVL_TOKEN_PARALLEL_NEEDLE
+"        if (kvl_mla_prefill_bf16(work_b, work_a, seq_len, &cfg, &aw) != 0 ||\n            kvl_mla_compressed_state_prefill_bf16(work_a, seq_len, &cfg, &aw,\n                                                   &states[layer]) != 0) {")
+set(KVL_TOKEN_PARALLEL_REPLACEMENT
+"        if (kvl_mla_prefill_compressed_token_parallel_bf16(\n                work_b, work_a, seq_len, &cfg, &aw, &states[layer]) != 0) {")
+string(REPLACE "${KVL_TOKEN_PARALLEL_NEEDLE}" "${KVL_TOKEN_PARALLEL_REPLACEMENT}"
+       KVL_TOKEN_PARALLEL_GENERATE "${KVL_TOKEN_PARALLEL_GENERATE}")
+string(FIND "${KVL_TOKEN_PARALLEL_GENERATE}"
+       "kvl_mla_prefill_compressed_token_parallel_bf16" KVL_TOKEN_PARALLEL_POS)
+if(KVL_TOKEN_PARALLEL_POS LESS 0)
+  message(FATAL_ERROR "generate.c token-parallel prefill insertion point changed")
+endif()
+set(KVL_TOKEN_PARALLEL_SOURCE "${CMAKE_BINARY_DIR}/generate_token_parallel_prefill.c")
+file(WRITE "${KVL_TOKEN_PARALLEL_SOURCE}" "${KVL_TOKEN_PARALLEL_GENERATE}")
+set_source_files_properties("${KVL_TOKEN_PARALLEL_SOURCE}" PROPERTIES
+  GENERATED TRUE
+  COMPILE_DEFINITIONS "kvl_matvec_bf16=kvl_matvec_bf16_dump;kvl_moe_token_bf16=kvl_moe_token_auto"
+)
+add_executable(kvl_generate_token_parallel_prefill
+  "${KVL_TOKEN_PARALLEL_SOURCE}"
+  "${KVL_ROOT}/src/logits_dump.c"
+)
+target_include_directories(kvl_generate_token_parallel_prefill PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_generate_token_parallel_prefill PRIVATE
+  kvl_storage kvl_mla_prefill_token_parallel
+)
+
 # Decoder workspace candidate: baseline compressed MLA allocates seven temporary
 # buffers per layer/token. The research function reuses one ~tens-of-KiB process
 # arena while retaining the same arithmetic and state update order.
