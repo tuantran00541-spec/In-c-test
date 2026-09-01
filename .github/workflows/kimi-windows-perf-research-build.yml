@@ -94,6 +94,9 @@ jobs:
               -ThreadList '2,4,6' `
               -SkipLong
             if ($LASTEXITCODE -ne 3) { throw "mock mismatch gate must stop with exit=3, got $LASTEXITCODE" }
+            # GitHub's pwsh wrapper exits with the last native exit code. Exit 3 is
+            # expected above, so clear it only after asserting the fail-safe worked.
+            $global:LASTEXITCODE = 0
           } finally {
             Remove-Item Env:KVL_MOCK_MISMATCH -ErrorAction SilentlyContinue
             Pop-Location
