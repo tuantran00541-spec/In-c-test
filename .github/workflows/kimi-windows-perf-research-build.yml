@@ -42,10 +42,10 @@ jobs:
           $repo = (Get-Location).Path
           $script = Join-Path $repo 'tools\windows_long_prompt_combined.ps1'
 
-          # Parse both user-facing scripts with the legacy Windows PowerShell parser.
-          powershell -NoProfile -Command '$e=$null;$t=$null;[System.Management.Automation.Language.Parser]::ParseFile("tools\windows_long_prompt_combined.ps1",[ref]$t,[ref]$e)>$null;if($e.Count){$e|%%{Write-Error $_};exit 1}'
+          # Force legacy Windows PowerShell to parse both user-facing scripts.
+          powershell -NoProfile -Command '$null = [scriptblock]::Create((Get-Content -Raw ".\tools\windows_long_prompt_combined.ps1"))'
           if ($LASTEXITCODE -ne 0) { throw 'long-prompt script parse failed' }
-          powershell -NoProfile -Command '$e=$null;$t=$null;[System.Management.Automation.Language.Parser]::ParseFile("tools\windows_prepare_shared_q8.ps1",[ref]$t,[ref]$e)>$null;if($e.Count){$e|%%{Write-Error $_};exit 1}'
+          powershell -NoProfile -Command '$null = [scriptblock]::Create((Get-Content -Raw ".\tools\windows_prepare_shared_q8.ps1"))'
           if ($LASTEXITCODE -ne 0) { throw 'shared-Q8 prep script parse failed' }
 
           $tmp = Join-Path $env:RUNNER_TEMP 'kvl-long-gate-mock'
