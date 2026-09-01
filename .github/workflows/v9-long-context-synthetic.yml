@@ -6,6 +6,7 @@ on:
       - research/v9-long-context
       - research/v9-long-context-parallel-prefill
       - research/v9-two-turn-vi-chat
+      - feature/kimi-trunk-cache-auto
   workflow_dispatch:
 
 jobs:
@@ -22,7 +23,9 @@ jobs:
             tools/prepare_kimi_vl_q8.py \
             tools/fetch_tokenizer.py \
             tools/kvl_doctor.py \
+            tools/kvl_memory_plan.py \
             tools/kvl_vl_chat.py \
+            tools/kvl_vl_two_turn.py \
             tools/kvl_chat.py
       - name: Planner 8k 16k 32k gates
         run: python3 tools/test_long_context_planner.py
@@ -53,7 +56,7 @@ jobs:
       - name: User helper syntax
         shell: pwsh
         run: |
-          py -3 -m py_compile tools/prepare_kimi_vl_q8.py tools/fetch_tokenizer.py tools/kvl_doctor.py tools/kvl_vl_chat.py tools/kvl_chat.py
+          py -3 -m py_compile tools/prepare_kimi_vl_q8.py tools/fetch_tokenizer.py tools/kvl_doctor.py tools/kvl_memory_plan.py tools/kvl_vl_chat.py tools/kvl_vl_two_turn.py tools/kvl_chat.py
           $text = Get-Content -Raw tools/windows_setup_q8.ps1
           [void][scriptblock]::Create($text)
       - name: Planner 8k 16k 32k gates
