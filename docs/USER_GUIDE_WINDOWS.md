@@ -60,17 +60,18 @@ OneDrive/sync folders, network drives, or compressed folders for the first test.
 
 For a 16 GiB laptop, close LM Studio and any other loaded LLM before running this runtime.
 
-## 3. Clone the current test branch
+## 3. Clone current `main`
 
 Open PowerShell:
 
 ```powershell
 git clone https://github.com/tuantran00541-spec/In-c-test.git
 cd In-c-test
-git switch research/v9-two-turn-vi-chat
+git switch main
 git pull
 ```
 
+The current user-facing runtime is on `main`; a research branch is not required for normal use.
 Do not download model weights into the Git history. The repository already ignores
 `checkpoints/`, `packed/`, `*.safetensors`, `*.bin`, and `*.idx`.
 
@@ -434,7 +435,7 @@ The packed runtime can be regenerated from the pinned Hugging Face checkpoint at
 
 ## 15. Research self-speculative decoder
 
-The branch also contains `kvl_self_spec_sweep`, which evaluates a same-model draft + exact target
+The repository also contains `kvl_self_spec_sweep`, which evaluates a same-model draft + exact target
 verification design with INT8 MLA draft history and selected routed-expert skipping. This is for
 benchmarking candidate acceleration masks. It is deliberately separate from the user-facing
 exact generator until acceptance and speed are validated broadly enough.
