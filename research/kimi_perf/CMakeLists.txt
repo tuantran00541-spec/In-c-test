@@ -41,6 +41,14 @@ target_compile_definitions(kvl_generate_expert_parallel PRIVATE
   kvl_moe_token_bf16=kvl_moe_token_q8_expert_parallel_auto
 )
 
+add_executable(kvl_q8_expert_parallel_probe
+  "${CMAKE_CURRENT_LIST_DIR}/q8_expert_parallel_probe.c"
+)
+target_include_directories(kvl_q8_expert_parallel_probe PRIVATE "${KVL_ROOT}/include")
+target_link_libraries(kvl_q8_expert_parallel_probe PRIVATE
+  kvl_storage kvl_q8_expert_parallel
+)
+
 # Generate a measurement-only clone of generate.c at configure time. It reports
 # cache/trunk counters after prefill, resets counters without dropping resident
 # data, then reports decode separately. Model math and token selection are not
