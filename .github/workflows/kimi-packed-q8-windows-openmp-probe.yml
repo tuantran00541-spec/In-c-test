@@ -1,0 +1,136 @@
+name: Packed Q8 Windows OpenMP Probe
+
+on:
+  push:
+    branches:
+      - research/kimi-msvc-q8-openmp
+    paths:
+      - 'src/ops.c'
+      - 'src/q8_ops.c'
+      - 'src/expert_cache.c'
+      - 'src/mla_prefill_streaming.c'
+      - 'CMakeLists.txt'
+      - '.github/workflows/kimi-packed-q8-windows-openmp-probe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-probe:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      OMP_DYNAMIC: 'FALSE'
+      OMP_NESTED: 'FALSE'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build AVX2 baseline and global-OpenMP pilot
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build-off -A x64 -DKVL_USE_AVX2=ON
+          cmake --build build-off --config Release --target kvl_q8_probe kvl_mla_prefill_bench
+          cmake -S . -B build-on -A x64 -DKVL_USE_AVX2=ON -DCMAKE_C_FLAGS="/openmp"
+          cmake --build build-on --config Release --target kvl_q8_probe kvl_mla_prefill_bench
+
+      - name: Generate deterministic Q8 rowwise fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import struct
+          from pathlib import Path
+          root = Path('probe-data')
+          root.mkdir(exist_ok=True)
+          n_in, n_out = 2048, 8192
+          x = [((i * 37) % 257 - 128) / 128.0 for i in range(n_in)]
+          scales = [0.001 + (i % 17) * 0.0001 for i in range(n_out)]
+          with (root/'x.f32').open('wb') as f:
+              f.write(struct.pack('<%df' % n_in, *x))
+          with (root/'q8.blob').open('wb') as f:
+              f.write(struct.pack('<%df' % n_out, *scales))
+              chunk = bytearray(n_in)
+              for o in range(n_out):
+                  for i in range(n_in):
+                      chunk[i] = ((o * 13 + i * 7) % 255) + 1
+                  f.write(chunk)
+          print('fixture bytes', (root/'q8.blob').stat().st_size)
+          '@ | python -
+
+      - name: Q8 correctness across 1/2/4 threads
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $off = Resolve-Path 'build-off\Release\kvl_q8_probe.exe'
+          $on = Resolve-Path 'build-on\Release\kvl_q8_probe.exe'
+          $blob = Resolve-Path 'probe-data\q8.blob'
+          $x = Resolve-Path 'probe-data\x.f32'
+          $env:OMP_NUM_THREADS = '1'
+          & $off $blob $x 2048 8192 'probe-data\off.f32'
+          foreach ($threads in 1,2,4) {
+            $env:OMP_NUM_THREADS = [string]$threads
+            & $on $blob $x 2048 8192 ("probe-data\on-$threads.f32")
+          }
+          @'
+          from pathlib import Path
+          import hashlib
+          root=Path('probe-data')
+          ref=(root/'off.f32').read_bytes()
+          print('off sha256', hashlib.sha256(ref).hexdigest())
+          for t in (1,2,4):
+              data=(root/f'on-{t}.f32').read_bytes()
+              print(f'on{t} sha256', hashlib.sha256(data).hexdigest())
+              if data != ref:
+                  raise SystemExit(f'Q8 output changed at OMP_NUM_THREADS={t}')
+          print('Q8_BIT_EXACT_PASS')
+          '@ | python -
+
+      - name: Q8 micro timing sweep
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $off = Resolve-Path 'build-off\Release\kvl_q8_probe.exe'
+          $on = Resolve-Path 'build-on\Release\kvl_q8_probe.exe'
+          $blob = Resolve-Path 'probe-data\q8.blob'
+          $x = Resolve-Path 'probe-data\x.f32'
+          function Measure-Probe([string]$label, [string]$binary, [int]$threads) {
+            $env:OMP_NUM_THREADS = [string]$threads
+            $samples = @()
+            for ($i=0; $i -lt 5; $i++) {
+              $out = "probe-data\timing-$label-$i.f32"
+              $sw = [System.Diagnostics.Stopwatch]::StartNew()
+              & $binary $blob $x 2048 8192 $out 2>$null
+              $sw.Stop()
+              if ($LASTEXITCODE -ne 0) { throw "$label failed" }
+              $samples += $sw.Elapsed.TotalSeconds
+            }
+            $sorted = $samples | Sort-Object
+            $median = $sorted[[int]([math]::Floor($sorted.Count/2))]
+            Write-Host ("Q8_TIMING label={0} threads={1} median_s={2:N6} samples={3}" -f $label,$threads,$median,($samples -join ','))
+          }
+          Measure-Probe 'off1' $off 1
+          Measure-Probe 'on1' $on 1
+          Measure-Probe 'on2' $on 2
+          Measure-Probe 'on4' $on 4
+
+      - name: MLA prefill timing sweep
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $off = Resolve-Path 'build-off\Release\kvl_mla_prefill_bench.exe'
+          $on = Resolve-Path 'build-on\Release\kvl_mla_prefill_bench.exe'
+          foreach ($case in @(@('off1',$off,1), @('on1',$on,1), @('on2',$on,2), @('on4',$on,4))) {
+            $label=$case[0]; $binary=$case[1]; $threads=[int]$case[2]
+            $env:OMP_NUM_THREADS = [string]$threads
+            Write-Host "MLA_BEGIN label=$label threads=$threads"
+            & $binary 256 512
+            if ($LASTEXITCODE -ne 0) { throw "$label MLA probe failed" }
+            Write-Host "MLA_END label=$label threads=$threads"
+          }
