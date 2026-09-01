@@ -19,6 +19,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Parse PowerShell script
         shell: pwsh
         run: |
@@ -26,7 +30,7 @@ jobs:
           $text = Get-Content tools/windows_openmp_ab.ps1 -Raw
           [scriptblock]::Create($text) | Out-Null
 
-      - name: Exercise parser with fake frontend
+      - name: Exercise parser with fake frontend under Windows PowerShell 5.1
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -34,14 +38,14 @@ jobs:
           Set-Content -Path fake-bin\baseline.exe -Value ''
           Set-Content -Path fake-bin\openmp.exe -Value ''
           @'
-          @echo off
-          echo [kvl] timing first_token=10.000s avg_next=2.000s total=14.000s generated=3 1>&2
-          echo [kvl] generated ids: 1 2 163586 1>&2
-          exit /b 0
-          '@ | Set-Content -Path fake-python.cmd -Encoding ascii
+          import sys
+          print('[kvl] timing first_token=10.000s avg_next=2.000s total=14.000s generated=3', file=sys.stderr)
+          print('[kvl] generated ids: 1 2 163586', file=sys.stderr)
+          '@ | Set-Content -Path tools\kvl_chat.py -Encoding utf8
+          $py = (Get-Command python).Source
           powershell -ExecutionPolicy Bypass -File tools\windows_openmp_ab.ps1 `
             -ModelDir .\fake-model `
-            -Python .\fake-python.cmd `
+            -Python $py `
             -BaselineBinary .\fake-bin\baseline.exe `
             -PilotBinary .\fake-bin\openmp.exe `
-            -Threads 1,2
+            -ThreadList '1,2'
