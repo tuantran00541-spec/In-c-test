@@ -1,4 +1,6 @@
-int kvl_router_noaux_tc_stack(const struct KvlRouterConfig *cfg,
+#include "kvl/ops.h"
+
+int kvl_router_noaux_tc_stack(const KvlRouterConfig *cfg,
                               const float *x,
                               const float *router_weight,
                               const float *correction_bias,
