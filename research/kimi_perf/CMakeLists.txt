@@ -110,6 +110,39 @@ target_link_libraries(kvl_generate_fused_prefill PRIVATE
   kvl_storage kvl_mla_prefill_fused
 )
 
+# Decoder workspace candidate: baseline compressed MLA allocates seven temporary
+# buffers per layer/token. The research function reuses one ~tens-of-KiB process
+# arena while retaining the same arithmetic and state update order.
+add_library(kvl_mla_decode_reuse STATIC
+  "${CMAKE_CURRENT_LIST_DIR}/mla_decode_reuse.c"
+)
+target_include_directories(kvl_mla_decode_reuse PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_decode_reuse PUBLIC kvl_storage)
+
+add_executable(kvl_mla_decode_reuse_probe
+  "${CMAKE_CURRENT_LIST_DIR}/mla_decode_reuse_probe.c"
+)
+target_include_directories(kvl_mla_decode_reuse_probe PRIVATE
+  "${KVL_ROOT}/include" "${CMAKE_CURRENT_LIST_DIR}"
+)
+target_link_libraries(kvl_mla_decode_reuse_probe PRIVATE
+  kvl_storage kvl_mla_decode_reuse
+)
+
+add_executable(kvl_generate_decode_reuse
+  "${KVL_ROOT}/src/generate.c"
+  "${KVL_ROOT}/src/logits_dump.c"
+)
+target_link_libraries(kvl_generate_decode_reuse PRIVATE
+  kvl_storage kvl_mla_decode_reuse
+)
+target_compile_definitions(kvl_generate_decode_reuse PRIVATE
+  kvl_moe_token_bf16=kvl_moe_token_auto
+  kvl_mla_decode_compressed_bf16=kvl_mla_decode_compressed_reuse_bf16
+)
+
 # Generate a measurement-only clone of generate.c at configure time. It reports
 # cache/trunk counters after prefill, resets counters without dropping resident
 # data, then reports decode separately. Model math and token selection are not
