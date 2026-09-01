@@ -20,7 +20,8 @@ cmake --build $BuildDir --config Release --target `
     kvl_mla_fused_prefill_probe `
     kvl_mla_token_parallel_prefill_probe `
     kvl_mla_decode_reuse_probe `
-    kvl_router_stack_probe
+    kvl_router_stack_probe `
+    kvl_trunk_lookup_index_probe
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $baseline = Join-Path $BuildDir 'core\Release\kvl_generate.exe'
@@ -35,7 +36,8 @@ $fusedProbe = Join-Path $BuildDir 'Release\kvl_mla_fused_prefill_probe.exe'
 $tokenParallelProbe = Join-Path $BuildDir 'Release\kvl_mla_token_parallel_prefill_probe.exe'
 $decodeProbe = Join-Path $BuildDir 'Release\kvl_mla_decode_reuse_probe.exe'
 $routerProbe = Join-Path $BuildDir 'Release\kvl_router_stack_probe.exe'
-foreach ($p in @($baseline,$profile,$parallel,$fused,$tokenParallel,$decodeReuse,$sharedQ8,$q8Probe,$fusedProbe,$tokenParallelProbe,$decodeProbe,$routerProbe)) {
+$trunkLookupProbe = Join-Path $BuildDir 'Release\kvl_trunk_lookup_index_probe.exe'
+foreach ($p in @($baseline,$profile,$parallel,$fused,$tokenParallel,$decodeReuse,$sharedQ8,$q8Probe,$fusedProbe,$tokenParallelProbe,$decodeProbe,$routerProbe,$trunkLookupProbe)) {
     if (-not (Test-Path $p)) { throw "Missing expected binary: $p" }
 }
 
@@ -52,6 +54,8 @@ if ($LASTEXITCODE -ne 0) { throw "MLA token-parallel prefill bit-exact probe fai
 if ($LASTEXITCODE -ne 0) { throw "MLA decode-reuse bit-exact probe failed" }
 & $routerProbe
 if ($LASTEXITCODE -ne 0) { throw "stack router bit-exact probe failed" }
+& $trunkLookupProbe
+if ($LASTEXITCODE -ne 0) { throw "trunk indexed lookup exactness probe failed" }
 
 Write-Host "PASS: isolated performance research binaries built"
 Write-Host "  row-parallel baseline : $baseline"
@@ -66,5 +70,6 @@ Write-Host "  fused prefill exact    : $fusedProbe"
 Write-Host "  token prefill exact    : $tokenParallelProbe"
 Write-Host "  decode exactness       : $decodeProbe"
 Write-Host "  router stack exact     : $routerProbe"
+Write-Host "  trunk lookup exact     : $trunkLookupProbe"
 Write-Host ""
 Write-Host "No main build directory or packed weights were modified."
