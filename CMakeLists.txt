@@ -4,6 +4,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(KVL_USE_AVX2 "Use AVX2 BF16/Q8 GEMV backends" OFF)
 option(KVL_MSVC_PARALLEL_KERNELS "Enable OpenMP for selected MSVC direct-GGUF kernels" OFF)
+option(KVL_MSVC_PACKED_Q8_PARALLEL_KERNELS "Enable OpenMP for packed-Q8 BF16/Q8 GEMV and expert prefetch on MSVC" OFF)
 
 if(MSVC)
   add_compile_options(/W4)
@@ -11,11 +12,32 @@ else()
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+# The legacy MSVC OpenMP parser rejects C99 declarations in the canonical
+# omp-for initializer used by ops.c/q8_ops.c. Keep source semantics unchanged
+# and generate MSVC-compatible build copies only for the opt-in packed-Q8 pilot.
+set(KVL_OPS_SOURCE src/ops.c)
+set(KVL_Q8_OPS_SOURCE src/q8_ops.c)
+if(MSVC AND KVL_MSVC_PACKED_Q8_PARALLEL_KERNELS)
+  foreach(_kvl_src IN ITEMS ops q8_ops)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/${_kvl_src}.c" _kvl_text)
+    string(REPLACE
+      "#ifdef _OPENMP\n#pragma omp parallel for schedule(static) if(out > 64)\n#endif\n    for (int o = 0; o < out; ++o) {"
+      "    int o;\n#ifdef _OPENMP\n#pragma omp parallel for schedule(static) if(out > 64)\n#endif\n    for (o = 0; o < out; ++o) {"
+      _kvl_text "${_kvl_text}")
+    set(_kvl_generated "${CMAKE_CURRENT_BINARY_DIR}/${_kvl_src}_msvc_omp.c")
+    file(WRITE "${_kvl_generated}" "${_kvl_text}")
+    set_source_files_properties("${_kvl_generated}" PROPERTIES GENERATED TRUE COMPILE_OPTIONS "/openmp")
+    if(_kvl_src STREQUAL "ops")
+      set(KVL_OPS_SOURCE "${_kvl_generated}")
+    else()
+      set(KVL_Q8_OPS_SOURCE "${_kvl_generated}")
+    endif()
+  endforeach()
+endif()
+
 # Linux keeps the existing target-wide OpenMP behavior. On MSVC, long-context
-# prefill retains its established OpenMP path. The broader fast path remains
-# opt-in until real Windows A/B evidence justifies promotion. For the first
-# direct-GGUF pilot, enable only the two kernels whose OpenMP induction loops are
-# compatible with MSVC's native /openmp parser: Q8_0 row GEMV and expert prefetch.
+# prefill retains its established OpenMP path. The broader fast paths remain
+# opt-in until real Windows A/B evidence justifies promotion.
 if(MSVC)
   set_source_files_properties(src/mla_prefill_streaming.c PROPERTIES COMPILE_OPTIONS "/openmp")
   if(KVL_MSVC_PARALLEL_KERNELS)
@@ -24,13 +46,16 @@ if(MSVC)
       src/expert_cache.c
       PROPERTIES COMPILE_OPTIONS "/openmp")
   endif()
+  if(KVL_MSVC_PACKED_Q8_PARALLEL_KERNELS)
+    set_source_files_properties(src/expert_cache.c PROPERTIES COMPILE_OPTIONS "/openmp")
+  endif()
 else()
   find_package(OpenMP)
 endif()
 
 # Keep the old fully-materialized MLA prefill available as a lab oracle while
 # routing production callers on this branch to the exact low-memory implementation.
-set_source_files_properties(src/ops.c PROPERTIES
+set_source_files_properties(${KVL_OPS_SOURCE} PROPERTIES
   COMPILE_DEFINITIONS "kvl_mla_prefill_bf16=kvl_mla_prefill_materialized_bf16")
 
 # Opt-in research logit dumping wraps only direct LM-head matvec calls in the
@@ -42,9 +67,9 @@ add_library(kvl_storage
   src/expert_store.c
   src/expert_cache.c
   src/trunk_store.c
-  src/ops.c
+  ${KVL_OPS_SOURCE}
   src/mla_prefill_streaming.c
-  src/q8_ops.c
+  ${KVL_Q8_OPS_SOURCE}
   src/gguf_q8_0.c
   src/gguf_q8_moe.c
   src/q5_ops.c
