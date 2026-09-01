@@ -237,6 +237,8 @@ typedef struct {
     int64_t got;
 } PrefetchWork;
 
+#define KVL_PREFETCH_STACK_MAX 64
+
 static int cmp_work(const void *a, const void *b) {
     const PrefetchWork *x = (const PrefetchWork *)a;
     const PrefetchWork *y = (const PrefetchWork *)b;
@@ -250,18 +252,34 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
     if (n == 0) return 0;
     c->prefetch_batches++;
 
-    PrefetchWork *w = (PrefetchWork *)calloc((size_t)n, sizeof *w);
-    if (!w) return -1;
+    PrefetchWork stack_w[KVL_PREFETCH_STACK_MAX];
+    PrefetchWork *w = stack_w;
+    int heap_w = 0;
+    if (n > KVL_PREFETCH_STACK_MAX) {
+        w = (PrefetchWork *)malloc((size_t)n * sizeof *w);
+        if (!w) return -1;
+        heap_w = 1;
+    }
 
     /* When persistent layer pins are enabled, do not evict a resident member of
      * the batch while reserving slots for another missing member of that same
-     * batch. The baseline path leaves pinned_of NULL and retains its old LRU
-     * behavior byte-for-byte. */
+     * batch. The Kimi top-k path uses stack storage (n=6); larger generic batches
+     * retain the old heap fallback and identical LRU/publish ordering. */
+    int32_t stack_avoid[KVL_PREFETCH_STACK_MAX];
     int32_t *avoid = NULL;
+    int heap_avoid = 0;
     int n_avoid = 0;
     if (c->pinned_of) {
-        avoid = (int32_t *)malloc((size_t)n * sizeof *avoid);
-        if (!avoid) { free(w); return -1; }
+        if (n <= KVL_PREFETCH_STACK_MAX) {
+            avoid = stack_avoid;
+        } else {
+            avoid = (int32_t *)malloc((size_t)n * sizeof *avoid);
+            if (!avoid) {
+                if (heap_w) free(w);
+                return -1;
+            }
+            heap_avoid = 1;
+        }
         for (int i = 0; i < n; ++i) {
             int32_t key;
             if (key_for(c, layer, experts[i], &key) != 0) continue;
@@ -303,7 +321,11 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
         nw++;
     }
 
-    if (nw == 0) { free(avoid); free(w); return 0; }
+    if (nw == 0) {
+        if (heap_avoid) free(avoid);
+        if (heap_w) free(w);
+        return 0;
+    }
     qsort(w, (size_t)nw, sizeof *w, cmp_work);
 
     /* Phase 2: only independent positioned reads happen in parallel. Measure the WALL
@@ -338,8 +360,8 @@ int kvl_expert_cache_getmany(KvlExpertCache *c, int layer, const int *experts, i
         c->prefetch_reads++;
         ok++;
     }
-    free(avoid);
-    free(w);
+    if (heap_avoid) free(avoid);
+    if (heap_w) free(w);
     return ok;
 }
 
